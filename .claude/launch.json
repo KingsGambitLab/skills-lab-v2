@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "skills-lab-v2",
+      "runtimeExecutable": "/Users/tushar/Desktop/codebases/skills-lab-v2/scripts/run_uvicorn.sh",
+      "runtimeArgs": [],
+      "port": 8001
+    }
+  ]
+}

@@ -1,0 +1,22 @@
+__pycache__/
+*.pyc
+*.pyo
+*.db
+*.db-shm
+*.db-wal
+*.sqlite
+.env
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+.DS_Store
+
+# Runtime state — do NOT commit
+.anthropic_budget.json
+
+# Macro / editor noise
+.idea/
+.vscode/
+*.swp

@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  app:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - ./frontend:/app/frontend
+      - app-data:/app/data
+    environment:
+      - DATABASE_URL=sqlite+aiosqlite:///data/skills_lab.db
+
+volumes:
+  app-data:
