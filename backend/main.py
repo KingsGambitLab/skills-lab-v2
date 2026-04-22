@@ -165,6 +165,7 @@ from backend.docker_runner import (
     is_docker_available as _docker_available,
     run_in_docker as _docker_run,
     validate_solution_starter_invariant as _docker_validate_invariant,
+    prewarm_images as _docker_prewarm,
 )
 from backend.schemas import (
     CodeExecuteRequest,
@@ -202,6 +203,22 @@ logging.basicConfig(level=logging.INFO)
 # ---------------------------------------------------------------------------
 
 app = FastAPI(title="Skills Lab v2", version="0.1.0")
+
+
+# Gap D fix (2026-04-22): prewarm Docker images on startup so the first
+# learner hitting a code_exercise doesn't wait 30s for python:3.11-slim to
+# pull. Runs in a background thread so it doesn't block startup.
+@app.on_event("startup")
+async def _prewarm_docker_on_startup():
+    import threading
+    def _run():
+        try:
+            pulled = _docker_prewarm()
+            if pulled:
+                logger.info("docker prewarm: pulled/verified %d images: %s", len(pulled), pulled)
+        except Exception as e:
+            logger.warning("docker prewarm failed (non-fatal): %s", e)
+    threading.Thread(target=_run, daemon=True, name="docker-prewarm").start()
 
 app.add_middleware(
     CORSMiddleware,
@@ -4740,8 +4757,17 @@ def _llm_generate_step_content(
     step_title: str,
     step_type: str,
     step_description: str,
+    *,
+    retry_hint: str = "",
+    model_override: str | None = None,
 ) -> dict | None:
     """Generate real content for a specific step via LLM.
+
+    Gap B fix (2026-04-22): optional `retry_hint` is appended to the prompt
+    when a previous attempt was rejected by the LangGraph invariant — tells
+    the LLM exactly what went wrong (e.g. "last attempt's starter passed
+    the hidden tests; the starter MUST be incomplete"). `model_override`
+    lets the retry loop switch to Opus on the final attempts.
 
     Fix 2026-04-19 (post-fidelity-audit): now receives source_material via course_context
     and enforces strict-grounded rules when source is present. Previously this function
@@ -4964,7 +4990,7 @@ Generate ONLY JSON (no fences):
         else:
             prompt += """{
   "content": "<HTML explanation + SETUP SCAFFOLDING (200-350 words total). STRUCTURE (Maya beginner review 2026-04-20 flagged wall-of-text rendering): use styled CARDS not paragraphs, each wrapped like `<div style=\\"background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px; margin-bottom:10px;\\"><h4 style=\\"margin:0 0 6px 0; color:#e8ecf4;\\">Card title</h4><p style=\\"margin:0; color:#c9d1df;\\">body</p></div>`. DO NOT duplicate the step title inside content — the UI already renders it above. Inline references to tool names, function names, file names, config keys MUST be wrapped in `<code style=\\"background:#161b26; color:#2dd4bf; padding:1px 6px; border-radius:4px; font-family: monospace;\\">read_file</code>` — never render them as plain prose. Any checklist MUST use `<ul>` with real bullets or a styled card-per-item list — NEVER use raw `[ ]` text that looks like markdown source. If listing 'Integration Checklist' / 'Tool Registration Process' / 'Scenario Context' sections, each gets its own card with a single icon/emoji prefix (✅ / 🔧 / 📋) — no stacks of bolded headers without visual separation.>",
-  "code": "<REAL starter code, 20-60 lines, production-flavored. Include imports/scaffolding, one or two working helpers, and 2-4 explicit TODO markers where the learner fills in. Use realistic domain data (not 'Hello world'). NEVER emit placeholder stubs like '# Your answer here' or '// Write your solution below' — Tomás learner review 2026-04-20 flagged an entire Docker/K8s course shipping empty stubs for every code_exercise.\\n\\n### STARTER MUST NOT PASS THE HIDDEN TESTS (LangGraph invariant, non-negotiable 2026-04-22)\\n- The starter is given to the LEARNER to complete. It MUST leave work for them.\\n- The function/method the tests call MUST be unimplemented in the starter. Use ONE of: (a) `pass`, (b) `raise NotImplementedError('TODO')`, (c) `return None` / `return []` / `return 0` (wrong sentinel), (d) a `# TODO:` comment followed by an incomplete branch that returns the wrong thing.\\n- The Creator pre-publish runs the hidden_tests against BOTH the starter AND the solution_code in a Docker container. If the starter PASSES the tests, the exercise is REJECTED and regenerated — because nothing is left for the learner to do. If the solution_code FAILS the tests, it's REJECTED too. BOTH invariants must hold.\\n- Emit starter code that fails OBVIOUSLY: `def find_order(n, prereqs): return []  # TODO: Kahn's algorithm here` — returning `[]` fails almost every topo-sort test, which is correct.\\n- DO NOT emit a fully working function in the starter and then write the same function again in solution_code. That wastes the LangGraph gate and ships an already-solved exercise if the gate flakes.>",
+  "code": "<REAL starter code, 20-60 lines, production-flavored. Include imports/scaffolding, one or two working helpers, and 2-4 explicit TODO markers where the learner fills in. Use realistic domain data (not 'Hello world').\\n\\n### STARTER MUST NOT PASS THE HIDDEN TESTS (LangGraph invariant — enforced by AST parser + Docker)\\n- The function the tests `from solution import <name>` MUST have a BROKEN body. Every tested function's FIRST real statement must be ONE of:\\n  (a) `raise NotImplementedError('TODO')` (preferred — signals intent clearly)\\n  (b) `pass`\\n  (c) a single `return None` / `return []` / `return 0` sentinel\\n- Docstrings are allowed before the broken statement; additional statements after are NOT (the AST check inspects the first real statement).\\n- The AST pre-filter rejects IN ZERO-LATENCY when the tested function body has multiple real statements → wasted LLM work.\\n\\n### L2 FEW-SHOT (2026-04-22) — follow these verbatim patterns:\\n\\nEXAMPLE 1 — Sliding window (GOOD starter):\\n```\\nfrom typing import List\\ndef max_sum_k(nums: List[int], k: int) -> int:\\n    '''Find the maximum sum of k consecutive elements.'''\\n    raise NotImplementedError('TODO: sliding window with running sum')\\n```\\nEXAMPLE 1 — Sliding window (GOOD solution_code):\\n```\\nfrom typing import List\\ndef max_sum_k(nums: List[int], k: int) -> int:\\n    if not nums or k <= 0 or k > len(nums): return 0\\n    cur = sum(nums[:k]); best = cur\\n    for i in range(k, len(nums)):\\n        cur += nums[i] - nums[i-k]; best = max(best, cur)\\n    return best\\n```\\n\\nEXAMPLE 2 — Two pointers (GOOD starter, sentinel return):\\n```\\nfrom typing import List\\ndef remove_duplicates(nums: List[int]) -> int:\\n    '''In-place dedup of a sorted list. Returns new length k.'''\\n    return 0  # TODO: two-pointer write/scan\\n```\\nEXAMPLE 2 — (GOOD solution_code):\\n```\\nfrom typing import List\\ndef remove_duplicates(nums: List[int]) -> int:\\n    if not nums: return 0\\n    k = 1\\n    for i in range(1, len(nums)):\\n        if nums[i] != nums[k-1]:\\n            nums[k] = nums[i]; k += 1\\n    return k\\n```\\n\\nEXAMPLE 3 — WHAT NOT TO DO (starter was REJECTED 5 times by the invariant gate):\\n```\\n# BAD — the function is fully implemented. LangGraph rejects.\\ndef remove_duplicates(nums):\\n    if not nums: return 0\\n    k = 1\\n    for i in range(1, len(nums)):\\n        if nums[i] != nums[k-1]:\\n            nums[k] = nums[i]; k += 1\\n    return k  # \u2190 this is a solution, not a starter\\n```\\nThe BAD starter has multi-statement body + no NotImplementedError/sentinel. The AST check rejects immediately.>",
   "expected_output": "<The expected stdout / query results / parsed shape when the code runs correctly.>",
   "demo_data": {
     "language": "python",
@@ -4976,7 +5002,7 @@ Generate ONLY JSON (no fences):
   },
   "validation": {
     "hint": "<One-sentence hint for stuck learners>",
-    "hidden_tests": "<Python/JS/Go test source (pytest / jest / go-test) that the grader runs inside Docker against the learner's submission. 4-10 test functions, real assertions against real behavior (not `assert 1==1`). MUST import from the learner's module (e.g. `from solution import fetch_all` for Python). Cheese-proof: no amount of string-stuffing can satisfy a real assertion. PREFERRED signal going forward.>",
+    "hidden_tests": "<Python/JS/Go test source the grader runs inside Docker against the learner's submission. **CAP AT 4-6 TEST FUNCTIONS** (L6 fix 2026-04-22 — more tests slow Docker + make the solution/starter invariant harder to satisfy). Real assertions against real behavior (not `assert 1==1`). MUST `from solution import <name>` so the tests can find the learner's function. Include: 1 happy-path test, 1 edge case (empty/zero), 1 boundary (single element or large), 1-2 adversarial (wrong return would fail). Cheese-proof: no amount of string-stuffing satisfies a real assertion.>",
     "solution_code": "<Complete working solution. Pre-publish validation runs this against hidden_tests in Docker and asserts all tests pass. Also runs starter code against the same tests and asserts at least one fails. If either invariant breaks, the exercise is regenerated (LangGraph solution/starter invariant, 2026-04-22).>",
     "requirements": "<Optional. For Python: `requirements.txt` content (one pip dep per line). For JS/TS: `package.json` content. For Go: `go.mod` content. The Docker runner installs these before running tests. Use when the exercise needs real libraries (sqlalchemy, fastapi, httpx, bcrypt, pytest-asyncio, confluent-kafka, opentelemetry-api, strawberry-graphql, etc.) — do NOT mock them anymore.>",
     "must_contain": ["<LEGACY signal — substring checks on the learner's source. Kept for courses where real test execution isn't wired yet; but hidden_tests is PREFERRED because must_contain is cheese-able. Emit both while we transition.>"]
@@ -5425,7 +5451,23 @@ IMPORTANT for incident_console:
         "concept", None, "",  # intro concept widgets + any step with no exercise_type
     }
     _max_tokens = 6000 if step_type in _token_heavy else 3500
-    result = _llm_json_call(CREATOR_SYSTEM_PROMPT, prompt, max_tokens=_max_tokens)
+    # Gap B (2026-04-22): append retry_hint + use Opus on final retries.
+    if retry_hint:
+        prompt += f"\n\n=== RETRY GUIDANCE (PREVIOUS ATTEMPT REJECTED) ===\n{retry_hint}\n"
+    # L5 (2026-04-22): if this is a code_exercise + the step title/description
+    # matches a known algorithm pattern, inject the canonical starter/solution/
+    # tests triple. Near-zero rejection rate on covered patterns.
+    if step_type == "code_exercise":
+        try:
+            from backend.algorithm_patterns import find_match, describe_pattern_for_prompt
+            pat = find_match(step_title, step_description)
+            if pat:
+                prompt += "\n\n" + describe_pattern_for_prompt(pat) + "\n"
+                logging.info("L5 pattern hit: step=%r matched pattern=%s", step_title, pat.id)
+        except Exception as _ie:
+            logging.warning("L5 pattern lookup failed (non-fatal): %s", _ie)
+    _model = model_override or _STEP_CONTENT_MODEL
+    result = _llm_json_call(CREATOR_SYSTEM_PROMPT, prompt, max_tokens=_max_tokens, model=_model)
     return result
 
 
@@ -7075,51 +7117,148 @@ async def creator_generate(
                 except Exception as e:
                     logging.warning("code_exercise critic wrapper failed: %s", e)
 
-            # Retry-on-incomplete: if the first LLM call produced incomplete content
-            # (caught by _is_complete), try ONCE more before falling back. Wave-2 Sarah
-            # review (2026-04-19) found Module 1 Step 1 shipped the neutral-scaffold
-            # error text to learners — a retry would have given the LLM a second shot
-            # to produce real content instead of silently accepting shallow output.
-            if not _is_complete(llm_content, ex_type) and _llm_enabled():
-                logging.warning(
-                    "First-pass LLM content for %s/%s/%s incomplete — retrying once.",
-                    title, mod.title, step_outline.title,
-                )
-                try:
-                    ctx_for_retry = dict(course_context) if isinstance(course_context, dict) else {}
-                    ctx_for_retry["is_capstone_module"] = (m_pos - 1 == capstone_module_idx)
-                    retry_content = _llm_generate_step_content(
-                        ctx_for_retry,
-                        mod.title,
-                        step_outline.title,
-                        ex_type,
-                        step_outline.description,
+            # Gap B (2026-04-22): retry loop for code_exercise, up to 5 total
+            # attempts. Attempts 1-3 use default Sonnet; 4-5 upgrade to Opus.
+            # Each retry injects a specific hint telling the LLM what the
+            # previous attempt got wrong (primarily: starter passed tests →
+            # emit a broken starter). Other ex_types get 2 attempts (prior
+            # behavior preserved — Opus override only for code_exercise
+            # since that's where the LangGraph gate fires).
+            #
+            # Total attempts per step when _is_complete keeps rejecting:
+            #   code_exercise: 5  (Sonnet×3 + Opus×2)
+            #   others:        2  (Sonnet×2)
+            _max_attempts = 5 if ex_type == "code_exercise" else 2
+            attempt = 1
+            while not _is_complete(llm_content, ex_type) and _llm_enabled() and attempt < _max_attempts:
+                attempt += 1
+                # Build a specific hint for this retry
+                _hint_parts = []
+                if ex_type == "code_exercise":
+                    _hint_parts.append(
+                        "Previous attempt was REJECTED by the LangGraph invariant gate "
+                        "(backend/docker_runner.validate_solution_starter_invariant). The most "
+                        "common reason: the starter you wrote PASSED the hidden_tests — meaning "
+                        "the learner has nothing to implement. THIS time, follow these rules "
+                        "EXACTLY:\n"
+                        "  1. `code` (starter): the function the hidden_tests call MUST be "
+                        "unimplemented. Use ONE of:\n"
+                        "     - `pass` as the only body line.\n"
+                        "     - `raise NotImplementedError('TODO: implement X')`\n"
+                        "     - `return []` / `return None` / `return 0` / `return False` as a "
+                        "wrong sentinel.\n"
+                        "  2. `solution_code`: a complete, working implementation. Must differ "
+                        "from the starter. Must pass every hidden_test.\n"
+                        "  3. `hidden_tests`: 4-8 pytest assertions against the learner's "
+                        "function. MUST fail against the starter; MUST pass against solution_code.\n"
+                        "  4. Verify mentally: could a learner run the starter and get all "
+                        "tests green? If YES, your starter is wrong — remove the body.\n"
                     )
-                    # Normalize the retry too before completeness-check.
-                    if ex_type == "code_review" and isinstance(retry_content, dict) and retry_content.get("demo_data"):
-                        retry_content["demo_data"] = _normalize_code_review_bugs(retry_content["demo_data"])
-                        try:
-                            retry_content["demo_data"] = _critic_code_review(retry_content["demo_data"])
-                        except Exception as e:
-                            logging.warning("code_review critic (retry) failed: %s", e)
-                        resolved_lines_r = [
-                            b.get("line") for b in retry_content["demo_data"].get("bugs", [])
-                            if isinstance(b, dict) and isinstance(b.get("line"), int)
-                        ]
-                        if resolved_lines_r:
-                            if not isinstance(retry_content.get("validation"), dict):
-                                retry_content["validation"] = {}
-                            retry_content["validation"]["bug_lines"] = sorted(set(resolved_lines_r))
-                    # Same critic for code_exercise on retry
-                    if ex_type == "code_exercise" and isinstance(retry_content, dict):
-                        try:
-                            retry_content = _critic_code_exercise(retry_content)
-                        except Exception as e:
-                            logging.warning("code_exercise critic (retry) failed: %s", e)
+                if attempt >= 4:
+                    _hint_parts.append(
+                        "CRITICAL: Retry attempt {0}/5. Previous {1} attempts all produced "
+                        "starters that passed their own tests. DO NOT emit any working logic "
+                        "in the `code` field. The function body MUST be a single "
+                        "`raise NotImplementedError(...)` line, nothing more.".format(attempt, attempt - 1)
+                    )
+                # L4: no Opus upgrade — Sonnet all retries.
+                # L3 (2026-04-22): parallel first-attempt fan-out for code_exercise.
+                # On retries, fire 2 concurrent LLM calls with slightly different
+                # hints; take the first one that passes _is_complete. Roughly 2×
+                # LLM spend per retry, but wall-clock cuts by up to 2× and the
+                # two attempts explore different framings (one stricter hint,
+                # one pattern-oriented) — higher chance at least one satisfies
+                # the invariant. When only one attempt is desired (non-code_exercise
+                # retries), fan-out=1 preserves the prior behavior.
+                _fanout = 2 if ex_type == "code_exercise" else 1
+                logging.warning(
+                    "Step retry %d/%d for %s/%s/%s (fan-out=%d, model=%s)",
+                    attempt, _max_attempts, title, mod.title, step_outline.title,
+                    _fanout, _STEP_CONTENT_MODEL,
+                )
+                ctx_for_retry = dict(course_context) if isinstance(course_context, dict) else {}
+                ctx_for_retry["is_capstone_module"] = (m_pos - 1 == capstone_module_idx)
+
+                def _single_regen(hint_text: str):
+                    try:
+                        rc = _llm_generate_step_content(
+                            ctx_for_retry, mod.title, step_outline.title, ex_type,
+                            step_outline.description, retry_hint=hint_text,
+                        )
+                        if ex_type == "code_review" and isinstance(rc, dict) and rc.get("demo_data"):
+                            rc["demo_data"] = _normalize_code_review_bugs(rc["demo_data"])
+                            try: rc["demo_data"] = _critic_code_review(rc["demo_data"])
+                            except Exception: pass
+                            resolved = [b.get("line") for b in rc["demo_data"].get("bugs", [])
+                                        if isinstance(b, dict) and isinstance(b.get("line"), int)]
+                            if resolved:
+                                rc.setdefault("validation", {})["bug_lines"] = sorted(set(resolved))
+                        if ex_type == "code_exercise" and isinstance(rc, dict):
+                            try: rc = _critic_code_exercise(rc)
+                            except Exception: pass
+                        return rc
+                    except Exception as _e:
+                        logging.warning("Single-regen failed: %s", _e)
+                        return None
+
+                try:
+                    if _fanout == 1:
+                        retry_content = _single_regen("\n".join(_hint_parts))
+                    else:
+                        # Two flavors of hint: one strict-rules, one pattern-oriented
+                        hint_a = "\n".join(_hint_parts)
+                        hint_b = ("\n".join(_hint_parts) +
+                                  "\n\n**FAN-OUT variant B**: try a DIFFERENT framing this time. "
+                                  "Write the starter as the SHORTEST POSSIBLE function body: "
+                                  "just `raise NotImplementedError('TODO')`. Put all detail in "
+                                  "the docstring + solution_code. Tests unchanged.")
+                        import concurrent.futures as _cf
+                        with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                            fut_a = _pool.submit(_single_regen, hint_a)
+                            fut_b = _pool.submit(_single_regen, hint_b)
+                            done, pending = _cf.wait(
+                                [fut_a, fut_b],
+                                timeout=180,
+                                return_when=_cf.FIRST_COMPLETED,
+                            )
+                            retry_content = None
+                            winners = []
+                            # Check if the first-completed passes _is_complete.
+                            for f in done:
+                                try:
+                                    rc = f.result()
+                                    if rc and _is_complete(rc, ex_type):
+                                        retry_content = rc
+                                        winners.append("first_completed")
+                                        break
+                                except Exception: pass
+                            # If first-completed didn't pass, wait for the other.
+                            if retry_content is None:
+                                for f in pending:
+                                    try:
+                                        rc = f.result(timeout=180)
+                                        if rc and _is_complete(rc, ex_type):
+                                            retry_content = rc
+                                            winners.append("second_completed")
+                                            break
+                                    except Exception: pass
+                            # If STILL none pass, just keep the first-completed.
+                            if retry_content is None:
+                                for f in list(done) + list(pending):
+                                    try:
+                                        rc = f.result(timeout=5)
+                                        if rc: retry_content = rc; break
+                                    except Exception: pass
+                            if winners:
+                                logging.info("L3 fan-out winner: %s", winners[0])
                     if _is_complete(retry_content, ex_type):
                         llm_content = retry_content
+                        break
+                    else:
+                        llm_content = retry_content or llm_content
                 except Exception as e:
-                    logging.warning("Step retry failed for %s/%s: %s", mod.title, step_outline.title, e)
+                    logging.warning("Step retry %d failed for %s/%s: %s", attempt, mod.title, step_outline.title, e)
+                    break
 
             if _is_complete(llm_content, ex_type):
                 content = llm_content.get("content") or f"<h2>{step_outline.title}</h2>\n<p>{step_outline.description}</p>"

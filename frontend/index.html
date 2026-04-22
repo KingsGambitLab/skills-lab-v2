@@ -9,6 +9,15 @@
      Uppercase hex in SVG is illegal in some user-agents when URL-encoded — keep percent-encoding clean. -->
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%234a7cff'/><stop offset='100%25' stop-color='%232dd4bf'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='url(%23g)'/><path d='M20 42 L42 20 L48 26 L26 48 L18 48 Z' fill='white' opacity='0.95'/><path d='M38 24 L44 30' stroke='%230f1219' stroke-width='2' stroke-linecap='round' opacity='0.35'/></svg>">
 <link rel="apple-touch-icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%234a7cff'/><stop offset='100%25' stop-color='%232dd4bf'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='url(%23g)'/><path d='M20 42 L42 20 L48 26 L26 48 L18 48 Z' fill='white' opacity='0.95'/></svg>">
+<!-- Gap E (2026-04-22): view templates. See frontend/templates/* + CLAUDE.md
+     "VIEW-TEMPLATE + JSON-ONLY ARCHITECTURE" section. CDN-portable by pointing
+     these at the CDN base URL. -->
+<link rel="stylesheet" href="/templates/drag_drop.css">
+<link rel="stylesheet" href="/templates/code.css">
+<link rel="stylesheet" href="/templates/project.css">
+<script src="/templates/drag_drop.js" defer></script>
+<script src="/templates/code.js" defer></script>
+<script src="/templates/project.js" defer></script>
 <style>
 /* ===== CSS Variables ===== */
 :root {

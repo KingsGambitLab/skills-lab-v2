@@ -69,6 +69,27 @@ _IMAGES: dict[str, str] = {
     "postgres":    "postgres:16-alpine",
 }
 
+# Gap C (2026-04-22): pre-built images with pytest + top-20 libs pre-installed.
+# Build locally via `docker build -t sll-python-runner:latest -f
+# backend/docker_images/sll-python-runner.Dockerfile backend/docker_images/`.
+# When available + no extra requirements requested, use these to skip the
+# ~6-8s pip-install step on every submission.
+_PREBUILT_IMAGES: dict[str, str] = {
+    "python":      "sll-python-runner:latest",
+    "py":          "sll-python-runner:latest",
+}
+
+
+def _image_exists_locally(image: str) -> bool:
+    try:
+        r = subprocess.run(
+            ["docker", "image", "inspect", image, "--format", "{{.Id}}"],
+            capture_output=True, text=True, timeout=5,
+        )
+        return r.returncode == 0
+    except Exception:
+        return False
+
 
 _DOCKER_AVAILABLE: bool | None = None
 
@@ -89,19 +110,20 @@ def is_docker_available() -> bool:
     return _DOCKER_AVAILABLE
 
 
-def _cmd_for_lang(language: str, has_requirements: bool, has_tests: bool) -> list[str]:
+def _cmd_for_lang(language: str, has_requirements: bool, has_tests: bool,
+                  prebuilt: bool = False) -> list[str]:
     """Return the shell command that runs inside the container."""
     L = language.lower()
     if L in ("python", "py"):
         steps = []
-        # Always install pytest — the slim image doesn't include it. Quiet pip.
         pip_args = "pip install -q --disable-pip-version-check"
+        # Prebuilt image already has pytest + common libs. Skip pip install
+        # unless Creator shipped additional requirements.
         if has_requirements:
-            steps.append(f"{pip_args} pytest -r /app/requirements.txt 2>&1 | tail -3")
-        elif has_tests:
+            steps.append(f"{pip_args} -r /app/requirements.txt 2>&1 | tail -3")
+        elif has_tests and not prebuilt:
             steps.append(f"{pip_args} pytest 2>&1 | tail -3")
         if has_tests:
-            # pytest with short tracebacks; `|| true` so non-zero rc doesn't short-circuit EXIT_CODE capture.
             steps.append("cd /app && pytest tests/ -q --tb=short 2>&1 | tail -60; echo EXIT_CODE=$?")
         else:
             steps.append("cd /app && python solution.py 2>&1; echo EXIT_CODE=$?")
@@ -227,6 +249,15 @@ def run_in_docker(
             "execution_time": 0,
             "exit_code": -1,
         }
+    # Gap C: prefer pre-built image when available AND no extra requirements
+    # requested (if the Creator shipped a requirements file, we need a clean
+    # base so pip install hits the full set).
+    _use_prebuilt = False
+    if not requirements and language.lower() in _PREBUILT_IMAGES:
+        prebuilt = _PREBUILT_IMAGES[language.lower()]
+        if _image_exists_locally(prebuilt):
+            image = prebuilt
+            _use_prebuilt = True
 
     L = language.lower()
     workdir = tempfile.mkdtemp(prefix="sll_docker_")
@@ -278,7 +309,7 @@ def run_in_docker(
             _materialize_files(workdir, extra_files)
 
         # Build docker run command
-        cmd_inner = _cmd_for_lang(language, has_reqs, has_tests)
+        cmd_inner = _cmd_for_lang(language, has_reqs, has_tests, prebuilt=_use_prebuilt)
         # Note: --network=bridge (default) so pip install / npm install works.
         # We chose network-over-isolation per the no-mocks directive: real
         # package installs, real library APIs. The grading container is
@@ -327,6 +358,135 @@ def run_in_docker(
         except Exception: pass
 
 
+def _heuristic_starter_is_incomplete(starter: str, language: str, tests: str = "") -> tuple[bool, str]:
+    """Gap A + L1 (2026-04-22): AST-based pre-filter before the Docker invariant.
+
+    Why AST: the regex-only heuristic matched `# TODO` anywhere in the source
+    (including comments next to a complete implementation) so it let through
+    starters where the tested function was actually fully implemented. AST
+    parse finds the EXACT function the test imports and checks its BODY's
+    first real statement.
+
+    For Python: parse starter → find each function the tests import
+    (`from solution import foo, bar`) → examine each tested function's body.
+    REJECT iff any tested function's body starts with a real implementation
+    (multi-statement body not starting with pass/raise/sentinel return).
+
+    For Go/JS/TS/Ruby: fall back to syntactic markers — AST parsing for those
+    languages would need per-language grammars. When in doubt, defer to Docker.
+
+    Returns (is_incomplete, reason). When is_incomplete=False, caller rejects
+    without burning a Docker roundtrip.
+    """
+    import re as _re
+    L = (language or "").lower()
+    src = starter or ""
+
+    # ── Python: AST check on each tested function ────────────────────
+    if L in ("python", "py"):
+        import ast
+        # What names do the tests import?
+        import_lines = _re.findall(r"from\s+solution\s+import\s+([^\n#]+)", tests or "")
+        imported = set()
+        for line in import_lines:
+            # strip trailing comment, split on commas, handle ' as ' aliases
+            clean = line.split("#")[0].strip()
+            for name in clean.split(","):
+                name = name.strip().split(" as ")[0].strip()
+                if name: imported.add(name)
+        if not imported:
+            # Tests don't import specific symbols OR use module import.
+            # Can't AST-check precisely; fall through to Docker.
+            return True, "tests don't name imports — let Docker authoritative"
+        try:
+            tree = ast.parse(src)
+        except SyntaxError as e:
+            return True, f"starter doesn't parse — let Docker try ({e})"
+
+        # Index functions + classes at module level
+        fns_by_name: dict[str, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef] = {}
+        for node in ast.walk(tree):
+            if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)):
+                fns_by_name[node.name] = node
+
+        verdicts = []
+        for name in imported:
+            node = fns_by_name.get(name)
+            if node is None:
+                # Name imported but no matching def in starter (module-level var?).
+                verdicts.append((name, "not_found"))
+                continue
+            if isinstance(node, ast.ClassDef):
+                # Check each method inside the class
+                method_verdicts = []
+                for sub in node.body:
+                    if isinstance(sub, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                        if sub.name.startswith("_"):
+                            continue
+                        method_verdicts.append((f"{name}.{sub.name}", _classify_fn_body(sub)))
+                if not method_verdicts:
+                    verdicts.append((name, "empty_class"))
+                else:
+                    # If ANY method looks complete, the class is complete enough to pass tests
+                    if any(v == "looks_complete" for _, v in method_verdicts):
+                        complete = [mn for mn, v in method_verdicts if v == "looks_complete"]
+                        return False, f"class {name} has complete methods {complete}"
+                    verdicts.append((name, f"class_ok:{method_verdicts}"))
+                continue
+            # Function
+            verdicts.append((name, _classify_fn_body(node)))
+
+        # Any tested function that looks complete → reject
+        complete_fns = [n for n, v in verdicts if v == "looks_complete"]
+        if complete_fns:
+            return False, f"tested function(s) {complete_fns} appear fully implemented in starter"
+        # No-import-match case: fall through to Docker for safety
+        if all(v == "not_found" for _, v in verdicts):
+            return True, f"tests import {sorted(imported)} but none found in starter — let Docker decide"
+        return True, f"AST pass: all tested functions look broken ({verdicts})"
+
+    # ── Go: simple markers ───────────────────────────────────────────
+    if L in ("go", "golang"):
+        if _re.search(r"panic\(\"[Nn]ot implemented", src) or _re.search(r"^\s*//\s*TODO", src, _re.M):
+            return True, "Go starter has panic/TODO"
+        return False, "Go starter: no incompleteness marker"
+
+    # ── JS/TS: simple markers ────────────────────────────────────────
+    if L in ("javascript", "js", "typescript", "ts"):
+        if "throw new Error" in src and "implemented" in src.lower():
+            return True, "JS starter throws not-implemented"
+        if _re.search(r"//\s*TODO", src):
+            return True, "JS starter has TODO comment"
+        return False, "JS starter: no incompleteness marker"
+
+    # Other languages — defer to Docker
+    return True, f"no AST check for {L} — let Docker decide"
+
+
+def _classify_fn_body(node) -> str:
+    """Return one of: 'empty', 'pass', 'raise', 'single_return', 'looks_complete'.
+    Ignores leading docstring expression.
+    """
+    import ast
+    body = list(node.body)
+    # Skip docstring
+    if body and isinstance(body[0], ast.Expr) and isinstance(body[0].value, ast.Constant) and isinstance(body[0].value.value, str):
+        body = body[1:]
+    if not body:
+        return "empty"
+    first = body[0]
+    if isinstance(first, ast.Pass):
+        return "pass"
+    if isinstance(first, ast.Raise):
+        return "raise"
+    # Single-return-sentinel body (body length 1, returns a simple literal or None)
+    if isinstance(first, ast.Return) and len(body) == 1:
+        # Accept any single-return as a valid broken starter (learner expected to replace)
+        return "single_return"
+    # Everything else looks complete
+    return "looks_complete"
+
+
 def validate_solution_starter_invariant(
     starter_code: str,
     solution_code: str,
@@ -338,13 +498,25 @@ def validate_solution_starter_invariant(
 ) -> dict[str, Any]:
     """LangGraph-style pre-publish validation: solution MUST pass, starter MUST fail.
 
+    Gap A (2026-04-22): runs a cheap heuristic pre-filter FIRST. If the starter
+    has no `pass` / `TODO` / `raise NotImplementedError` / wrong-sentinel marker,
+    we infer the LLM wrote the full solution in the starter slot and reject
+    IMMEDIATELY — saving the 20-30s Docker roundtrip that would reject it
+    anyway. Reduces invariant-retry wall clock from ~25s to ~100ms per reject.
+
     Returns {
-      solution_result: {test_results…},
-      starter_result:  {test_results…},
-      ok: bool,
-      reason: str (if not ok),
+      solution_result, starter_result, ok, reason,
+      heuristic_rejected: bool (True if Docker was skipped).
     }
     """
+    is_incomplete, heur_reason = _heuristic_starter_is_incomplete(starter_code, language, tests)
+    if not is_incomplete:
+        return {
+            "solution_result": None, "starter_result": None,
+            "ok": False,
+            "heuristic_rejected": True,
+            "reason": f"heuristic reject: starter looks complete ({heur_reason})",
+        }
     sol = run_in_docker(solution_code, language, tests=tests,
                         requirements=requirements, timeout_s=timeout_s)
     sta = run_in_docker(starter_code, language, tests=tests,
@@ -367,7 +539,8 @@ def validate_solution_starter_invariant(
         }
     return {
         "solution_result": sol, "starter_result": sta,
-        "ok": True, "reason": "solution passes, starter fails — invariant satisfied",
+        "ok": True, "heuristic_rejected": False,
+        "reason": "solution passes, starter fails — invariant satisfied",
     }
 
 
