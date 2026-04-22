@@ -576,15 +576,15 @@ Supported formats and tested against real training materials including:
 - Infosys Foundation Program curriculum (23-week Mysore GEC)
 - Any engineering/compliance/business onboarding content
 
-## ⚠️ HARD CONSTRAINT: Anthropic API Budget Cap — $100 USD
+## ⚠️ HARD CONSTRAINT: Anthropic API Budget Cap — $250 USD
 
-**The user has set a HARD CAP of $100 USD on total Anthropic API spend.** (Increased from $20 on 2026-04-18.) This constraint persists across all future sessions and context. Enforce it in every piece of code that calls `anthropic.Anthropic`.
+**The user has set a HARD CAP of $250 USD on total Anthropic API spend.** (Increased from $20 on 2026-04-18 → $100 on 2026-04-19 → $150 on 2026-04-21 → $250 on 2026-04-21 for the 10-course iteration loop.) This constraint persists across all future sessions and context. Enforce it in every piece of code that calls `anthropic.Anthropic`.
 
 **How it's enforced (in `backend/main.py`):**
 - Cumulative spend is tracked in `/Users/tushar/Desktop/codebases/skills-lab-v2/.anthropic_budget.json`
 - `_llm_enabled()` returns `False` when spend ≥ cap → all LLM callers auto-fall back to mocks
 - Env vars:
-  - `ANTHROPIC_BUDGET_USD=20` — set the cap (default 20)
+  - `ANTHROPIC_BUDGET_USD=150` — set the cap (default 150 as of 2026-04-21)
   - `USE_MOCK_LLM=1` — force mock mode (bypasses real API entirely)
 - GET `/api/admin/budget` exposes current spend/remaining
 
@@ -594,13 +594,194 @@ Supported formats and tested against real training materials including:
 3. **When generating new courses, assume budget pressure.** Ship a mock-fallback for every LLM-backed feature (Creator content generation, Clicky). If real LLM unavailable, the mock response must still be substantive (not a "sorry, unavailable" stub).
 4. **Do not seed the budget file with fake low numbers to unlock more spend** — that defeats the constraint. If real spend is ambiguous, estimate conservatively (upward).
 
+## 🎯 NO-MOCKS NORTH STAR (2026-04-22)
+
+**All assignments should be real-life-alike. Don't mock anything unless it is very, very expensive. Docker container running an image is OK.**
+
+This supersedes every earlier "mock module" decision. The sandbox now defaults to:
+
+1. **Primary runtime = Docker container** — per-language image (`python:3.11-slim`, `node:20-slim`, `golang:1.22-alpine`, `postgres:16-alpine`, etc.) with `pip install` / `npm install` / `go mod` reading the Creator-emitted requirements file. Learner code + hidden tests are mounted; tests run inside the container; pass/fail per test is returned. Nothing is stubbed.
+2. **Fallback = in-process mock sandbox** — only when Docker isn't available on the box (e.g. local dev without Docker daemon) or when the language has no container image we ship. The old `_build_mock_modules` stubs stay as this fallback.
+3. **Budget-gated exception**: ML training that needs a GPU, K8s API server that needs real cluster state, or any runtime that costs >$0.05 per session → we use a scripted / mocked environment (incident_console, simulator_loop) as a pedagogically-faithful substitute.
+
+Implication for the Creator:
+- Stop writing `sys.modules['bcrypt'] = …` stubs into starter code. Instead, emit a `requirements.txt` (or `package.json`, `go.mod`) with the real dependency and let the Docker runtime `pip install` it.
+- Starter code imports the real library. Solution code uses the real library's real API. Tests import the real library.
+- If a Creator-generated exercise requires a library not in the Docker image base, the image build step reads the requirements file and installs it. First run is slow (~30-60s); subsequent runs use the cached image.
+
+Implication for the grader:
+- `_validate_code_exercise` routes to `docker_run` when `language` supports a container. Hidden tests are primary (`pytest -q`, `jest --ci`, `go test ./...`). `must_contain` is retired as a grade primitive — it survives only as a legacy signal capped at 5% weight for compliance-copy exercises.
+- `solution MUST pass + starter MUST fail` is enforced at generation time (LangGraph validate-loop, shipped 2026-04-22).
+
+Implication for learners: what they see is what they'd see on their laptop with the real library installed. ImportErrors go away. Behavior becomes the primary signal.
+
+## 🎭 VIEW-TEMPLATE + JSON-ONLY ARCHITECTURE (2026-04-21)
+
+**Separation principle (non-negotiable going forward)**: for every assignment type EXCEPT interactive slides, the **view** is a static template file (HTML + CSS + JS) that WE own and check into `frontend/templates/`, and the **data** is a pure JSON payload produced by the Creator API. The LLM never emits UI/CSS/JS for assignments. Templates are versioned assets — CDN-portable tomorrow without touching the LLM pipeline.
+
+**Why**: today's Creator generates HTML/CSS/JS inline on every step, which is the root cause of the recurring dark-theme violations, zombie-setInterval bugs, wall-of-text rendering, plurality drift, and "wild-west" widget quality. Moving the view into owned templates kills that entire bug class AND makes the product CDN-deployable for future scale.
+
+### Assignment-family dispatch
+
+| Family | Creator JSON shape | Judge (grader) | View template |
+|---|---|---|---|
+| **Drag-drop** — parsons / ordering / categorization / sjt / **code_review** | `{items[], correct_mapping OR correct_order OR bug_lines, explanations[]}` | Simple backend endpoint — takes learner's ordering/click-set, returns per-item correctness JSON | `frontend/templates/drag_drop.*` — renders items, handles drop, calls judge, displays per-item ✓/✗ |
+| **Code — runnable language** (Python, Node, Go, Ruby, Java, Rust, etc.) | `{problem_statement, code (starter), test_cases[]}` | **Docker** container — builds + runs learner's code, executes tests, returns per-test pass/fail | `frontend/templates/code.*` — Monaco editor, Run button, test-results panel |
+| **Code — infra language** (Dockerfile, Kubernetes YAML, Helm, Terraform, docker-compose) | Same shape: `{problem_statement, code (starter), test_cases[]}` | **GitHub Actions** workflow — learner pushes branch, GHA builds image / applies manifest / lints / probes, reports conclusion back | Same `frontend/templates/code.*`, dispatches to GHA runner instead of Docker |
+| **Project / Capstone** (multi-file, deployable) | `{problem_statement, starter_files[], test_cases[] OR probe_url OR gha_workflow_check}` | **GHA** OR **URL/IP probe** OR **hidden tests** — Creator picks per capstone | `frontend/templates/project.*` — WebContainer (Monaco + file tree + virtual terminal) for multi-file editing, submit bar, grader-feedback panel |
+| **Interactive slides** (concept widgets — teaching surface) | **UNCHANGED** — LLM still generates HTML/CSS/JS as today | N/A (no grading) | LLM output injected directly; wrapped by managed-script teardown (Fix A) |
+
+### LLM quality passes (multi-pass, echoing the LangGraph pipeline from `~/Downloads/SYSTEM_ARCHITECTURE.md`)
+
+For every assignment JSON payload, the Creator runs:
+1. **Generate** — LLM produces `{problem_statement, code, test_cases}` (or family-specific fields).
+2. **Critique** — self-critique pass scores quality (clarity, difficulty, realism, cheese-proofness). Refine if < threshold. Max 3 iterations.
+3. **Validate — syntax** — parse check on `code` + `test_cases`.
+4. **Validate — full (solution/starter invariant)** — Creator also emits a hidden `solution` file. Grader runs: (a) solution MUST pass all tests, (b) starter MUST FAIL tests. Both conditions required — otherwise the exercise is either unsolvable or already solved.
+5. **Fix loop** — if validation fails, route to fix-solution / fix-tests / fix-problem based on failure category. Max 5 fix attempts, then quarantine the step.
+6. **Score difficulty** — final rubric scoring.
+7. **Package** — emit the final JSON payload for the frontend template to render.
+
+No step is published to a learner without passing every gate. The `_is_complete()` + ontology gate from this session is step 0 of this pipeline; the rest (critique / solution-starter invariant / fix loop) is the LangGraph rewrite on the roadmap.
+
+### File layout (target — to be built out across the next iterations)
+
+```
+frontend/templates/
+├── drag_drop.html        # parsons / ordering / categorization / sjt / code_review
+├── drag_drop.js
+├── drag_drop.css
+├── code.html             # runnable-language exercises (Docker judge)
+├── code.js               # includes Monaco mount + judge dispatcher
+├── code.css
+├── code_infra.js         # tiny variant that dispatches to GHA judge instead of Docker
+├── project.html          # capstone / multi-file (WebContainer + file tree + terminal)
+├── project.js
+├── project.css
+└── manifest.json         # template registry (version, asset URLs) — CDN-portable
+```
+
+The template registry is consumed by the frontend on step load: `POST /api/step/{id}` returns `{exercise_type, template_id, data}`; the frontend loads the template's JS bundle (local today, CDN tomorrow) + hands it the `data` payload. The template's judge handler calls back to the appropriate judge endpoint (simple-backend / Docker / GHA) and renders results.
+
+### Interpretive choices locked in (2026-04-21)
+
+1. **`code_review` sits in the drag-drop judge family** — learner clicks buggy lines, backend does set-match against `bug_lines`. No Docker needed.
+2. **"VS Code" in project templates = WebContainer/Monaco + file tree + virtual terminal** — in-browser, no VS Code Server pod per learner unless/until we ship one.
+3. **Dockerfile-exercise dispatch** splits on what the learner WRITES: writing a Dockerfile → GHA judge; writing Python that a Dockerfile runs → Docker judge.
+4. **Interactive slides stay LLM-HTML today** with the Fix-A managed-script teardown in place. Long-term, slide types migrate to templates too.
+
+## 🧬 ONTOLOGY LAYER (2026-04-21 — shipped as `backend/ontology.py`)
+
+**The rule**: every decision the Creator makes (slide shape, assignment type, course mode, tech domain, runtime) is a REGISTRY ENTRY, not a prose line in a prompt. Creator prompts are **assembled** from the registry at call time. Adding a new type = one `register_*()` call from an extension module. The Creator never invents outside the registry.
+
+**Five layers in `backend/ontology.py`** (each mutable, extensible via `register_*()` helpers):
+
+| Layer | Registry | Purpose |
+|---|---|---|
+| **1. Slide types** | `SLIDE_REGISTRY` | Templated content cards (concept_card, diagram_flow, checklist, table_compare, code_read, callout_warn/tip, stat_highlight, domain_legend, mini_demo). Each has a frozen HTML template + dark-theme CSS + declared field schema. Replaces free-form inline HTML that produced the recurring dark-theme + zombie-setInterval bugs. |
+| **2. Assignment types** | `ASSIGNMENT_REGISTRY` | Exercise types with **grade primitives** declared explicitly: `compile / hidden_tests / property_test / lint / must_contain / bug_lines / state_assertion / endpoint_probe / gha_workflow_check / artifact_flag / llm_rubric / benchmark_score`. Every code-writing assignment MUST include ≥1 cheese-proof primitive (anything except `must_contain` alone). |
+| **3. Course modes** | `COURSE_MODE_REGISTRY` | Module-shape contracts (linear / case_library / simulator_workday / drill_only / certification_track). Each enforces min/max module counts + capstone-type whitelist. |
+| **4. Tech domains** | `TECH_DOMAIN_REGISTRY` | **The master list for tech courses.** 13 domains V1: backend_python, backend_node, backend_go, frontend_react, data_sql, data_ml, data_analytics, devops_docker, devops_k8s, ops_sre, security_appsec, ai_dev_tools, observability. Each has canonical stack + preferred assignments + runtime requirements + fixture-library pointers. |
+| **5. Runtimes** | `RUNTIME_REGISTRY` | Execution primitives the grader dispatches to: `python_sandbox / sql_sqlite / yaml_schema / dockerfile_lint / shell_bash_n` (ready) + `docker / github_actions / vscode / terminal / ephemeral_k3d / ephemeral_system / webcontainer / benchmark_server` (planned first-class objects per user 2026-04-21 directive). Each declares which grade primitives it supports. |
+
+**Extending the ontology** — one call, no prompt rewrites:
+```python
+from backend.ontology import register_slide, register_assignment, SlideType, AssignmentType
+register_slide(SlideType(id="my_new_card", description="…", html_template="…", fields={"x":"str"}))
+register_assignment(AssignmentType(id="my_capstone", grade_primitives=["hidden_tests","state_assertion"], ...))
+```
+
+**Creator prompt assembly**: `build_creator_ontology_brief(domain_id)` renders the registry as the authoritative ontology section of the Creator prompt. Called at generate time so new registrations take effect without restart.
+
+**Gate enforcement**: `validate_step_against_ontology(exercise_type, demo_data, validation, code)` → `(ok, reason)`. Called from `_is_complete`. Enforces: required `demo_data` fields present, required `validation` fields present (with `any_of:...` syntax for one-of), fill-in-blank-for-code rejected (retired 2026-04-21), system_build without any of `{gha_workflow_check, endpoint_probe, state_assertion, artifact_flag}` rejected.
+
+**Code-writing assignment schema (2026-04-21 simplification)** — retired `fill_in_blank` for code languages; every code assignment emits only:
+- `code` — starter scaffold (20-60 lines, production-flavored, 2-4 TODOs)
+- `exercise_type` — one of: `code_exercise / code_review / code_read / system_build / mentored_iteration / property_test_grader`
+- `demo_data.language` — `python / sql / yaml / dockerfile / shell / go / ts / ...`
+- For `code_review` only: `demo_data.bugs[]` with `{line, line_content, description}`
+- For `code_exercise`: `validation.hidden_tests` (pytest/jest source) or `validation.properties` (Hypothesis). `must_contain` permitted only as low-weight supplementary signal.
+- **Solution/starter invariant** (from the design-doc LangGraph pipeline): Creator also emits a hidden `solution` file; before publish, generation validates that solution-passes + starter-fails. No exercise ships that's unsolvable OR already solved.
+
+**Target architecture references** (from the design docs in `~/Downloads/`, loaded into the ontology as north-star):
+- `SYSTEM_ARCHITECTURE.md` — LangGraph pipeline (`enrich → classify → generate → critique ↔ refine → validate_syntax → validate_full ↔ fix → score → package`), Docker-based test execution, solution-passes + starter-fails invariant.
+- `IMPLEMENTATION_GUIDE.md` — FastAPI + LangGraph + Pydantic state models, self-healing validation loop (up to 5 fix attempts per category: solution / tests / problem).
+- `FRONTEND_GUIDE.md` — React + Socket.IO + shadcn/ui + Monaco, live-generation-timeline with per-LLM-call activity feed, step-by-step progress.
+- `README.md` — index.
+
+The registry + prompt assembler + gate form the spine. Runtime backends (docker, GHA, vscode, terminal) land as separate handler registrations that bind into `RUNTIME_REGISTRY` at import time.
+
+## ⚠️ Deploy targets (2026-04-21) — skills.sclr.ac is SHARED, do NOT push there by default
+
+Two remote EC2 boxes exist behind nginx + basic auth (`impact:getshitdone`). Deploy conventions:
+
+- **`skills.sclr.ac` (52.88.255.208)** — **SHARED WITH AN EXTERNAL TEAM.** Do NOT push experimental changes, beta builds, or mid-cycle fixes here by default. Only deploy to this box when the user explicitly greenlights it (e.g. "push to both" / "deploy on sclr too"). Treat it as production-adjacent.
+- **`18.236.242.248`** — **default deploy target for all beta-cycle work.** Push freely. All `/loop` audits, stress tests, new exercise types, and Creator-prompt iterations go here first and stay here until the user OK's promotion.
+
+When in doubt: deploy to `18.236.242.248` only. If a change has been validated there, pause and ASK before touching `skills.sclr.ac`.
+
+## 🏗️ F24 + F26 (2026-04-21) — Capstone scaffold primitives + GHA eval harness
+
+**Problem:** Heavy-infra capstones (Docker / K8s / deploy / "read a 50K-line codebase") were unsolvable as-shipped because the Creator referenced artifacts (codebases to walk, services to deploy, workflows to run) without giving the learner any way to obtain those artifacts OR any way to prove their solution worked. F26 fixes the INPUT side (scaffolding); F24 fixes the GRADING side (external CI attestation). They ship together.
+
+### F26 — `demo_data.starter_repo` / `demo_data.starter_files` / `demo_data.repo_path_var`
+
+Creator emits one or both of these when a `code_exercise` / `system_build` step references external filesystem state:
+
+```json
+{
+  "demo_data": {
+    "starter_repo": {
+      "url": "https://github.com/skills-lab-demos/flowsync-50k",
+      "ref": "main",
+      "description": "50K-line FastAPI + Redis codebase with a real idle-timeout bug"
+    },
+    "starter_files": [
+      {"path": "app/auth/session_manager.py", "contents": "…"},
+      {"path": "app/db/queries.py", "contents": "…"}
+    ],
+    "repo_path_var": "repo_path"
+  }
+}
+```
+
+- `starter_repo` → clickable "Clone starter →" banner above the editor. MUST be a public GitHub URL. Purely informational to the learner (they clone locally).
+- `starter_files` → backend pre-materializes these into a temp dir at `/api/execute` time and injects a Python variable (named by `repo_path_var`, default `repo_path`) into the sandbox globals pointing at the dir. The learner's code then does `os.walk(repo_path)` against a real, non-empty directory.
+- When the emitted code calls `os.walk` / `Path().glob` / `open(x)` / `subprocess` against any path outside `"."`, the Creator MUST emit one of these primitives. `_is_complete` rejects code_exercise steps that reference external FS state but emit neither `starter_repo` nor `starter_files`.
+
+### F24 — `validation.gha_workflow_check` for Docker / heavy-infra capstones
+
+For exercises where the grader can't run the learner's solution server-side (Docker build, K8s apply, multi-service stack, long-running pipeline), the Creator emits:
+
+```json
+{
+  "validation": {
+    "gha_workflow_check": {
+      "repo_template": "https://github.com/skills-lab-demos/docker-capstone-<auto>",
+      "workflow_file": "lab-grade.yml",
+      "expected_conclusion": "success",
+      "grading_job": "grade",
+      "instructions_md": "1. Fork repo  2. Push your solution to a branch  3. GHA runs lab-grade.yml  4. Paste the run URL below"
+    }
+  }
+}
+```
+
+- Learner pastes the **GitHub Actions run URL** (e.g. `https://github.com/<their-fork>/actions/runs/12345678`) into a text box.
+- Backend parses owner/repo/run_id from the URL, calls `GET /repos/{owner}/{repo}/actions/runs/{run_id}` via the public GitHub API (unauthenticated works for public repos up to 60 req/hr; accept `GITHUB_TOKEN` env var for higher limits), asserts `run.conclusion == expected_conclusion`.
+- Score: 1.0 if conclusion matches and the target job (by `grading_job` name) succeeded; 0.0 otherwise with a feedback hint.
+- SSRF-safe: only `https://github.com/…` URLs accepted; run_id parsed as integer.
+- Required for: any `code_exercise` / `system_build` whose `demo_data.language` is `dockerfile` OR whose content describes K8s apply, multi-container deploy, or terraform apply.
+
+**Creator-prompt rule:** for `dockerfile` / `docker-compose` / Helm / K8s / `terraform apply` capstones, `gha_workflow_check` is MANDATORY. For plain Python/SQL/YAML exercises, `must_contain` / `endpoint_check` are still valid (`gha_workflow_check` is the extra tool, not a replacement).
+
 ## Tech Stack
 - **Backend**: Python 3.14, FastAPI, async SQLAlchemy (SQLite + aiosqlite)
 - **Frontend**: Single-file HTML (`frontend/index.html`), dark theme, no build step
 - **Database**: 6 tables — Course, Module, Step, UserProgress, Certificate, ReviewSchedule
 - **Code Execution**: Sandboxed `exec()` with mock modules, 10s timeout, restricted builtins
 - **Server**: uvicorn on port 8001, launch config in `.claude/launch.json`
-- **LLM Budget**: $100 USD cap on Anthropic API, auto-mock fallback. Current spend: see `/api/admin/budget`
+- **LLM Budget**: $250 USD cap on Anthropic API (bumped from $100 on 2026-04-21), auto-mock fallback. Current spend: see `/api/admin/budget`
 
 ## Project Structure
 ```

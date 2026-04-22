@@ -97,6 +97,12 @@ class Course(Base):
     # Never hard-delete — preserves user progress, certificates, and enables recovery.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # Lifecycle status (2026-04-21): "generating" while /api/creator/generate is
+    # mid-pipeline (rows now committed per-step for SQLite concurrency, so the
+    # course briefly exists in the DB but isn't complete); "ready" when gen
+    # finishes; "failed" if the handler raises. Only "ready" shows in public list.
+    generation_status: Mapped[str] = mapped_column(String, nullable=False, default="ready")
+
     modules: Mapped[list["Module"]] = relationship(
         back_populates="course", cascade="all, delete-orphan", order_by="Module.position"
     )
@@ -237,6 +243,30 @@ async def create_tables() -> None:
     """Create all tables. Call once at app startup."""
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+    # Lightweight forward-migrations for SQLite columns added after the first
+    # create_all ran. `create_all` is idempotent on TABLES but does NOT backfill
+    # new COLUMNS on existing tables. For a small app + SQLite, we accept this
+    # idempotent ALTER pattern rather than pulling in alembic.
+    await _ensure_column(
+        table="courses",
+        column="generation_status",
+        ddl="ALTER TABLE courses ADD COLUMN generation_status VARCHAR NOT NULL DEFAULT 'ready'",
+    )
+
+
+async def _ensure_column(*, table: str, column: str, ddl: str) -> None:
+    """Add a column to an existing SQLite table if it isn't already present.
+
+    PRAGMA table_info(name) returns one row per column. We check membership and
+    run the ALTER only when missing. Safe + idempotent across restarts.
+    """
+    from sqlalchemy import text
+    async with engine.begin() as conn:
+        rows = (await conn.execute(text(f"PRAGMA table_info({table})"))).fetchall()
+        existing = {r[1] for r in rows}
+        if column in existing:
+            return
+        await conn.execute(text(ddl))
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

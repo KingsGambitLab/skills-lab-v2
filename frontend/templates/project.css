@@ -1,0 +1,113 @@
+/* project template — for capstones (system_build / github_classroom / cluster_state_check) */
+.tmpl-project {
+  display: flex; flex-direction: column; gap: 14px;
+  color: #e8ecf4;
+  font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif;
+}
+.tmpl-project .tmpl-title {
+  display: inline-block;
+  margin: 0 0 8px 0; color: #e8ecf4; font-size: 1.15rem; font-weight: 600;
+}
+.tmpl-project .tmpl-capstone-badge {
+  display: inline-block;
+  margin-left: 10px;
+  padding: 3px 10px;
+  background: #2dd4bf22;
+  color: #2dd4bf;
+  border-radius: 10px;
+  font-size: 0.74rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  vertical-align: middle;
+}
+.tmpl-project .tmpl-problem {
+  margin: 0 0 10px 0; color: #c9d1df; font-size: 0.94rem; line-height: 1.55;
+}
+.tmpl-project .tmpl-section-title {
+  margin: 0 0 10px 0; color: #e8ecf4; font-size: 0.98rem; font-weight: 600;
+}
+
+.tmpl-project .tmpl-scaffold-banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 14px;
+  background: #1e2a44;
+  border: 1px solid #3b4a70;
+  border-left: 3px solid #4a7cff;
+  border-radius: 6px;
+}
+.tmpl-project .tmpl-scaffold-banner a {
+  color: #4a7cff; text-decoration: none;
+}
+.tmpl-project .tmpl-scaffold-meta { color: #8892a8; margin-left: 6px; font-size: 0.82rem; }
+
+.tmpl-project .tmpl-phases,
+.tmpl-project .tmpl-checklist,
+.tmpl-project .tmpl-gha-widget,
+.tmpl-project .tmpl-endpoint-widget {
+  background: #1e2538;
+  border: 1px solid #2a3352;
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.tmpl-project .tmpl-phase-list,
+.tmpl-project .tmpl-checklist-list {
+  display: flex; flex-direction: column; gap: 8px;
+}
+.tmpl-project .tmpl-phase-item,
+.tmpl-project .tmpl-check-item {
+  display: flex; gap: 10px; align-items: center;
+  padding: 8px 12px;
+  background: #161b26;
+  border: 1px solid #2a3352;
+  border-radius: 6px;
+  cursor: pointer;
+  user-select: none;
+}
+.tmpl-project .tmpl-phase-item:hover,
+.tmpl-project .tmpl-check-item:hover {
+  border-color: #4a7cff;
+}
+.tmpl-project .tmpl-phase-item.done,
+.tmpl-project .tmpl-check-item.done {
+  background: #0e2620; border-color: #2dd4bf;
+}
+.tmpl-project .tmpl-phase-icon { font-size: 1.1rem; color: #8892a8; }
+.tmpl-project .tmpl-phase-item.done .tmpl-phase-icon { color: #2dd4bf; }
+
+.tmpl-project .tmpl-gha-input-row {
+  display: flex; gap: 10px; margin-top: 10px;
+}
+.tmpl-project .tmpl-url-input {
+  flex: 1;
+  padding: 8px 12px;
+  background: #161b26;
+  border: 1px solid #2a3352;
+  border-radius: 6px;
+  color: #e8ecf4;
+  font-family: "SF Mono", monospace;
+  font-size: 0.86rem;
+}
+.tmpl-project .tmpl-url-input:focus {
+  outline: none; border-color: #4a7cff;
+}
+.tmpl-project .tmpl-btn {
+  padding: 8px 16px; border-radius: 6px; border: 0; cursor: pointer; font-size: 0.9rem;
+}
+.tmpl-project .tmpl-btn-primary { background: #4a7cff; color: #fff; }
+.tmpl-project .tmpl-btn:hover { filter: brightness(1.1); }
+
+.tmpl-project .tmpl-gha-result {
+  margin-top: 10px; padding: 10px 14px; border-radius: 6px; font-size: 0.88rem;
+}
+.tmpl-project .tmpl-gha-result.ok { background: #0e2620; color: #86efac; border-left: 3px solid #2dd4bf; }
+.tmpl-project .tmpl-gha-result.fail { background: #2a1a22; color: #fca5a5; border-left: 3px solid #f87171; }
+.tmpl-project .tmpl-gha-result.pending { background: #2a2718; color: #fbbf24; border-left: 3px solid #fbbf24; }
+
+.tmpl-project .tmpl-feedback {
+  margin-top: 8px; padding: 10px 14px; border-radius: 6px;
+  font-size: 0.92rem; display: none;
+}
+.tmpl-project .tmpl-feedback.pass { background: #0e2620; color: #86efac; border-left: 3px solid #2dd4bf; display: block; }
+.tmpl-project .tmpl-feedback.fail { background: #2a1a22; color: #fca5a5; border-left: 3px solid #f87171; display: block; }
+.tmpl-project .tmpl-feedback.partial { background: #2a2718; color: #fbbf24; border-left: 3px solid #fbbf24; display: block; }

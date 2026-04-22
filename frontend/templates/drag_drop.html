@@ -1,0 +1,38 @@
+<!--
+  drag_drop template — handles parsons / ordering / categorization / sjt / code_review.
+  View owns: layout, CSS, drag-drop interactions, submit-feedback render.
+  LLM owns: data payload only (items, categories, bug lines, etc.) — NO HTML.
+-->
+<div class="tmpl-drag-drop" data-template="drag_drop">
+  <div class="tmpl-header">
+    <h3 class="tmpl-title" data-slot="title"></h3>
+    <p class="tmpl-briefing" data-slot="briefing"></p>
+  </div>
+
+  <div class="tmpl-body">
+    <!-- Bin: where items start (the source pool) -->
+    <div class="tmpl-source-bin" data-role="source-bin">
+      <h5 class="tmpl-bin-label">Items</h5>
+      <div class="tmpl-item-list" data-role="source-items"></div>
+    </div>
+
+    <!-- Target bins: where learner drops items.
+         One bin for ordering/parsons (the "correct sequence").
+         N bins for categorization (one per category).
+         For sjt: N ranked slots.
+         For code_review: a code view with clickable lines (rendered separately below). -->
+    <div class="tmpl-target-bins" data-role="target-bins"></div>
+
+    <!-- code_review specific: the code being reviewed, one line per row -->
+    <div class="tmpl-code-review" data-role="code-review" style="display:none">
+      <pre class="tmpl-code-pre"><code data-slot="code-review-code"></code></pre>
+    </div>
+  </div>
+
+  <div class="tmpl-actions">
+    <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="submit">Submit</button>
+    <button type="button" class="tmpl-btn tmpl-btn-secondary" data-action="reset">Reset</button>
+  </div>
+
+  <div class="tmpl-feedback" data-role="feedback"></div>
+</div>

@@ -991,6 +991,10 @@ body.catalog-mode .content-scroll {
 .drag-item.correct { border-color: var(--success); background: var(--success-bg); }
 .drag-item.incorrect { border-color: var(--error); background: var(--error-bg); }
 .drag-item.distractor { color: var(--text-muted); border-style: dashed; }
+/* F20 fix 2026-04-21: during a drag, previously-placed items get this class
+   so the parent drop target (bin/slot) receives the drop event instead of the
+   child item swallowing it. Cleared on dragend. */
+.drag-item.drag-pass-through { pointer-events: none; }
 
 .drop-zone {
   min-height: 48px;
@@ -1381,6 +1385,22 @@ body.catalog-mode .content-scroll {
 .cr-line:hover { background: var(--bg-tertiary); }
 .cr-line.flagged {
   background: var(--error-bg);
+}
+/* F4 fix 2026-04-21: post-submit marker states so the learner sees which
+   clicks were right (green) vs wrong (brighter red) — before this the
+   flagged-coral color persisted regardless of correctness. */
+.cr-line.flagged.correct-click {
+  background: rgba(34, 197, 94, 0.15);
+  border-left-color: #22c55e;
+}
+.cr-line.flagged.wrong-click {
+  background: rgba(239, 68, 68, 0.22);
+  border-left-color: #ef4444;
+}
+.cr-line.flagged.correct-click .cr-line-marker,
+.cr-line.flagged.correct-click .cr-line-num { color: #22c55e; }
+.cr-line.flagged.wrong-click .cr-line-marker,
+.cr-line.flagged.wrong-click .cr-line-num { color: #ef4444;
   border-bottom-color: rgba(248,113,113,0.2);
 }
 .cr-line-num {
@@ -2076,29 +2096,62 @@ button.expertise-badge:hover {
 }
 
 /* ===== Creator Wizard ===== */
+/* Creator FAB — labeled pill (2026-04-21 UX fix: the old 52×52 "+" icon was
+   easy for first-timers to miss; new pill reads "✨ Create Course" so the
+   intent is unambiguous). Attention pulse fires on first load for visitors
+   who haven't clicked it yet (stops after 3 pulses). */
 .creator-fab {
   position: fixed;
   bottom: 28px;
   left: 28px;
   z-index: 90;
-  width: 52px;
   height: 52px;
-  border-radius: 50%;
+  padding: 0 22px 0 18px;
+  border-radius: 26px;
   background: linear-gradient(135deg, var(--accent), var(--teal));
   border: none;
   color: #fff;
-  font-size: 1.6rem;
-  font-weight: 300;
-  display: flex;
+  font-size: 0.95rem;
+  font-weight: 600;
+  letter-spacing: 0.2px;
+  display: inline-flex;
   align-items: center;
-  justify-content: center;
-  box-shadow: 0 4px 20px rgba(74, 124, 255, 0.35);
-  transition: transform 0.2s, box-shadow 0.2s;
+  gap: 8px;
+  box-shadow: 0 6px 24px rgba(74, 124, 255, 0.45), 0 2px 6px rgba(0,0,0,0.25);
+  transition: transform 0.18s ease, box-shadow 0.18s ease, filter 0.18s ease;
   cursor: pointer;
+  white-space: nowrap;
 }
 .creator-fab:hover {
-  transform: scale(1.1);
-  box-shadow: 0 6px 28px rgba(74, 124, 255, 0.5);
+  transform: translateY(-2px) scale(1.03);
+  box-shadow: 0 10px 32px rgba(74, 124, 255, 0.6), 0 3px 8px rgba(0,0,0,0.3);
+  filter: brightness(1.08);
+}
+.creator-fab:active { transform: translateY(0) scale(1); }
+.creator-fab .creator-fab-icon {
+  font-size: 1.15rem;
+  line-height: 1;
+  display: inline-block;
+}
+/* First-load attention ring — pulses 3 times then stops. Triggered by JS
+   adding .pulse class if the user hasn't opened the wizard before
+   (localStorage flag). */
+.creator-fab.pulse::after {
+  content: "";
+  position: absolute;
+  inset: -4px;
+  border-radius: 30px;
+  border: 2px solid rgba(74, 124, 255, 0.8);
+  pointer-events: none;
+  animation: creator-fab-pulse 1.6s ease-out 0s 3;
+}
+@keyframes creator-fab-pulse {
+  0%   { opacity: 0.9; transform: scale(1); }
+  70%  { opacity: 0;   transform: scale(1.25); }
+  100% { opacity: 0;   transform: scale(1.25); }
+}
+@media (max-width: 640px) {
+  .creator-fab { bottom: 20px; left: 20px; height: 46px; padding: 0 18px 0 14px; font-size: 0.88rem; }
 }
 
 .creator-overlay {
@@ -2562,7 +2615,10 @@ button.expertise-badge:hover {
 </div>
 
 <!-- Creator FAB -->
-<button class="creator-fab" id="creatorFab" onclick="openCreatorWizard()" title="Create Course">+</button>
+<button class="creator-fab" id="creatorFab" onclick="openCreatorWizard()" title="Create Course — generate a new course from a topic">
+  <span class="creator-fab-icon" aria-hidden="true">✨</span>
+  <span>Create Course</span>
+</button>
 
 <!-- Creator Wizard Modal -->
 <div class="creator-overlay" id="creatorOverlay">
@@ -2594,11 +2650,22 @@ async function fetchModule(courseId, moduleId) {
   return res.json();
 }
 
-async function executeCode(code) {
+async function executeCode(code, language, extras) {
+  const payload = { code, language: language || 'python' };
+  // D.2 (2026-04-21): pass language-specific fixtures when available.
+  // SQL: schema_setup (DDL) + seed_rows ([{table, rows}]).
+  // YAML: schema (JSON Schema dict).
+  // The grader pulls these from step.demo_data at submit time; executeCode
+  // passes them for the "Run" button previews.
+  if (extras && typeof extras === 'object') {
+    if (extras.schema_setup) payload.schema_setup = extras.schema_setup;
+    if (extras.seed_rows) payload.seed_rows = extras.seed_rows;
+    if (extras.yaml_schema) payload.yaml_schema = extras.yaml_schema;
+  }
   const res = await fetch(`${API}/execute`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ code })
+    body: JSON.stringify(payload)
   });
   if (!res.ok) throw new Error(`Execution failed: ${res.status}`);
   return res.json();
@@ -3066,6 +3133,9 @@ function showCatalog() {
   state.currentModuleData = null;
   state.expertiseLevel = null;
   updateHash();
+  // Hide the "Automated learner is reviewing" banner — it's per-course only
+  // (2026-04-21 user fix: banner was floating across all views).
+  if (typeof refreshAutoReviewBannerVisibility === 'function') refreshAutoReviewBannerVisibility();
 
   // Body class → CSS collapses sidebar + expands content-scroll to full width
   document.body.classList.add('catalog-mode');
@@ -3549,7 +3619,11 @@ function renderStep(rawStep, index) {
   if (NON_CONCEPT_TYPES_WITH_BRIEFING.has(type) && step.content) {
     const isStub = /data-auto-review-stub="1"/.test(step.content);
     const plainLen = step.content.replace(/<[^>]+>/g, ' ').trim().length;
-    if (!isStub && plainLen > 80) {
+    // Threshold lowered 80 -> 20 on 2026-04-21 when the duplicate inline renders
+    // in renderCodeExerciseStep / renderSystemBuildStep were removed (E.1 fix).
+    // Without the inline fallback, short-but-real content (20-80 chars) would
+    // have rendered nowhere. 20 chars still excludes tokens-only stubs.
+    if (!isStub && plainLen > 20) {
       html += `<div class="step-briefing" style="background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:14px 18px; margin:14px 0 22px; line-height:1.6;">
         ${step.content}
       </div>`;
@@ -3613,13 +3687,66 @@ function renderStep(rawStep, index) {
   html += '</div>';
   container.innerHTML = html;
 
-  // Execute inline <script> tags (innerHTML doesn't run them automatically)
+  // Execute inline <script> tags (innerHTML doesn't run them automatically).
+  // F3 fix 2026-04-21: the Creator tends to wrap setup code in
+  // `document.addEventListener('DOMContentLoaded', function() { ... })`, but
+  // DOMContentLoaded has ALREADY fired by the time we reinstantiate these
+  // scripts — so the body never runs and "Click to reveal" widgets look dead
+  // (user report on /41/0 of created-d08b7691ff00).
+  // Strip the DOMContentLoaded wrapper and run the body inline as an IIFE.
+  //
+  // Fix A 2026-04-21 (zombie-timer teardown): any setInterval / setTimeout
+  // armed inside a widget script SURVIVES step navigation because we only
+  // replace the container's innerHTML on nav. The old interval keeps firing
+  // against a now-null `getElementById(...)`, throwing 10-100 errors/min
+  // (user report on skills.sclr.ac/#created-2672ff02d5d0/126/1, module intro
+  // widget's "Auto-pulse sync indicator" interval kept firing on step 1).
+  //
+  // Fix: tear down any timers armed by the PREVIOUS widget script before we
+  // arm the new one. We shim setInterval/setTimeout inside the widget's IIFE
+  // so the timer IDs are captured and we can clear them on step nav. The
+  // shimmed functions feed the shared _widgetTimers registry on `window`.
+  if (!window._widgetTimers) {
+    window._widgetTimers = { intervals: [], timeouts: [] };
+    window._tearDownWidgetTimers = function() {
+      try {
+        (window._widgetTimers.intervals || []).forEach(id => { try { clearInterval(id); } catch (e) {} });
+        (window._widgetTimers.timeouts || []).forEach(id => { try { clearTimeout(id); } catch (e) {} });
+      } catch (e) {}
+      window._widgetTimers = { intervals: [], timeouts: [] };
+    };
+  }
+  // Clear any timers the PREVIOUS widget armed before running the new one.
+  window._tearDownWidgetTimers();
+
   container.querySelectorAll('script').forEach(oldScript => {
     const newScript = document.createElement('script');
     if (oldScript.src) {
       newScript.src = oldScript.src;
     } else {
-      newScript.textContent = oldScript.textContent;
+      let code = oldScript.textContent || '';
+      // Match patterns like:
+      //   document.addEventListener('DOMContentLoaded', function() { BODY });
+      //   window.addEventListener('DOMContentLoaded', () => { BODY });
+      // Extract BODY and run inline via IIFE. Anchored loosely so both
+      // function-expression and arrow forms match.
+      const domReadyRegex = /(?:document|window)\s*\.\s*addEventListener\s*\(\s*['"]DOMContentLoaded['"]\s*,\s*(?:function\s*\(\s*\)\s*|\(\s*\)\s*=>\s*)\{([\s\S]*)\}\s*\)\s*;?\s*$/;
+      const m = code.trim().match(domReadyRegex);
+      if (m) {
+        code = `(function(){${m[1]}})();`;
+      }
+      // Fix A: wrap the widget body so setInterval/setTimeout are tracked.
+      // The shimmed fns call the real ones and push the returned id into
+      // window._widgetTimers. Teardown on next step nav clears them.
+      code = `(function(){
+        const _origInt = window.setInterval.bind(window);
+        const _origTo  = window.setTimeout.bind(window);
+        const _tracked = window._widgetTimers;
+        const setInterval = (fn, d, ...a) => { const id = _origInt(fn, d, ...a); _tracked.intervals.push(id); return id; };
+        const setTimeout  = (fn, d, ...a) => { const id = _origTo(fn, d, ...a);  _tracked.timeouts.push(id);  return id; };
+        try { ${code} } catch (e) { console.error('[widget script]', e); }
+      })();`;
+      newScript.textContent = code;
     }
     oldScript.parentNode.replaceChild(newScript, oldScript);
   });
@@ -3774,14 +3901,12 @@ function renderCodeExerciseStep(step, index) {
 
   let html = '';
 
-  // Render the step.content (HTML explanation + setup scaffolding) above the editor.
-  // Alex learner review 2026-04-20 found code_exercise was dropping step.content —
-  // leaving the learner with just "# Write your solution below" and zero context
-  // (especially brutal for "Use Claude Code to..." steps where the content field
-  // contains the install/auth/CLAUDE.md pointers a first-time user needs).
-  if (step.content && String(step.content).trim()) {
-    html += `<div class="code-exercise-intro" style="margin-bottom:16px;">${step.content}</div>`;
-  }
+  // NOTE (2026-04-21): step.content is now rendered by the unified briefing panel
+  // in the dispatcher above (renderStep). Removing the old inline block here —
+  // previously it caused the briefing to appear TWICE on code_exercise steps
+  // (user report on skills.sclr.ac/#created-373e38f8e51c/117/3).
+  // The briefing panel's 20-char threshold still guarantees short-but-real
+  // content lands on screen.
 
   // Deployer sandbox note — subtle banner for simple sandboxed code exercises.
   if (level === 'deployer') {
@@ -3865,17 +3990,63 @@ function toggleHint() {
 // ===================================================================
 // Code Editor Rendering & Setup
 // ===================================================================
+
+// F16 fix (2026-04-21): language label + highlighter were hardcoded to Python.
+// Now reads `step.language` (falls back to demo_data.language / validation.language)
+// and picks the display label + highlighter per-language. For types we don't
+// syntax-highlight, we render escaped plain text (still in the dark editor chrome).
+const _LANG_LABEL = {
+  python: 'Python', py: 'Python',
+  sql: 'SQL',
+  yaml: 'YAML', yml: 'YAML',
+  dockerfile: 'Dockerfile', docker: 'Dockerfile',
+  shell: 'Shell', bash: 'Bash', sh: 'Shell',
+  javascript: 'JavaScript', js: 'JavaScript',
+  typescript: 'TypeScript', ts: 'TypeScript',
+  go: 'Go',
+  rust: 'Rust',
+  java: 'Java',
+  ruby: 'Ruby',
+  php: 'PHP',
+  c: 'C', cpp: 'C++',
+  markdown: 'Markdown', md: 'Markdown',
+  json: 'JSON',
+  log: 'Log',
+  text: 'Text',
+};
+
+function _resolveEditorLanguage(index) {
+  try {
+    const step = (getSteps() || [])[index] || {};
+    const dd = step.demo_data || {};
+    const val = step.validation || {};
+    const raw = (step.language || dd.language || val.language || 'python');
+    return String(raw).toLowerCase().trim();
+  } catch (e) {
+    return 'python';
+  }
+}
+
+function _renderEditorHighlight(code, lang) {
+  if (lang === 'python' || lang === 'py') return highlightPython(code);
+  // For non-Python we render plain-escaped text — safer than mis-highlighting
+  // as Python (keywords like FROM/RUN/CMD would have been colored as Python).
+  return esc(code);
+}
+
 function renderCodeEditor(code, index, readOnly) {
   const lines = code.split('\n').length;
   const lineNums = Array.from({ length: Math.max(lines, 1) }, (_, i) => i + 1).join('\n');
+  const lang = _resolveEditorLanguage(index);
+  const label = _LANG_LABEL[lang] || (lang.charAt(0).toUpperCase() + lang.slice(1)) || 'Python';
   return `
-    <div class="code-editor-wrapper">
+    <div class="code-editor-wrapper" data-lang="${esc(lang)}">
       <div class="code-editor-header">
-        <span>Python</span>
+        <span>${esc(label)}</span>
       </div>
       <div class="code-editor-body">
         <div class="code-line-numbers" id="lineNums">${lineNums}</div>
-        <pre class="code-highlight" id="codeHighlight">${highlightPython(code)}</pre>
+        <pre class="code-highlight" id="codeHighlight">${_renderEditorHighlight(code, lang)}</pre>
         <textarea class="code-textarea" id="codeTextarea"
           spellcheck="false" autocomplete="off" autocorrect="off" autocapitalize="off"
           ${readOnly ? 'readonly' : ''}>${esc(code)}</textarea>
@@ -3894,8 +4065,11 @@ function setupCodeEditor(step, index) {
     ta.style.height = Math.max(120, ta.scrollHeight) + 'px';
   }
 
+  const _editorLang = _resolveEditorLanguage(index);
   function sync() {
-    hl.innerHTML = highlightPython(ta.value);
+    // F16 fix 2026-04-21: highlight matches step.language (Python coloring on
+    // a Dockerfile would mis-color keywords).
+    hl.innerHTML = _renderEditorHighlight(ta.value, _editorLang);
     const lines = ta.value.split('\n').length;
     ln.textContent = Array.from({ length: Math.max(lines, 1) }, (_, i) => i + 1).join('\n');
     autoResize();
@@ -4068,6 +4242,18 @@ async function onRunCode(index, isExercise) {
   if (!ta || !btn) return;
 
   const code = ta.value;
+  // D.2 (2026-04-21): pick language + fixtures from step metadata so SQL / YAML
+  // exercises route to the correct sandbox. step.language / step.demo_data.language
+  // comes through the demo_data spread in the dispatcher at line ~3501.
+  const step = getSteps()[index] || {};
+  const dd = step.demo_data || {};
+  const val = step.validation || {};
+  const language = step.language || dd.language || val.language || 'python';
+  const extras = {
+    schema_setup: dd.schema_setup || val.schema_setup,
+    seed_rows: dd.seed_rows || val.seed_rows,
+    yaml_schema: val.yaml_schema || dd.yaml_schema || val.schema || dd.schema,
+  };
   btn.disabled = true;
   btn.innerHTML = '<span class="spinner"></span> Running...';
   panel.style.display = 'block';
@@ -4075,7 +4261,7 @@ async function onRunCode(index, isExercise) {
   body.textContent = 'Running...';
 
   try {
-    const result = await executeCode(code);
+    const result = await executeCode(code, language, extras);
     const output = result.stdout || result.output || '';
     const error = result.stderr || result.error || '';
     if (result.exit_code === 1 || (!output && error)) {
@@ -4461,31 +4647,54 @@ function setupScenarioBranch(step, index) {
         clearTimeout(stuckTimeout);
         if (transEl && transEl.parentNode) transEl.remove();
 
-        // Score line — just the percentage (user feedback 2026-04-20: the
-        // "Step 0: Correct choice Step 1: ..." feedback string from the server
-        // was redundant with the per-option green/red coloring, so dropped it).
-        const scoreEl = document.createElement('div');
-        scoreEl.className = 'scenario-score ' + (result.correct ? 'perfect' : 'partial');
+        // F23 fix 2026-04-21: promoted to a sticky score banner at the TOP of
+        // the scenario (not mid-body flow where it scrolled away). Uses the
+        // standard score-display color tiers (perfect / partial / low) instead
+        // of the scenario-score class which had NO matching CSS — previously
+        // rendered as plain unstyled text. 3 tiers: ≥90% perfect (green),
+        // 50-89% partial (amber), <50% low (red). Retry hint included when
+        // score < 100% and attempts left.
         const scorePct = Math.round((result.score || 0) * 100);
-        scoreEl.innerHTML = `<strong>Score:</strong> ${scorePct}%`;
-        container.appendChild(scoreEl);
+        const tier = scorePct >= 90 ? 'perfect' : (scorePct >= 50 ? 'partial' : 'low');
+        const iconByTier = { perfect: '✓', partial: '◐', low: '✗' };
+        const totalQs = questions.length;
+        const rightCount = Math.round((result.score || 0) * totalQs);
+        // Remove any prior score banner so re-runs don't stack
+        container.querySelectorAll('.scenario-score-banner').forEach(n => n.remove());
+        const scoreEl = document.createElement('div');
+        scoreEl.className = `scenario-score-banner score-display ${tier}`;
+        scoreEl.style.cssText = `
+          position: sticky; top: 8px; z-index: 5;
+          margin: 0 0 16px 0; padding: 14px 18px;
+          display: flex; align-items: center; gap: 12px;
+          font-size: 0.95rem; font-weight: 500;
+          box-shadow: 0 4px 16px rgba(0,0,0,0.25);
+        `;
+        scoreEl.innerHTML = `
+          <span style="font-size:1.4rem; line-height:1;">${iconByTier[tier]}</span>
+          <span><strong style="font-size:1.15rem;">${scorePct}%</strong>
+            <span style="opacity:0.75; margin-left:4px;">· ${rightCount} of ${totalQs} decisions correct</span>
+          </span>
+          ${result.feedback && !result.correct ? `<span style="margin-left:auto; font-size:0.82rem; font-weight:400; opacity:0.85;">${esc((result.feedback || '').split('\n')[0].slice(0, 140))}</span>` : ''}
+        `;
+        // Insert at the TOP of the scenario container (above the questions)
+        container.insertBefore(scoreEl, container.firstChild);
+
         if ((result.score || 0) >= 0.5) {
           markStepComplete(state.currentCourse.id, state.currentModule, index, scorePct);
         }
-        // Auto-scroll the insight (if any) or score panel into view —
-        // user was missing the takeaway because it rendered below the fold.
-        const scrollTarget = container.querySelector('.scenario-insight') || scoreEl;
-        if (scrollTarget) {
-          setTimeout(() => scrollTarget.scrollIntoView({ behavior: 'smooth', block: 'center' }), 100);
-        }
+        // Auto-scroll so the learner sees the banner — and then the insight if any
+        setTimeout(() => scoreEl.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
       } catch (e) {
         clearTimeout(stuckTimeout);
         if (transEl && transEl.parentNode) transEl.remove();
         // No client-side grading fallback — would require leaking the answer key.
+        container.querySelectorAll('.scenario-score-banner').forEach(n => n.remove());
         const scoreEl = document.createElement('div');
-        scoreEl.className = 'scenario-score partial';
+        scoreEl.className = 'scenario-score-banner score-display low';
+        scoreEl.style.cssText = 'position:sticky; top:8px; z-index:5; margin:0 0 16px 0; padding:14px 18px;';
         scoreEl.textContent = 'Grading unavailable — try again in a moment.';
-        container.appendChild(scoreEl);
+        container.insertBefore(scoreEl, container.firstChild);
       }
       return;
     }
@@ -4746,11 +4955,8 @@ function displayCodeReviewResults(result, bugs, flaggedLines, index) {
 
   // REVEAL-GATE AWARENESS (user screenshot 2026-04-20): on attempt 1-2 with
   // wrong submissions, the server strips `line` / `description` / `hint` from
-  // item_results so the learner doesn't see the answer key. Without this check,
-  // the old renderer drew "× Missed - Line undefined" rows with empty descriptions.
-  // When reveal is gated, skip per-bug rendering and show only the score +
-  // retry hint. The server's `feedback` field carries the "N more retries..."
-  // message in that mode.
+  // item_results so the learner doesn't see the answer key. When reveal is
+  // gated, skip per-bug rendering and show score + retry hint only.
   const anyHasLineInfo = itemResults.some(b =>
     (b.line != null || b.line_number != null) &&
     (b.description || b.issue || b.hint)
@@ -4758,11 +4964,33 @@ function displayCodeReviewResults(result, bugs, flaggedLines, index) {
 
   let html = '';
 
+  // Server-authoritative found-count. Server knows which lines the learner
+  // flagged, so if item_results has per-bug `found_by_user`/`found`, use that.
+  // If item_results is gated/opaque, derive found from the score (source of truth).
+  const totalBugs = itemResults.length || (bugs && bugs.length) || (result.total_bugs || 0);
+  let found;
   if (anyHasLineInfo) {
-    // Full-reveal path (attempt 3+ OR correct submission): render per-bug details
+    found = itemResults.reduce((acc, b) => {
+      const was = (b.found_by_user !== undefined) ? b.found_by_user
+        : (b.found !== undefined ? b.found
+        : (b.correct !== undefined ? b.correct
+        : (b.is_correct !== undefined ? b.is_correct : null)));
+      if (was !== null) return acc + (was ? 1 : 0);
+      const ln = b.line || b.line_number;
+      return acc + ((ln != null && flaggedLines.has(ln)) ? 1 : 0);
+    }, 0);
+  } else {
+    // F4 fix 2026-04-21: on the gated path, item_results is opaque (`[{}, {}, {}]`)
+    // so the prior reduce always returned 0 — produced the "0/3 bugs found · 33%"
+    // contradiction the user flagged. Instead, round the score to a found count.
+    found = totalBugs > 0 ? Math.round((result.score || 0) * totalBugs) : 0;
+  }
+
+  if (anyHasLineInfo) {
+    // Full-reveal path: render per-bug details
     itemResults.forEach(bug => {
       const bugLine = bug.line || bug.line_number;
-      if (bugLine == null) return;  // skip stripped rows defensively
+      if (bugLine == null) return;
       const wasFound = (bug.found_by_user !== undefined)
         ? bug.found_by_user
         : (bug.found !== undefined ? bug.found : flaggedLines.has(bugLine));
@@ -4774,30 +5002,39 @@ function displayCodeReviewResults(result, bugs, flaggedLines, index) {
     });
   }
 
-  // Score line. Count needs to work in both reveal paths.
-  const total = itemResults.length || (bugs && bugs.length) || (result.total_bugs || 0);
-  const found = itemResults.reduce((acc, b) => {
-    const was = (b.found_by_user !== undefined) ? b.found_by_user
-      : (b.found !== undefined ? b.found
-      : (b.correct !== undefined ? b.correct
-      : (b.is_correct !== undefined ? b.is_correct : null)));
-    if (was !== null) return acc + (was ? 1 : 0);
-    // Fallback: compare the user's flagged set to the bug's line
-    const ln = b.line || b.line_number;
-    return acc + ((ln != null && flaggedLines.has(ln)) ? 1 : 0);
-  }, 0);
-  const pct = total > 0 ? found / total : 0;
+  const pct = totalBugs > 0 ? found / totalBugs : 0;
   const cls = pct === 1 ? 'perfect' : pct >= 0.5 ? 'partial' : 'low';
   const scorePct = (result.score != null) ? Math.round(result.score * 100) : Math.round(pct * 100);
 
   // Score banner. If reveal is gated, carry the server's retry hint text.
   const firstFeedbackLine = (result.feedback || '').split('\n')[0] || '';
   html += `<div class="score-display ${cls}" style="margin-top:12px;">
-    <strong>${found} / ${total} bugs found</strong> &middot; ${scorePct}%
+    <strong>${found} / ${totalBugs} bugs found</strong> &middot; ${scorePct}%
     ${firstFeedbackLine ? `<br><span style="font-weight:400; color:var(--text-muted); font-size:0.88rem;">${esc(firstFeedbackLine)}</span>` : ''}
   </div>`;
 
   document.getElementById('crResult').innerHTML = html;
+
+  // F4 fix 2026-04-21: update the in-code line markers so correct clicks turn
+  // green and wrong clicks turn bright-red — previously ALL flagged lines kept
+  // the same coral-red tint regardless of correctness (user report on /40/3).
+  // Compute the canonical bug-line set from item_results (when revealed) so we
+  // can color BOTH hit-clicks AND missed-click lines correctly.
+  const correctBugLines = new Set();
+  itemResults.forEach(b => {
+    const ln = b.line || b.line_number;
+    if (ln != null) correctBugLines.add(Number(ln));
+  });
+  document.querySelectorAll('.cr-line.flagged').forEach(el => {
+    el.classList.remove('correct-click', 'wrong-click');
+    const ln = Number(el.dataset.line);
+    if (!correctBugLines.size) return;  // gated path — no per-line info to color
+    if (correctBugLines.has(ln)) {
+      el.classList.add('correct-click');
+    } else {
+      el.classList.add('wrong-click');
+    }
+  });
 
   if (pct >= 0.5) {
     markStepComplete(state.currentCourse.id, state.currentModule, index);
@@ -4913,8 +5150,10 @@ function displayMcqResultLocal(isCorrect, options, selectedIndex, correctIndex, 
 // ===================================================================
 function renderSystemBuildStep(step, index) {
   const mission = step.mission || step.title || 'System Build';
-  // Backend provides mission HTML in `content`; fall back to description
-  const missionDesc = step.mission_description || step.content || step.description || '';
+  // mission_description is the short subtitle under the mission header.
+  // step.content is rendered by the unified briefing panel above (E.1 fix
+  // 2026-04-21); do NOT fall back to it here or it renders twice.
+  const missionDesc = step.mission_description || step.description || '';
   const requirements = step.requirements || step.acceptance_criteria || [];
   const techStack = step.tech_stack || [];
   // Backend provides phases/checklist in demo_data (merged into step by dispatcher)
@@ -6341,6 +6580,14 @@ function setupDragDrop(type, step, index) {
       item.classList.add('dragging');
       e.dataTransfer.effectAllowed = 'move';
       e.dataTransfer.setData('text/plain', '');
+      // F20 fix 2026-04-21: when bins are full, already-placed .drag-item
+      // children occlude the drop target's hit area — the browser fires drop
+      // on the child (which has no drop listener) and the item lands at
+      // `(unplaced)`. Setting pointer-events:none on all placed items during
+      // the active drag lets the parent bin's drop handler receive the event.
+      document.querySelectorAll('.drag-item').forEach(el => {
+        if (el !== item) el.classList.add('drag-pass-through');
+      });
     });
 
     item.addEventListener('dragend', () => {
@@ -6348,6 +6595,10 @@ function setupDragDrop(type, step, index) {
       draggedEl = null;
       // Remove all dragover classes
       document.querySelectorAll('.dragover').forEach(el => el.classList.remove('dragover'));
+      // Clear the F20 pass-through class so clicks work again
+      document.querySelectorAll('.drag-item.drag-pass-through').forEach(el => {
+        el.classList.remove('drag-pass-through');
+      });
     });
   });
 
@@ -6436,6 +6687,11 @@ async function checkParsons(index) {
   slots.forEach(slot => {
     const item = slot.querySelector('.drag-item');
     userOrder.push(item ? item.dataset.text : null);
+    // F5 fix 2026-04-21: clear stale correct/incorrect classes from prior
+    // submit so re-submits reflect the latest state (user report
+    // /#created-d08b7691ff00/41/2 — button felt dead because outline
+    // colors didn't update).
+    if (item) item.classList.remove('correct', 'incorrect');
   });
 
   const btn = document.getElementById('parsonsCheckBtn');
@@ -6458,7 +6714,7 @@ async function checkParsons(index) {
     const total = correctLines.filter(l => !distractors.has(l)).length;
     const pct = total > 0 ? correct / total : 0;
     const cls = pct === 1 ? 'perfect' : pct >= 0.5 ? 'partial' : 'low';
-    document.getElementById('parsonsResult').innerHTML = `<div class="score-display ${cls}" style="margin-top:12px;">${correct}/${total} correct</div>`;
+    document.getElementById('parsonsResult').innerHTML = `<div class="score-display ${cls}" style="margin-top:12px;">${correct}/${total} correct &middot; ${Math.round(pct*100)}%</div>`;
     if (pct === 1) {
       markStepComplete(state.currentCourse.id, state.currentModule, index);
       showCelebration();
@@ -6480,10 +6736,13 @@ function displayParsonsResults(result, slots, index) {
     if (isCorrect) correct++;
   });
   const total = slots.length;
-  const pct = total > 0 ? correct / total : 0;
+  // Prefer server score when available; show as X/Y · NN% rather than raw 0.67 decimal
+  // (F5 fix 2026-04-21 — user confused by "0.67 correct" on /41/2).
+  const serverPct = (typeof result.score === 'number') ? Math.round(result.score * 100) : null;
+  const pct = serverPct != null ? serverPct / 100 : (total > 0 ? correct / total : 0);
   const cls = pct === 1 ? 'perfect' : pct >= 0.5 ? 'partial' : 'low';
-  const score = result.score != null ? result.score : `${correct}/${total}`;
-  document.getElementById('parsonsResult').innerHTML = `<div class="score-display ${cls}" style="margin-top:12px;">${score} correct</div>`;
+  const pctDisplay = serverPct != null ? serverPct : Math.round(pct * 100);
+  document.getElementById('parsonsResult').innerHTML = `<div class="score-display ${cls}" style="margin-top:12px;"><strong>${correct} / ${total}</strong> in correct position &middot; ${pctDisplay}%</div>`;
   if (pct === 1) {
     markStepComplete(state.currentCourse.id, state.currentModule, index);
     showCelebration();
@@ -6501,6 +6760,8 @@ async function checkOrdering(index) {
   slots.forEach(slot => {
     const item = slot.querySelector('.drag-item');
     userOrderIds.push(item ? (item.dataset.orderingId || item.dataset.text) : null);
+    // F5 fix 2026-04-21: clear stale correct/incorrect classes before resubmit
+    if (item) item.classList.remove('correct', 'incorrect');
   });
 
   const btn = document.getElementById('orderingCheckBtn');
@@ -6546,8 +6807,9 @@ function displayOrderingResults(result, slots, index) {
   const pct = total > 0 ? correct / total : 0;
   const cls = pct === 1 ? 'perfect' : pct >= 0.5 ? 'partial' : 'low';
 
-  // Score header
-  let html = `<div class="score-display ${cls}" style="margin-top:12px;">${correct}/${total} in correct position</div>`;
+  // Score header — include % (F5 fix 2026-04-21: match parsons header format)
+  const serverPct = (typeof result.score === 'number') ? Math.round(result.score * 100) : Math.round(pct * 100);
+  let html = `<div class="score-display ${cls}" style="margin-top:12px;"><strong>${correct} / ${total}</strong> in correct position &middot; ${serverPct}%</div>`;
 
   // REVEAL-GATE AWARENESS (2026-04-20): on attempts 1-2 the server strips
   // correct_position so learners don't see the answer. If nothing has
@@ -6974,22 +7236,237 @@ const CREATOR_STEPS = [
   { num: 4, label: 'Done' },
 ];
 
+// ----- Creator draft persistence (2026-04-21) -----
+// User report: "creator form does not persist data. If I press back, it is gone."
+// Fix: snapshot the entire wizard state to localStorage on every input + step
+// advance, restore on openCreatorWizard(), clear only on successful /generate.
+// Files can't be serialized so we persist only title/desc/urls/choices + the
+// server-side sessionId (which already holds extracted file text server-side).
+const CREATOR_DRAFT_KEY = 'creatorDraft_v1';
+const CREATOR_DRAFT_TTL_MS = 1000 * 60 * 60 * 24 * 7;  // 7 days
+
+function _saveCreatorDraft() {
+  try {
+    const titleEl = document.getElementById('creatorTitle');
+    const descEl = document.getElementById('creatorDesc');
+    const urlsEl = document.getElementById('creatorUrls');
+    const typeEl = document.getElementById('creatorType');
+    const levelEl = document.getElementById('creatorLevel');
+    const modeEl = document.getElementById('creatorMode');
+    const archEl = document.getElementById('creatorArchetype');
+    // Only snapshot if at least one field has real user content — prevents the
+    // "Resume your draft?" banner from firing on an empty wizard open.
+    const title = titleEl?.value || '';
+    const desc = descEl?.value || '';
+    const hasContent = title.trim() || desc.trim() || creatorState.sessionId;
+    if (!hasContent) return;
+    const draft = {
+      savedAt: Date.now(),
+      fields: {
+        title,
+        desc,
+        urls: urlsEl?.value || '',
+        courseType: typeEl?.value || '',
+        level: levelEl?.value || '',
+        courseMode: modeEl?.value || '',
+        archetype: archEl?.value || '',
+      },
+      state: { ...creatorState },
+      urlsFetchedMaterial: state._urlsFetchedMaterial || '',
+      // Step-2 in-progress answers (text inputs the learner is typing into the
+      // clarifying-question textareas). Serialize live DOM values so a back-nav
+      // from step 3 doesn't lose them.
+      step2Answers: _snapshotStep2Answers(),
+    };
+    localStorage.setItem(CREATOR_DRAFT_KEY, JSON.stringify(draft));
+  } catch (e) { /* quota / private-mode — fall through silently */ }
+}
+
+function _snapshotStep2Answers() {
+  const out = {};
+  // The step-2 questions render as combo inputs with data-qid (see renderCreatorStep2).
+  document.querySelectorAll('.creator-answer[data-qid]').forEach(el => {
+    const qid = el.getAttribute('data-qid');
+    if (!qid) return;
+    out[qid] = el.value || '';
+  });
+  // Depth radio selection (segmented control in step 2)
+  const depthSel = document.querySelector('.depth-seg input[type="radio"]:checked');
+  if (depthSel) out.__depth = depthSel.value || depthSel.dataset.value || '';
+  // Framing pills (step 1)
+  const framings = [];
+  document.querySelectorAll('.framing-pill.active').forEach(p => {
+    framings.push(`${p.dataset.dim}:${p.dataset.opt}`);
+  });
+  if (framings.length) out.__framings = framings;
+  return out;
+}
+
+function _loadCreatorDraft() {
+  try {
+    const raw = localStorage.getItem(CREATOR_DRAFT_KEY);
+    if (!raw) return null;
+    const draft = JSON.parse(raw);
+    if (!draft || !draft.savedAt) return null;
+    if (Date.now() - draft.savedAt > CREATOR_DRAFT_TTL_MS) {
+      localStorage.removeItem(CREATOR_DRAFT_KEY);
+      return null;
+    }
+    return draft;
+  } catch (e) { return null; }
+}
+
+function _clearCreatorDraft() {
+  try { localStorage.removeItem(CREATOR_DRAFT_KEY); } catch (e) {}
+}
+
+// Install a single delegated listener that snapshots the draft whenever any
+// input inside the Creator overlay changes. Covers all current + future fields
+// without having to wire oninput= on every element.
+(function _installCreatorDraftListener() {
+  function handler(e) {
+    const overlay = document.getElementById('creatorOverlay');
+    if (!overlay || !overlay.contains(e.target)) return;
+    // Debounce bursts of keystrokes to one save per ~300ms.
+    clearTimeout(_installCreatorDraftListener._t);
+    _installCreatorDraftListener._t = setTimeout(_saveCreatorDraft, 300);
+  }
+  if (document.readyState !== 'loading') {
+    document.addEventListener('input', handler, true);
+    document.addEventListener('change', handler, true);
+  } else {
+    document.addEventListener('DOMContentLoaded', () => {
+      document.addEventListener('input', handler, true);
+      document.addEventListener('change', handler, true);
+    });
+  }
+})();
+
 function openCreatorWizard() {
-  creatorState = {
-    step: 1,
-    sessionId: null,
-    questions: [],
-    initialOutline: null,
-    refinedOutline: null,
-    followUpQuestions: null,
-    generatedCourseId: null,
-    generatedCourse: null,
-  };
+  // First-visit flag (2026-04-21): remember that the user has discovered the
+  // button so the attention-pulse doesn't keep nagging on subsequent loads.
+  try { localStorage.setItem('creatorFabOpened', '1'); } catch (e) {}
+  const fab = document.getElementById('creatorFab');
+  if (fab) fab.classList.remove('pulse');
+
+  // 2026-04-21 draft-persistence: if a draft exists, restore creatorState
+  // BEFORE rendering so the wizard lands on the same step the user left on.
+  // Title/desc/URLs land back into the DOM after renderCreatorStep1() writes
+  // the inputs (handled in _applyCreatorDraftToDOM called post-render).
+  const draft = _loadCreatorDraft();
+  if (draft && draft.state) {
+    creatorState = { ...creatorState, ...draft.state };
+    if (draft.urlsFetchedMaterial) {
+      state._urlsFetchedMaterial = draft.urlsFetchedMaterial;
+    }
+  } else {
+    creatorState = {
+      step: 1,
+      sessionId: null,
+      questions: [],
+      initialOutline: null,
+      refinedOutline: null,
+      followUpQuestions: null,
+      generatedCourseId: null,
+      generatedCourse: null,
+    };
+  }
   const overlay = document.getElementById('creatorOverlay');
   overlay.style.display = 'flex';
   requestAnimationFrame(() => overlay.classList.add('visible'));
   renderCreatorWizard();
+  // Post-render: push saved field values back into the DOM inputs.
+  if (draft && draft.fields) _applyCreatorDraftToDOM(draft);
 }
+
+function _applyCreatorDraftToDOM(draft) {
+  if (!draft || !draft.fields) return;
+  const f = draft.fields;
+  const set = (id, v) => { const el = document.getElementById(id); if (el && v != null) el.value = v; };
+  set('creatorTitle', f.title);
+  set('creatorDesc', f.desc);
+  set('creatorUrls', f.urls);
+  set('creatorType', f.courseType);
+  set('creatorLevel', f.level);
+  set('creatorMode', f.courseMode);
+  set('creatorArchetype', f.archetype);
+  // Step-2 combo-input answers + depth + framing pills — only meaningful if we
+  // rendered step 2 (for step 2) or step 1 (framing pills).
+  if (draft.step2Answers) {
+    Object.entries(draft.step2Answers).forEach(([qid, val]) => {
+      if (qid === '__depth' || qid === '__framings') return;
+      const el = document.querySelector(`.creator-answer[data-qid="${CSS.escape(qid)}"]`);
+      if (el) el.value = val || '';
+    });
+    if (draft.step2Answers.__depth) {
+      const radio = document.querySelector(
+        `.depth-seg input[type="radio"][value="${CSS.escape(draft.step2Answers.__depth)}"]`);
+      if (radio) radio.checked = true;
+    }
+    if (Array.isArray(draft.step2Answers.__framings)) {
+      draft.step2Answers.__framings.forEach(key => {
+        const [dim, opt] = String(key).split(':');
+        if (!dim || !opt) return;
+        const pill = document.querySelector(
+          `.framing-pill[data-dim="${CSS.escape(dim)}"][data-opt="${CSS.escape(opt)}"]`);
+        if (pill) pill.classList.add('active');
+      });
+    }
+  }
+  // Recompute the combined-chars meter (F19-era) since we just rehydrated inputs.
+  if (typeof updateCreatorContentMeter === 'function') updateCreatorContentMeter();
+  // One-shot subtle banner so the user knows the draft was restored.
+  _showCreatorDraftRestoredBanner(draft.savedAt);
+}
+
+function _showCreatorDraftRestoredBanner(savedAt) {
+  const body = document.getElementById('creatorBody');
+  if (!body) return;
+  // Don't double-render on subsequent re-renders.
+  if (document.getElementById('creatorDraftBanner')) return;
+  const when = savedAt ? new Date(savedAt).toLocaleString() : '';
+  const banner = document.createElement('div');
+  banner.id = 'creatorDraftBanner';
+  banner.style.cssText = 'margin:0 0 14px; padding:10px 14px; background:#1e2a44; border:1px solid #3b4a70; border-radius:6px; display:flex; align-items:center; gap:12px; font-size:0.85rem; color:#c9d1df;';
+  banner.innerHTML = `
+    <span style="color:#4a7cff;">&#8635;</span>
+    <span style="flex:1;">Restored your in-progress draft ${when ? `(saved ${esc(when)})` : ''}. Keep editing, or</span>
+    <button onclick="_discardCreatorDraft()"
+      style="background:transparent; border:1px solid #3b4a70; color:#c9d1df; padding:4px 10px; border-radius:4px; cursor:pointer; font-size:0.78rem;">Start fresh</button>
+    <button onclick="(function(){document.getElementById('creatorDraftBanner')?.remove();})()"
+      style="background:transparent; border:none; color:#8892a8; cursor:pointer; font-size:1.1rem; line-height:1;">&times;</button>`;
+  body.insertBefore(banner, body.firstChild);
+}
+
+function _discardCreatorDraft() {
+  _clearCreatorDraft();
+  creatorState = {
+    step: 1, sessionId: null, questions: [], initialOutline: null,
+    refinedOutline: null, followUpQuestions: null,
+    generatedCourseId: null, generatedCourse: null,
+  };
+  state._urlsFetchedMaterial = '';
+  renderCreatorWizard();
+}
+
+// Fire the first-visit attention pulse on FAB if user hasn't opened it yet.
+// Runs 3 pulses (≈ 5s total) then auto-stops.
+(function _creatorFabFirstVisitPulse() {
+  function arm() {
+    try {
+      if (localStorage.getItem('creatorFabOpened')) return;
+      const fab = document.getElementById('creatorFab');
+      if (!fab) return;
+      fab.classList.add('pulse');
+      setTimeout(() => fab.classList.remove('pulse'), 6000);
+    } catch (e) {}
+  }
+  if (document.readyState === 'complete' || document.readyState === 'interactive') {
+    setTimeout(arm, 600);
+  } else {
+    document.addEventListener('DOMContentLoaded', () => setTimeout(arm, 600));
+  }
+})();
 
 function closeCreatorWizard() {
   const overlay = document.getElementById('creatorOverlay');
@@ -7629,8 +8106,9 @@ async function creatorFetchUrls() {
 
 // Combined content-size meter (2026-04-20 user directive): rolls up course-objective +
 // uploaded-file char estimate + fetched-URL char count; shows green <90%, amber
-// 90-99%, red at 100%. Refuses submit at 18000+ via creatorStart.
-const CREATOR_CONTENT_LIMIT_CHARS = 18000;
+// 90-99%, red at 100%. Refuses submit at 50000+ via creatorStart (bumped from
+// 18000 on 2026-04-21 per user request to allow longer source material).
+const CREATOR_CONTENT_LIMIT_CHARS = 50000;
 
 function _estimateFileCharCount(files) {
   if (!files || !files.length) return 0;
@@ -7848,7 +8326,7 @@ async function creatorStart() {
     }
 
     // HARD LIMIT ENFORCEMENT (user directive 2026-04-20): no silent truncation
-    // anywhere in the pipeline. If combined content > 18000 chars, refuse to
+    // anywhere in the pipeline. If combined content > 50000 chars, refuse to
     // submit and ask the creator to trim. This guarantees every char the
     // creator typed/uploaded/fetched makes it into every prompt verbatim.
     const combinedLen = (desc || '').length + (sourceMaterial || '').length;
@@ -7899,6 +8377,7 @@ async function creatorStart() {
     creatorState.questions = data.questions || [];
     creatorState.initialOutline = data.initial_outline || { modules: [] };
     creatorState.step = 2;
+    _saveCreatorDraft();  // 2026-04-21 persist draft across back-nav
     renderCreatorWizard();
   } catch (e) {
     btn.disabled = false;
@@ -8113,6 +8592,7 @@ async function creatorRefine(isRetry) {
     creatorState.refinedOutline = data.outline || { modules: [] };
     creatorState.followUpQuestions = data.follow_up_questions || null;
     creatorState.step = 3;
+    _saveCreatorDraft();  // 2026-04-21 persist draft across back-nav
     renderCreatorWizard();
   } catch (e) {
     _stopRefinePhases();
@@ -8296,6 +8776,7 @@ async function creatorGenerate() {
     creatorState.generatedCourseId = data.course_id;
     creatorState.generatedCourse = data.course || null;
     creatorState.step = 4;
+    _clearCreatorDraft();  // 2026-04-21: course persisted, drop the in-progress draft
     renderCreatorWizard();
     // Product feature 2026-04-20: kick off the auto-review banner poller.
     // Backend fired review_and_iterate() when /api/creator/generate returned;
@@ -8482,6 +8963,7 @@ function updateCreatorFab() {
 
 let _autoReviewPollTimer = null;
 let _autoReviewCourseId = null;
+let _autoReviewLastState = null;  // cached for instant re-render on navigation (no wait for 5s poll)
 
 function _ensureAutoReviewBanner() {
   let b = document.getElementById('autoReviewBanner');
@@ -8524,24 +9006,36 @@ function _ensureAutoReviewBanner() {
   return b;
 }
 
-function _renderAutoReviewState(state) {
+function _renderAutoReviewState(reviewState) {
   const b = _ensureAutoReviewBanner();
   const icon = document.getElementById('autoReviewIcon');
   const title = document.getElementById('autoReviewTitle');
   const body = document.getElementById('autoReviewBody');
   const progress = document.getElementById('autoReviewProgress');
-  if (!state || state.status === 'not_queued' || state.status === 'unavailable') {
+  if (!reviewState || reviewState.status === 'not_queued' || reviewState.status === 'unavailable') {
+    b.style.display = 'none';
+    return;
+  }
+  // Scope the banner to the course being reviewed (2026-04-21 user report:
+  // "only show within that particular course"). If the creator navigated to
+  // a DIFFERENT course (or back to catalog), hide — they shouldn't see a QC
+  // banner for an unrelated course. Polling continues in the background so
+  // when they come back the live state shows up again.
+  // Argument renamed to `reviewState` so the module-level `state` (current
+  // course / current module) stays visible through the closure.
+  const viewingCourseId = (state && state.currentCourse && state.currentCourse.id) || null;
+  if (_autoReviewCourseId && viewingCourseId !== _autoReviewCourseId) {
     b.style.display = 'none';
     return;
   }
   b.style.display = 'block';
-  const s = state.status || '';
-  const iters = state.iterations || [];
+  const s = reviewState.status || '';
+  const iters = reviewState.iterations || [];
   const currIter = iters.length ? iters.length + (s.includes('complete') ? 0 : 1) : 1;
-  const maxIters = state.max_iterations || 3;
+  const maxIters = reviewState.max_iterations || 3;
 
   if (s === 'complete') {
-    const v = state.final_verdict || {};
+    const v = reviewState.final_verdict || {};
     if (v.summary === 'clean') {
       icon.textContent = '✅';
       b.style.borderLeftColor = '#34d399';
@@ -8573,7 +9067,7 @@ function _renderAutoReviewState(state) {
     icon.textContent = '⚠️';
     b.style.borderLeftColor = '#f87171';
     title.textContent = 'Course QC encountered an error';
-    body.textContent = state.error || 'Automated review could not complete. Your course is unaffected.';
+    body.textContent = reviewState.error || 'Automated review could not complete. Your course is unaffected.';
     if (_autoReviewPollTimer) { clearInterval(_autoReviewPollTimer); _autoReviewPollTimer = null; }
   } else {
     icon.textContent = '🤖';
@@ -8595,6 +9089,7 @@ function startReviewStatusPolling(courseId) {
       const r = await fetch(`${API}/courses/${courseId}/review_status`);
       if (!r.ok) return;
       const st = await r.json();
+      _autoReviewLastState = st;
       _renderAutoReviewState(st);
       if (st.status === 'complete' || st.status === 'error' || st.status === 'not_queued' || st.status === 'unavailable') {
         if (_autoReviewPollTimer) { clearInterval(_autoReviewPollTimer); _autoReviewPollTimer = null; }
@@ -8603,6 +9098,18 @@ function startReviewStatusPolling(courseId) {
   };
   poll();
   _autoReviewPollTimer = setInterval(poll, 5000);
+}
+
+// Called on navigation (enterCourse / goToCatalog) to re-evaluate whether
+// the banner should be visible for the course being viewed. Uses the cached
+// last poll result so we don't wait up to 5s for the next poll tick.
+function refreshAutoReviewBannerVisibility() {
+  if (!_autoReviewLastState) {
+    const b = document.getElementById('autoReviewBanner');
+    if (b) b.style.display = 'none';
+    return;
+  }
+  _renderAutoReviewState(_autoReviewLastState);
 }
 
 // ===================================================================

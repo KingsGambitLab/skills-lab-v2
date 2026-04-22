@@ -1,0 +1,67 @@
+<!--
+  project template — handles system_build / github_classroom_capstone / cluster_state_check.
+  View owns: multi-file editor placeholder, phases + checklist UI, GHA workflow
+  run URL paste box, deployment URL paste box, submit + feedback.
+  LLM owns only JSON: problem_statement + phases + checklist + starter_repo + validation config.
+-->
+<div class="tmpl-project" data-template="project">
+  <div class="tmpl-header">
+    <h3 class="tmpl-title" data-slot="title"></h3>
+    <span class="tmpl-capstone-badge">Capstone</span>
+    <div class="tmpl-problem" data-slot="problem_statement"></div>
+  </div>
+
+  <!-- F26 scaffold: clone link -->
+  <div class="tmpl-scaffold-banner tmpl-clone-banner" data-role="clone-banner" style="display:none">
+    <span class="tmpl-scaffold-icon">📂</span>
+    <div>
+      <strong>Starter repo:</strong>
+      <a data-role="clone-url" target="_blank" rel="noopener noreferrer"></a>
+      <span class="tmpl-scaffold-meta" data-role="clone-meta"></span>
+    </div>
+  </div>
+
+  <!-- Phases checklist -->
+  <div class="tmpl-phases" data-role="phases">
+    <h4 class="tmpl-section-title">Phases</h4>
+    <div class="tmpl-phase-list" data-role="phase-list"></div>
+  </div>
+
+  <!-- Acceptance checklist -->
+  <div class="tmpl-checklist" data-role="checklist">
+    <h4 class="tmpl-section-title">Acceptance checklist</h4>
+    <div class="tmpl-checklist-list" data-role="checklist-list"></div>
+  </div>
+
+  <!-- F24 GHA workflow check (when configured) -->
+  <div class="tmpl-gha-widget" data-role="gha-widget" style="display:none">
+    <h4 class="tmpl-section-title">✓ GitHub Actions grading</h4>
+    <p class="tmpl-gha-instructions" data-role="gha-instructions">
+      1. Fork the starter repo. &nbsp; 2. Push your solution to a branch. &nbsp;
+      3. GitHub Actions runs <code data-role="gha-workflow-file">lab-grade.yml</code> automatically.
+      &nbsp; 4. Paste the run URL below and click <strong>Check my CI</strong>.
+    </p>
+    <div class="tmpl-gha-input-row">
+      <input type="url" class="tmpl-url-input" data-role="gha-run-url"
+             placeholder="https://github.com/you/your-fork/actions/runs/1234567890" />
+      <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="check-gha">Check my CI</button>
+    </div>
+    <div class="tmpl-gha-result" data-role="gha-result" style="display:none"></div>
+  </div>
+
+  <!-- Endpoint_check: learner submits the live deploy URL -->
+  <div class="tmpl-endpoint-widget" data-role="endpoint-widget" style="display:none">
+    <h4 class="tmpl-section-title">🌐 Deployed service check</h4>
+    <p>Paste your deployed service URL; the grader will probe it.</p>
+    <div class="tmpl-gha-input-row">
+      <input type="url" class="tmpl-url-input" data-role="deploy-url"
+             placeholder="https://your-service.railway.app/healthz" />
+    </div>
+  </div>
+
+  <div class="tmpl-actions">
+    <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="submit">Submit capstone</button>
+  </div>
+
+  <div class="tmpl-feedback" data-role="feedback"></div>
+</div>

@@ -461,6 +461,9 @@ async def regenerate_single_step(
     llm_generate_step_content: Any,
     darkify_html_content: Any,
     llm_enabled: Any,
+    normalize_code_review_bugs: Any = None,  # D.1 fix 2026-04-21
+    critic_code_review: Any = None,  # B+C critic 2026-04-21
+    critic_code_exercise: Any = None,  # B+C critic 2026-04-21
     max_retries: int = 1,
 ) -> dict[str, Any]:
     """Regenerate one step in place, with full prior-course context.
@@ -582,6 +585,33 @@ async def regenerate_single_step(
         if not isinstance(candidate, dict):
             last_reason = "llm_returned_non_dict"
             continue
+
+        # D.1 (2026-04-21): for code_review, normalize bugs[].line via line_content
+        # before the completeness check so regens benefit from the same anti-drift
+        # fix as initial generation (main.py:5969).
+        if ex_type == "code_review" and normalize_code_review_bugs and isinstance(candidate.get("demo_data"), dict):
+            candidate["demo_data"] = normalize_code_review_bugs(candidate["demo_data"])
+            # B+C critic (2026-04-21): LLM self-verify + find-missing pass on bugs[].
+            if critic_code_review:
+                try:
+                    candidate["demo_data"] = critic_code_review(candidate["demo_data"])
+                except Exception as e:
+                    logger.warning("per_step code_review critic failed: %s", e)
+            resolved_lines = [
+                b.get("line") for b in candidate["demo_data"].get("bugs", [])
+                if isinstance(b, dict) and isinstance(b.get("line"), int)
+            ]
+            if resolved_lines:
+                if not isinstance(candidate.get("validation"), dict):
+                    candidate["validation"] = {}
+                candidate["validation"]["bug_lines"] = sorted(set(resolved_lines))
+
+        # B+C critic (2026-04-21): code_exercise solvability + anti-gaming must_contain.
+        if ex_type == "code_exercise" and critic_code_exercise:
+            try:
+                candidate = critic_code_exercise(candidate)
+            except Exception as e:
+                logger.warning("per_step code_exercise critic failed: %s", e)
 
         ok, reason = _minimal_completeness_check(candidate, ex_type)
         if ok:

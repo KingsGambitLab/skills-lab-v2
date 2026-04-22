@@ -1,0 +1,62 @@
+<!--
+  code template — handles code_exercise / code_read / code.
+  View owns editor + Run button + test-result panel + F26 scaffold banners.
+  LLM owns only JSON: language + starter_code + problem_statement + starter_files/starter_repo (optional).
+-->
+<div class="tmpl-code" data-template="code">
+  <div class="tmpl-header">
+    <h3 class="tmpl-title" data-slot="title"></h3>
+    <div class="tmpl-problem" data-slot="problem_statement"></div>
+  </div>
+
+  <!-- F26: clone-link banner (shown only when starter_repo is present) -->
+  <div class="tmpl-scaffold-banner tmpl-clone-banner" data-role="clone-banner" style="display:none">
+    <span class="tmpl-scaffold-icon">🔗</span>
+    <div>
+      <strong>Clone the starter:</strong>
+      <a data-role="clone-url" target="_blank" rel="noopener noreferrer"></a>
+      <span class="tmpl-scaffold-meta" data-role="clone-meta"></span>
+    </div>
+  </div>
+
+  <!-- F26: pre-seeded files banner (when starter_files was materialized in sandbox) -->
+  <div class="tmpl-scaffold-banner tmpl-files-banner" data-role="files-banner" style="display:none">
+    <span class="tmpl-scaffold-icon">📦</span>
+    <div>
+      <strong>Pre-seeded starter files:</strong>
+      <span data-role="files-count"></span> files written to <code data-role="repo-path-var">repo_path</code>
+    </div>
+  </div>
+
+  <div class="tmpl-editor-wrapper">
+    <div class="tmpl-editor-header">
+      <span class="tmpl-lang-badge" data-slot="lang-badge">python</span>
+      <div class="tmpl-editor-actions">
+        <button type="button" class="tmpl-btn tmpl-btn-ghost" data-action="reset-code" title="Restore starter">Reset</button>
+      </div>
+    </div>
+    <textarea class="tmpl-editor" data-role="editor" spellcheck="false"
+              autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+  </div>
+
+  <div class="tmpl-actions">
+    <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="run">▶ Run</button>
+    <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="submit">Submit</button>
+    <span class="tmpl-hint-trigger" data-action="reveal-hint">💡 Hint</span>
+  </div>
+
+  <div class="tmpl-output-panel" data-role="output" style="display:none">
+    <div class="tmpl-output-header">Output</div>
+    <pre class="tmpl-output-body" data-role="output-body"></pre>
+  </div>
+
+  <div class="tmpl-test-panel" data-role="test-panel" style="display:none">
+    <div class="tmpl-test-header">
+      <span class="tmpl-test-verdict" data-role="test-verdict"></span>
+      <span class="tmpl-test-count" data-role="test-count"></span>
+    </div>
+    <pre class="tmpl-test-output" data-role="test-output"></pre>
+  </div>
+
+  <div class="tmpl-feedback" data-role="feedback"></div>
+</div>

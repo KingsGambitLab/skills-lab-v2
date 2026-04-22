@@ -73,6 +73,23 @@ class StepOut(BaseModel):
 class CodeExecuteRequest(BaseModel):
     code: str
     language: str = "python"
+    # D.2 (2026-04-21): optional language-specific fixtures the frontend can
+    # pass for ad-hoc runs. SQL exercises use schema_setup (DDL) + seed_rows
+    # ([{"table": str, "rows": [dict]}]) to prime an in-memory SQLite DB.
+    # YAML exercises use `yaml_schema` for JSON-schema validation.
+    # When not provided, the runtime pulls these from step.demo_data at grade time.
+    # (Renamed from `schema` on 2026-04-21 to avoid shadowing Pydantic BaseModel.schema.)
+    schema_setup: str | None = None
+    seed_rows: list | None = None
+    yaml_schema: dict | None = None
+    # F26 (2026-04-21): capstone scaffold primitives. When the exercise
+    # references external filesystem state (os.walk / Path().glob / open), the
+    # Creator emits `demo_data.starter_files` ([{"path": str, "contents": str}])
+    # which the sandbox materializes into a tempdir and injects under the Python
+    # variable named by `repo_path_var` (default "repo_path"). Without these,
+    # os.walk(repo_path) walks nothing and the exercise is unsolvable.
+    starter_files: list | None = None
+    repo_path_var: str | None = None
 
 
 class CodeExecuteResponse(BaseModel):
@@ -165,11 +182,11 @@ class CreatorStartRequest(BaseModel):
     # Min length of 3 so titles like "X" surface a clean 422 at the START gate instead of
     # silently producing an incoherent course. (Chaos C1 found input validation gaps.)
     title: str = Field(min_length=3, max_length=200)
-    # Bumped to 18000 chars 2026-04-20 to match the combined-content hard limit.
-    # The handler enforces combined len(description) + len(source_material) <= 18000
-    # AFTER Pydantic accepts, so no silent truncation anywhere downstream.
-    description: str = Field(min_length=10, max_length=18000)
-    source_material: str | None = Field(default=None, max_length=18000)
+    # Bumped to 50000 chars 2026-04-21 (was 18000). The handler enforces
+    # combined len(description) + len(source_material) <= 50000 AFTER Pydantic
+    # accepts, so no silent truncation anywhere downstream.
+    description: str = Field(min_length=10, max_length=50000)
+    source_material: str | None = Field(default=None, max_length=50000)
     # Enum-validated so course_type="self_paced" or other typos return 422 at the START gate,
     # not an unstructured 500 at generate time (Chaos C1 finding).
     course_type: Literal["technical", "case_study", "compliance"]

@@ -1,0 +1,128 @@
+/* code template — dark palette, no LLM-authored styles. */
+.tmpl-code {
+  display: flex; flex-direction: column; gap: 14px;
+  color: #e8ecf4;
+  font-family: -apple-system, BlinkMacSystemFont, Inter, sans-serif;
+}
+.tmpl-code .tmpl-title {
+  margin: 0 0 8px 0; color: #e8ecf4; font-size: 1.1rem; font-weight: 600;
+}
+.tmpl-code .tmpl-problem {
+  margin: 0 0 12px 0; color: #c9d1df; font-size: 0.92rem; line-height: 1.55;
+}
+.tmpl-code .tmpl-problem > div { margin-bottom: 10px; }
+
+.tmpl-code .tmpl-scaffold-banner {
+  display: flex; gap: 10px; align-items: flex-start;
+  padding: 10px 14px;
+  background: #1e2a44;
+  border: 1px solid #3b4a70;
+  border-left: 3px solid #4a7cff;
+  border-radius: 6px;
+  color: #c9d1df;
+  font-size: 0.88rem;
+}
+.tmpl-code .tmpl-scaffold-banner.tmpl-files-banner { border-left-color: #2dd4bf; }
+.tmpl-code .tmpl-scaffold-icon { font-size: 1.1rem; }
+.tmpl-code .tmpl-scaffold-banner a {
+  color: #4a7cff; text-decoration: none; word-break: break-all;
+}
+.tmpl-code .tmpl-scaffold-banner a:hover { text-decoration: underline; }
+.tmpl-code .tmpl-scaffold-meta { color: #8892a8; margin-left: 6px; font-size: 0.82rem; }
+
+.tmpl-code .tmpl-editor-wrapper {
+  background: #161b26;
+  border: 1px solid #2a3352;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.tmpl-code .tmpl-editor-header {
+  display: flex; justify-content: space-between; align-items: center;
+  padding: 8px 14px;
+  background: #1e2538;
+  border-bottom: 1px solid #2a3352;
+}
+.tmpl-code .tmpl-lang-badge {
+  padding: 2px 8px;
+  border-radius: 10px;
+  background: #4a7cff22;
+  color: #4a7cff;
+  font-size: 0.78rem;
+  font-weight: 600;
+  text-transform: lowercase;
+}
+.tmpl-code .tmpl-editor {
+  width: 100%;
+  min-height: 320px;
+  background: #161b26;
+  color: #e8ecf4;
+  border: 0;
+  padding: 14px;
+  font-family: "SF Mono", Monaco, Consolas, monospace;
+  font-size: 0.88rem;
+  resize: vertical;
+  outline: none;
+  tab-size: 4;
+}
+.tmpl-code .tmpl-actions {
+  display: flex; gap: 10px; align-items: center;
+}
+.tmpl-code .tmpl-btn {
+  padding: 8px 16px; border-radius: 6px; border: 0; cursor: pointer; font-size: 0.9rem;
+  transition: filter 100ms;
+}
+.tmpl-code .tmpl-btn-primary { background: #4a7cff; color: #fff; }
+.tmpl-code .tmpl-btn-ghost {
+  background: transparent; color: #8892a8;
+  border: 1px solid #2a3352;
+}
+.tmpl-code .tmpl-btn:hover { filter: brightness(1.15); }
+.tmpl-code .tmpl-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+.tmpl-code .tmpl-hint-trigger {
+  color: #fbbf24; cursor: pointer; font-size: 0.86rem;
+  user-select: none;
+}
+.tmpl-code .tmpl-hint-trigger.revealed {
+  color: #c9d1df; font-style: italic; cursor: default;
+}
+
+.tmpl-code .tmpl-output-panel,
+.tmpl-code .tmpl-test-panel {
+  background: #161b26;
+  border: 1px solid #2a3352;
+  border-radius: 6px;
+  overflow: hidden;
+}
+.tmpl-code .tmpl-output-header,
+.tmpl-code .tmpl-test-header {
+  padding: 6px 14px;
+  background: #1e2538;
+  border-bottom: 1px solid #2a3352;
+  font-size: 0.82rem;
+  color: #8892a8;
+}
+.tmpl-code .tmpl-output-body,
+.tmpl-code .tmpl-test-output {
+  margin: 0;
+  padding: 12px 14px;
+  color: #e8ecf4;
+  font-family: "SF Mono", Monaco, Consolas, monospace;
+  font-size: 0.84rem;
+  white-space: pre-wrap;
+  overflow: auto;
+  max-height: 280px;
+}
+.tmpl-code .tmpl-output-body.error { color: #f87171; }
+
+.tmpl-code .tmpl-test-verdict.pass { color: #2dd4bf; font-weight: 600; }
+.tmpl-code .tmpl-test-verdict.fail { color: #f87171; font-weight: 600; }
+.tmpl-code .tmpl-test-verdict.partial { color: #fbbf24; font-weight: 600; }
+.tmpl-code .tmpl-test-count { margin-left: 10px; color: #8892a8; font-size: 0.82rem; }
+
+.tmpl-code .tmpl-feedback {
+  margin-top: 8px; padding: 10px 14px; border-radius: 6px;
+  font-size: 0.92rem; display: none;
+}
+.tmpl-code .tmpl-feedback.pass { background: #0e2620; color: #86efac; border-left: 3px solid #2dd4bf; display: block; }
+.tmpl-code .tmpl-feedback.fail { background: #2a1a22; color: #fca5a5; border-left: 3px solid #f87171; display: block; }
+.tmpl-code .tmpl-feedback.partial { background: #2a2718; color: #fbbf24; border-left: 3px solid #fbbf24; display: block; }

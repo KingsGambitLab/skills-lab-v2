@@ -843,11 +843,29 @@ async def _probe_code_execute(
     stype = step_row.exercise_type
     code = step_row.code or ""
     val = step_row.validation or {}
+    dd = step_row.demo_data or {}
     must_contain = val.get("must_contain") or []
     expected_output = step_row.expected_output or ""
     sid = step_row.id
     mid = mod_row.id
     title = step_row.title or ""
+
+    # D.2 (2026-04-21): pass language + SQL/YAML fixtures so probes exercise
+    # the correct sandbox. code_exercise steps with language="sql" need the
+    # schema_setup + seed_rows; language="yaml" needs the JSON schema.
+    language = (dd.get("language") or val.get("language") or "python").lower()
+    def _probe_payload(code_body: str) -> dict:
+        p = {"code": code_body, "language": language}
+        if language == "sql":
+            if dd.get("schema_setup"):
+                p["schema_setup"] = dd["schema_setup"]
+            if dd.get("seed_rows"):
+                p["seed_rows"] = dd["seed_rows"]
+        elif language in ("yaml", "yml"):
+            schema = val.get("yaml_schema") or dd.get("yaml_schema") or val.get("schema") or dd.get("schema")
+            if schema:
+                p["yaml_schema"] = schema
+        return p
 
     if not must_contain and not expected_output:
         # No graded contract at all — manual_review only, nothing to probe
@@ -869,7 +887,7 @@ async def _probe_code_execute(
     # ships broken — the learner can't even click Run before starting.
     if code and len(code) >= 30:
         try:
-            r0 = await client.post("/api/execute", json={"code": code})
+            r0 = await client.post("/api/execute", json=_probe_payload(code))
             if r0.status_code == 200:
                 data0 = r0.json()
                 stderr0 = (data0.get("stderr") or "") + " " + (data0.get("error") or "")
@@ -903,7 +921,7 @@ async def _probe_code_execute(
         synthesized_correct += (code or "print('probe')\n")
 
     try:
-        r = await client.post("/api/execute", json={"code": synthesized_correct})
+        r = await client.post("/api/execute", json=_probe_payload(synthesized_correct))
         if r.status_code == 200:
             data = r.json()
             exit_code = data.get("exit_code")

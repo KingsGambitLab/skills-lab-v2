@@ -20,3 +20,11 @@ build/
 .idea/
 .vscode/
 *.swp
+
+# Solver-agent sandbox artifacts (do NOT commit)
+cloudsync-minimal/
+web-api/
+fake-PYREPL_TRACE-value
+
+# Transient logs from review pipeline
+reviews/*.log
