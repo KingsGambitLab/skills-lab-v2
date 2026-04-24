@@ -5,7 +5,10 @@
 -->
 <div class="tmpl-code" data-template="code">
   <div class="tmpl-header">
-    <h3 class="tmpl-title" data-slot="title"></h3>
+    <!-- 2026-04-22 v6: removed <h3 data-slot="title"> — the outer
+         `.step-title` already renders step.title via renderStep, so the
+         template-level title was a duplicate on every step. Briefing/problem
+         slot stays. -->
     <div class="tmpl-problem" data-slot="problem_statement"></div>
   </div>
 
@@ -35,8 +38,15 @@
         <button type="button" class="tmpl-btn tmpl-btn-ghost" data-action="reset-code" title="Restore starter">Reset</button>
       </div>
     </div>
-    <textarea class="tmpl-editor" data-role="editor" spellcheck="false"
-              autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+    <!-- 2026-04-22: line-number gutter (user report "Code editor does not
+         have line numbers"). Gutter mirrors line count + scroll position of
+         the textarea. Click-drag on gutter is disabled (pointer-events:none)
+         so learner interactions remain on the textarea. -->
+    <div class="tmpl-editor-shell">
+      <div class="tmpl-editor-gutter" data-role="gutter" aria-hidden="true"><div>1</div></div>
+      <textarea class="tmpl-editor" data-role="editor" spellcheck="false"
+                autocomplete="off" autocorrect="off" autocapitalize="off"></textarea>
+    </div>
   </div>
 
   <div class="tmpl-actions">

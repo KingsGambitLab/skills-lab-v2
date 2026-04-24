@@ -277,10 +277,63 @@ class CreatorGenerateRequest(BaseModel):
     creator_notes: str | None = None
 
 
+# v8.6 (2026-04-24) PYDANTIC PRE-GATE — hard schema for code_exercise JSON
+# emitted by Sonnet. Validates types BEFORE the 5-10s Docker invariant runs,
+# so type errors (e.g. `hidden_tests=["test1","test2"]` list instead of single
+# string; `language={"name":"python"}` dict instead of string) are caught in
+# ~1ms instead of wasting a Docker cycle + producing an inscrutable traceback.
+#
+# Design intent (buddy-Opus consult #9): de-prioritized vs resilience items
+# but still ship — it tightens the Sonnet→grader contract + gives the retry
+# loop a clearer rejection message than ontology gate's "required field
+# missing" (which doesn't distinguish missing from mistyped).
+#
+# `extra: allow` on every model — we constrain the fields we CARE about, but
+# Creator + learner paths carry additional fields (_internal_scaffold, etc.)
+# that should pass through transparently.
+
+class CodeExerciseValidationModel(BaseModel):
+    # hidden_tests is the primary grade surface — must be a real test file
+    # (>=50 chars rules out "pass" or empty string) and a single string (the
+    # LLM sometimes emits a list of test snippets, which breaks the runner).
+    hidden_tests: str = Field(min_length=50)
+    # solution_code must be a functional impl — >=20 chars rules out empty /
+    # placeholder comments.
+    solution_code: str = Field(min_length=20)
+    # Optional fields — present in most generations but not required.
+    hint: str | None = None
+    requirements: str | None = None
+    must_contain: list[str] | None = None
+    model_config = {"extra": "allow"}
+
+
+class CodeExerciseDemoDataModel(BaseModel):
+    # Language string — picks the Docker runner image + test framework.
+    # The LLM sometimes emits a dict here; this forces the error to surface.
+    language: str = Field(min_length=1)
+    model_config = {"extra": "allow"}
+
+
+class CodeExerciseAssignmentModel(BaseModel):
+    # Briefing HTML — rendered as the step's concept content.
+    content: str = Field(min_length=50)
+    # Starter code — what the learner edits.
+    code: str = Field(min_length=20)
+    validation: CodeExerciseValidationModel
+    demo_data: CodeExerciseDemoDataModel
+    model_config = {"extra": "allow"}
+
+
 class CreatorGenerateResponse(BaseModel):
     course_id: str
     status: str = "generated"
     course: CourseOut
+    # v8.6 (2026-04-24) DEAD-LETTER — steps whose retry loop exhausted but were
+    # persisted with quality_flag="needs_author_review" instead of rolling back
+    # the whole course. Creator UI reads this to show "N steps need your review"
+    # with per-step regenerate buttons. Empty list = course is clean.
+    # Each entry: {module_title, step_title, exercise_type, failure_reason, retry_tail}.
+    needs_review_steps: list[dict] | None = None
 
 
 class CreatorSessionOut(BaseModel):

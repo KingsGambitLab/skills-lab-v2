@@ -1,10 +1,14 @@
 """
 SQLAlchemy async database setup with SQLite (aiosqlite).
 Upgrade path: swap DATABASE_URL to postgresql+asyncpg://... for production.
+Env override: DATABASE_URL environment variable (set by production deploy
+to point at Postgres).
 """
 
 import enum
-from datetime import datetime
+import os
+import secrets
+from datetime import datetime, timedelta
 from typing import AsyncGenerator
 
 from sqlalchemy import (
@@ -22,32 +26,43 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 from sqlalchemy.types import JSON
 
-DATABASE_URL = "sqlite+aiosqlite:///./skills_lab.db"
+# 2026-04-23 v8: DATABASE_URL is env-overridable so a Postgres deploy can
+# flip the target without code edits. Default = local SQLite for dev.
+DATABASE_URL = os.environ.get("DATABASE_URL", "sqlite+aiosqlite:///./skills_lab.db")
 
 # SQLite: enable WAL mode + busy_timeout to avoid locks under concurrent access.
 # Without these, a long-running transaction (like creator/generate's 60s LLM gather)
 # blocks learners hitting /progress/complete with "database is locked" errors.
 from sqlalchemy import event
 
-engine = create_async_engine(
-    DATABASE_URL,
-    echo=False,
-    connect_args={"timeout": 15},  # Wait up to 15s for locks
-)
+# SQLite connect_args vs Postgres: the `timeout` kwarg is SQLite-only. Detect
+# and apply accordingly so the same file can run against either backend.
+_IS_SQLITE = DATABASE_URL.startswith("sqlite")
+if _IS_SQLITE:
+    engine = create_async_engine(
+        DATABASE_URL,
+        echo=False,
+        connect_args={"timeout": 15},  # Wait up to 15s for locks
+    )
+else:
+    # Postgres (asyncpg): pooling is handled by SQLAlchemy.
+    engine = create_async_engine(DATABASE_URL, echo=False, pool_pre_ping=True)
 async_session_factory = async_sessionmaker(engine, expire_on_commit=False)
 
 
-@event.listens_for(engine.sync_engine, "connect")
-def _set_sqlite_pragmas(dbapi_connection, connection_record):
-    """Set SQLite pragmas on every connection for better concurrency."""
-    cursor = dbapi_connection.cursor()
-    try:
-        cursor.execute("PRAGMA journal_mode=WAL")
-        cursor.execute("PRAGMA synchronous=NORMAL")
-        cursor.execute("PRAGMA busy_timeout=15000")  # 15s wait for locks
-        cursor.execute("PRAGMA foreign_keys=ON")
-    finally:
-        cursor.close()
+if _IS_SQLITE:
+    @event.listens_for(engine.sync_engine, "connect")
+    def _set_sqlite_pragmas(dbapi_connection, connection_record):
+        """Set SQLite pragmas on every connection for better concurrency.
+        Postgres doesn't need this (has real MVCC)."""
+        cursor = dbapi_connection.cursor()
+        try:
+            cursor.execute("PRAGMA journal_mode=WAL")
+            cursor.execute("PRAGMA synchronous=NORMAL")
+            cursor.execute("PRAGMA busy_timeout=15000")  # 15s wait for locks
+            cursor.execute("PRAGMA foreign_keys=ON")
+        finally:
+            cursor.close()
 
 
 class Base(DeclarativeBase):
@@ -68,6 +83,14 @@ class StepType(str, enum.Enum):
     concept = "concept"
     code = "code"
     exercise = "exercise"
+
+
+class UserRole(str, enum.Enum):
+    """v8 auth roles. A user picks ONE role at signup. Admin is set by DB
+    flip — there's no public /register path to admin."""
+    learner = "learner"
+    creator = "creator"
+    admin = "admin"
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +125,14 @@ class Course(Base):
     # course briefly exists in the DB but isn't complete); "ready" when gen
     # finishes; "failed" if the handler raises. Only "ready" shows in public list.
     generation_status: Mapped[str] = mapped_column(String, nullable=False, default="ready")
+
+    # v8 auth columns (2026-04-23). Pre-user-model courses have
+    # creator_user_id=NULL + is_published=True (backward-compat).
+    creator_user_id: Mapped[int | None] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True,
+    )
+    is_published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
     modules: Mapped[list["Module"]] = relationship(
         back_populates="course", cascade="all, delete-orphan", order_by="Module.position"
@@ -236,6 +267,78 @@ class CourseReview(Base):
 
 
 # ---------------------------------------------------------------------------
+# v8 AUTH TABLES (2026-04-23) — User / Session / Enrollment
+# ---------------------------------------------------------------------------
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    email: Mapped[str] = mapped_column(String(255), unique=True, index=True, nullable=False)
+    password_hash: Mapped[str] = mapped_column(String(255), nullable=False)
+    display_name: Mapped[str | None] = mapped_column(String(100), nullable=True)
+    role: Mapped[str] = mapped_column(
+        Enum(UserRole, native_enum=False), nullable=False, default=UserRole.learner,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    disabled_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    sessions: Mapped[list["Session"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+    )
+    enrollments: Mapped[list["Enrollment"]] = relationship(
+        back_populates="user", cascade="all, delete-orphan",
+    )
+
+
+class Session(Base):
+    __tablename__ = "sessions"
+
+    id: Mapped[str] = mapped_column(String(128), primary_key=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    created_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    expires_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    user_agent: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="sessions")
+
+    @staticmethod
+    def new_for_user(user_id: int, ttl_hours: int = 24 * 14) -> "Session":
+        return Session(
+            id=secrets.token_urlsafe(48),
+            user_id=user_id,
+            expires_at=datetime.utcnow() + timedelta(hours=ttl_hours),
+        )
+
+
+class Enrollment(Base):
+    __tablename__ = "enrollments"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[int] = mapped_column(
+        Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    course_id: Mapped[str] = mapped_column(
+        String, ForeignKey("courses.id", ondelete="CASCADE"), nullable=False, index=True,
+    )
+    enrolled_at: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), nullable=False,
+    )
+    last_active_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    progress_percent: Mapped[int] = mapped_column(Integer, default=0)
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+
+    user: Mapped["User"] = relationship(back_populates="enrollments")
+
+
+# ---------------------------------------------------------------------------
 # Startup helpers
 # ---------------------------------------------------------------------------
 
@@ -251,6 +354,22 @@ async def create_tables() -> None:
         table="courses",
         column="generation_status",
         ddl="ALTER TABLE courses ADD COLUMN generation_status VARCHAR NOT NULL DEFAULT 'ready'",
+    )
+    # v8 (2026-04-23) auth columns on existing courses table. Idempotent.
+    await _ensure_column(
+        table="courses",
+        column="creator_user_id",
+        ddl="ALTER TABLE courses ADD COLUMN creator_user_id INTEGER",
+    )
+    await _ensure_column(
+        table="courses",
+        column="is_published",
+        ddl="ALTER TABLE courses ADD COLUMN is_published BOOLEAN NOT NULL DEFAULT 1",
+    )
+    await _ensure_column(
+        table="courses",
+        column="published_at",
+        ddl="ALTER TABLE courses ADD COLUMN published_at DATETIME",
     )
 
 

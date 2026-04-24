@@ -11,13 +11,18 @@
 <link rel="apple-touch-icon" href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'><defs><linearGradient id='g' x1='0' y1='0' x2='1' y2='1'><stop offset='0%25' stop-color='%234a7cff'/><stop offset='100%25' stop-color='%232dd4bf'/></linearGradient></defs><rect width='64' height='64' rx='14' fill='url(%23g)'/><path d='M20 42 L42 20 L48 26 L26 48 L18 48 Z' fill='white' opacity='0.95'/></svg>">
 <!-- Gap E (2026-04-22): view templates. See frontend/templates/* + CLAUDE.md
      "VIEW-TEMPLATE + JSON-ONLY ARCHITECTURE" section. CDN-portable by pointing
-     these at the CDN base URL. -->
-<link rel="stylesheet" href="/templates/drag_drop.css">
-<link rel="stylesheet" href="/templates/code.css">
-<link rel="stylesheet" href="/templates/project.css">
-<script src="/templates/drag_drop.js" defer></script>
-<script src="/templates/code.js" defer></script>
-<script src="/templates/project.js" defer></script>
+     these at the CDN base URL.
+     v=1.1.0 cache-buster: bumped 2026-04-22 so browsers that cached an older
+     code.{html,js,css} bundle pick up the line-number gutter fix. Bump this
+     number when shipping new template versions. -->
+<link rel="stylesheet" href="/templates/drag_drop.css?v=1.1.2">
+<link rel="stylesheet" href="/templates/code.css?v=1.1.2">
+<link rel="stylesheet" href="/templates/project.css?v=1.1.3">
+<link rel="stylesheet" href="/templates/terminal.css?v=1.1.2">
+<script src="/templates/drag_drop.js?v=1.1.2" defer></script>
+<script src="/templates/code.js?v=1.1.2" defer></script>
+<script src="/templates/project.js?v=1.1.3" defer></script>
+<script src="/templates/terminal.js?v=1.1.2" defer></script>
 <style>
 /* ===== CSS Variables ===== */
 :root {
@@ -2558,6 +2563,53 @@ button.expertise-badge:hover {
   <!-- Sidebar Toggle (Mobile) -->
   <button class="sidebar-toggle" id="sidebarToggle" onclick="toggleSidebar()">&#9776;</button>
 
+  <!-- v8 AUTH BAR (2026-04-23). Renders top-right. When signed out: Log in / Sign up.
+       When signed in: display name + role + Logout. Click name to open "My Courses". -->
+  <div id="authBar" style="position:fixed; top:12px; right:20px; z-index:1500; display:flex; gap:10px; align-items:center; font-size:0.85rem;">
+    <!-- populated by renderAuthBar() on load + after auth changes -->
+  </div>
+
+  <!-- Auth modal (login + register, toggles between them) -->
+  <div id="authModal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,0.7); z-index:2000; align-items:center; justify-content:center;">
+    <div style="background:var(--bg-card); border:1px solid var(--border); border-radius:12px; padding:24px 28px; width:min(420px, 90vw); color:var(--text-primary);">
+      <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+        <h3 id="authModalTitle" style="margin:0; font-size:1.15rem;">Sign in</h3>
+        <button onclick="hideAuthModal()" style="background:none; border:0; color:var(--text-secondary); font-size:1.4rem; cursor:pointer;">&times;</button>
+      </div>
+      <div id="authModalError" style="display:none; background:rgba(248,113,113,0.12); border:1px solid rgba(248,113,113,0.4); border-radius:6px; padding:8px 12px; margin-bottom:12px; color:#fca5a5; font-size:0.85rem;"></div>
+      <form id="authForm" onsubmit="doAuthSubmit(event)" style="display:flex; flex-direction:column; gap:10px;">
+        <label style="display:flex; flex-direction:column; gap:4px; font-size:0.82rem; color:var(--text-secondary);">
+          Email
+          <input type="email" id="authEmail" required autocomplete="email"
+                 style="padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary); color:var(--text-primary);">
+        </label>
+        <label style="display:flex; flex-direction:column; gap:4px; font-size:0.82rem; color:var(--text-secondary);">
+          Password
+          <input type="password" id="authPassword" required minlength="8" autocomplete="current-password"
+                 style="padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary); color:var(--text-primary);">
+        </label>
+        <div id="authRegisterFields" style="display:none;">
+          <label style="display:flex; flex-direction:column; gap:4px; font-size:0.82rem; color:var(--text-secondary);">
+            Display name (optional)
+            <input type="text" id="authDisplayName" maxlength="100" autocomplete="name"
+                   style="padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary); color:var(--text-primary);">
+          </label>
+          <label style="display:flex; flex-direction:column; gap:4px; font-size:0.82rem; color:var(--text-secondary); margin-top:10px;">
+            I am a…
+            <select id="authRole" style="padding:8px 10px; border:1px solid var(--border); border-radius:6px; background:var(--bg-secondary); color:var(--text-primary);">
+              <option value="learner">Learner — take courses</option>
+              <option value="creator">Creator — build + publish courses</option>
+            </select>
+          </label>
+        </div>
+        <button type="submit" id="authSubmitBtn" style="margin-top:6px; padding:10px; background:var(--accent); color:#fff; border:0; border-radius:6px; font-weight:600; cursor:pointer;">Sign in</button>
+        <div style="text-align:center; font-size:0.82rem; color:var(--text-secondary); margin-top:6px;">
+          <a href="#" id="authToggleLink" onclick="toggleAuthMode(event)" style="color:var(--accent); text-decoration:none;">New here? Create an account</a>
+        </div>
+      </form>
+    </div>
+  </div>
+
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-header">
@@ -2707,18 +2759,46 @@ function startPhaseCycle(setter, phases) {
   return () => timers.forEach(clearTimeout);
 }
 
-// Per-step attempt counter (module-level, resets on page refresh). The backend
-// gates the answer-key reveal behind attempt_number >= 3 for wrong submissions,
-// so we tick the counter on every submit and pass it through. See reveal-gate
-// in main.py / validate_exercise for the server-side half.
-const _stepAttemptCounts = new Map();
-function _recordAttempt(stepId) {
-  const key = String(stepId);
-  const n = (_stepAttemptCounts.get(key) || 0) + 1;
-  _stepAttemptCounts.set(key, n);
-  return n;
+// Per-step attempt counter — sessionStorage-backed so it survives template
+// re-mounts, drag-drop reset clicks, and re-renders within the same tab.
+// The backend gates the answer-key reveal behind attempt_number >= 3 for
+// wrong submissions, so we tick the counter on every submit and pass it
+// through. See reveal-gate in main.py / validate_exercise for the
+// server-side half.
+//
+// 2026-04-22 fix (beginner-agent walkthrough, M4.S4 categorization): the
+// previous in-memory Map worked for the legacy validateExercise path but
+// the NEW template path (createTemplateHandlers.judgeFn) used a separate
+// state._attempts[step.id] tracker that didn't share state and appeared
+// to reset. Agent saw "2 more retries" three attempts in a row — frontend
+// was sending attempt_number=1 every POST, so the reveal never fired.
+// Unifying BOTH paths onto sessionStorage fixes this.
+const _SLL_ATTEMPT_KEY = (stepId) => `sllAttempt:${String(stepId)}`;
+function _sllRecordAttempt(stepId) {
+  try {
+    const k = _SLL_ATTEMPT_KEY(stepId);
+    const n = (parseInt(sessionStorage.getItem(k) || '0', 10) || 0) + 1;
+    sessionStorage.setItem(k, String(n));
+    return n;
+  } catch (_) {
+    if (!window._sllAttemptFallback) window._sllAttemptFallback = new Map();
+    const n = (window._sllAttemptFallback.get(String(stepId)) || 0) + 1;
+    window._sllAttemptFallback.set(String(stepId), n);
+    return n;
+  }
 }
-function _getAttempt(stepId) { return _stepAttemptCounts.get(String(stepId)) || 0; }
+function _sllGetAttempt(stepId) {
+  try {
+    const k = _SLL_ATTEMPT_KEY(stepId);
+    return parseInt(sessionStorage.getItem(k) || '0', 10) || 0;
+  } catch (_) {
+    return (window._sllAttemptFallback || new Map()).get(String(stepId)) || 0;
+  }
+}
+// Legacy aliases — some older renderers still call _recordAttempt/_getAttempt.
+// Keep the names working so nothing breaks, route through the unified store.
+const _recordAttempt = _sllRecordAttempt;
+const _getAttempt = _sllGetAttempt;
 
 async function validateExercise(stepId, exerciseType, response) {
   // Backend schema expects `response_data`, not `response`. Keep both for back-compat.
@@ -3029,6 +3109,10 @@ async function restoreFromHash(r) {
 // Initialization
 // ===================================================================
 async function init() {
+  // v8 (2026-04-23): hydrate auth state before catalog so the auth bar
+  // renders in its final form immediately (no flash from signed-out →
+  // signed-in).
+  try { await hydrateAuth(); } catch (_) {}
   const r = parseHash();
   if (r) {
     await loadCatalog();
@@ -3036,6 +3120,169 @@ async function init() {
   } else {
     await loadCatalog();
     showCatalog();
+  }
+}
+
+// ===================================================================
+// v8 AUTH (2026-04-23) — client-side session management
+// ===================================================================
+//
+// Backend: backend/auth.py. Cookie: sll_session (httpOnly, SameSite=Lax).
+// We don't touch the cookie from JS — it's automatic on every fetch().
+// State lives on window._auth = {user, enrollments}. renderAuthBar()
+// redraws whenever state changes. Callers: init(), doLogin(), doRegister(),
+// doLogout(), renderAuthBar() (self-refresh).
+
+window._auth = { user: null, enrollments: [] };
+
+async function hydrateAuth() {
+  try {
+    const r = await fetch(`${API}/auth/me`, { credentials: 'same-origin' });
+    if (r.ok) {
+      const body = await r.json();
+      window._auth.user = body;  // null if not logged in
+    }
+  } catch (_) { window._auth.user = null; }
+  if (window._auth.user) {
+    try {
+      const r = await fetch(`${API}/auth/my-courses`, { credentials: 'same-origin' });
+      if (r.ok) {
+        const body = await r.json();
+        window._auth.enrollments = body.courses || [];
+      }
+    } catch (_) {}
+  }
+  renderAuthBar();
+}
+
+function renderAuthBar() {
+  const bar = document.getElementById('authBar');
+  if (!bar) return;
+  const u = window._auth.user;
+  if (!u) {
+    bar.innerHTML = `
+      <button onclick="showAuthModal('login')" style="padding:6px 14px; background:transparent; color:var(--text-primary); border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:0.85rem;">Log in</button>
+      <button onclick="showAuthModal('register')" style="padding:6px 14px; background:var(--accent); color:#fff; border:0; border-radius:6px; cursor:pointer; font-size:0.85rem;">Sign up</button>
+    `;
+  } else {
+    const displayName = u.display_name || u.email.split('@')[0];
+    const roleBadge = u.role === 'creator'
+      ? '<span style="background:rgba(74,124,255,0.15); color:var(--accent); padding:2px 8px; border-radius:10px; font-size:0.7rem; font-weight:600;">CREATOR</span>'
+      : (u.role === 'admin'
+          ? '<span style="background:rgba(251,191,36,0.15); color:#fbbf24; padding:2px 8px; border-radius:10px; font-size:0.7rem; font-weight:600;">ADMIN</span>'
+          : '');
+    bar.innerHTML = `
+      ${roleBadge}
+      <span style="color:var(--text-primary);">${esc(displayName)}</span>
+      <button onclick="doLogout()" style="padding:6px 12px; background:transparent; color:var(--text-secondary); border:1px solid var(--border); border-radius:6px; cursor:pointer; font-size:0.82rem;">Log out</button>
+    `;
+  }
+}
+
+function showAuthModal(mode) {
+  window._authMode = mode || 'login';
+  const title = document.getElementById('authModalTitle');
+  const btn = document.getElementById('authSubmitBtn');
+  const link = document.getElementById('authToggleLink');
+  const regFields = document.getElementById('authRegisterFields');
+  const err = document.getElementById('authModalError');
+  err.style.display = 'none';
+  err.textContent = '';
+  document.getElementById('authEmail').value = '';
+  document.getElementById('authPassword').value = '';
+  if (window._authMode === 'register') {
+    title.textContent = 'Create your account';
+    btn.textContent = 'Sign up';
+    link.textContent = 'Already have an account? Sign in';
+    regFields.style.display = 'block';
+  } else {
+    title.textContent = 'Sign in';
+    btn.textContent = 'Sign in';
+    link.textContent = 'New here? Create an account';
+    regFields.style.display = 'none';
+  }
+  const modal = document.getElementById('authModal');
+  modal.style.display = 'flex';
+  setTimeout(() => document.getElementById('authEmail').focus(), 50);
+}
+
+function hideAuthModal() {
+  document.getElementById('authModal').style.display = 'none';
+}
+
+function toggleAuthMode(ev) {
+  ev.preventDefault();
+  showAuthModal(window._authMode === 'register' ? 'login' : 'register');
+}
+
+async function doAuthSubmit(ev) {
+  ev.preventDefault();
+  const err = document.getElementById('authModalError');
+  err.style.display = 'none';
+  const email = document.getElementById('authEmail').value.trim();
+  const password = document.getElementById('authPassword').value;
+  const btn = document.getElementById('authSubmitBtn');
+  btn.disabled = true;
+  const origText = btn.textContent;
+  btn.textContent = 'Working…';
+  try {
+    let resp;
+    if (window._authMode === 'register') {
+      const body = {
+        email, password,
+        display_name: document.getElementById('authDisplayName').value.trim() || null,
+        role: document.getElementById('authRole').value,
+      };
+      resp = await fetch(`${API}/auth/register`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin', body: JSON.stringify(body),
+      });
+    } else {
+      resp = await fetch(`${API}/auth/login`, {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin', body: JSON.stringify({email, password}),
+      });
+    }
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({detail: 'Request failed'}));
+      throw new Error(body.detail || `HTTP ${resp.status}`);
+    }
+    hideAuthModal();
+    await hydrateAuth();
+  } catch (e) {
+    err.textContent = e.message || 'Authentication failed';
+    err.style.display = 'block';
+  } finally {
+    btn.disabled = false;
+    btn.textContent = origText;
+  }
+}
+
+async function doLogout() {
+  try {
+    await fetch(`${API}/auth/logout`, {method: 'POST', credentials: 'same-origin'});
+  } catch (_) {}
+  window._auth.user = null;
+  window._auth.enrollments = [];
+  renderAuthBar();
+}
+
+async function enrollInCourse(courseId) {
+  if (!window._auth.user) { showAuthModal('login'); return; }
+  try {
+    const r = await fetch(`${API}/auth/enroll/${encodeURIComponent(courseId)}`, {
+      method: 'POST', credentials: 'same-origin',
+    });
+    if (!r.ok) {
+      const body = await r.json().catch(() => ({detail: 'enroll failed'}));
+      alert('Enroll failed: ' + (body.detail || r.status));
+      return;
+    }
+    await hydrateAuth();
+    // Opportunistic visual cue — let catalog refresh reflect enrollment.
+    try { loadCatalog().then(showCatalog); } catch (_) {}
+  } catch (e) {
+    alert('Enroll error: ' + e.message);
   }
 }
 
@@ -3572,6 +3819,213 @@ function renderCurrentStep() {
 // ===================================================================
 // Step Renderer (dispatcher)
 // ===================================================================
+// P0-1 (2026-04-22): template HTML cache + data-contract helpers. Preloads
+// the 3 template HTMLs on page init so mount() can be synchronous.
+window._sllTemplateHtmlCache = window._sllTemplateHtmlCache || {};
+(function _preloadTemplates() {
+  const names = ['drag_drop', 'code', 'project', 'terminal'];
+  // 2026-04-22: cache-buster version must match the `?v=` on the CSS/JS
+  // links above so a single version bump invalidates every template asset
+  // atomically. If you change *.html / *.css / *.js, bump BOTH locations.
+  // v1.1.2 (2026-04-24) — added terminal.css + terminal.js to the head so
+  // SllTemplateTerminal registers on boot. Prior version shipped terminal.html
+  // in the HTML cache but never loaded the JS → dispatch fell through to the
+  // narrative fallback (agent blocker P0.4 2026-04-24).
+  const TPL_VERSION = '1.1.4';
+  names.forEach(n => {
+    fetch(`/templates/${n}.html?v=${TPL_VERSION}`, {cache: 'force-cache'})
+      .then(r => r.ok ? r.text() : Promise.reject(`HTTP ${r.status}`))
+      .then(html => { window._sllTemplateHtmlCache[n] = html; })
+      .catch(e => console.warn(`[tpl] failed to preload ${n}.html:`, e));
+  });
+})();
+
+// 2026-04-22 — Title/content mismatch softeners. Beginner-agent walkthrough
+// caught titles like "Is This a Binary-Search-the-Answer Problem?" on a
+// code_exercise (learner expected categorization UI) and "Write-Pointer
+// Off-By-One" on a code_review whose code had no detectable off-by-one.
+// Per user 2026-04-22: "for content issues, use template/backend
+// safeguards, avoid Creator prompt churn." These helpers soften the
+// mismatch at render time without regenerating the course.
+const _TITLE_QUIZ_PATTERNS = [
+  /^is this (?:a|an) .+\?$/i,
+  /^does .+ apply(?: here)?\?$/i,
+  /^would .+ work here\?$/i,
+  /^which .+ fits\?$/i,
+];
+function _softenBriefingForMismatch(step, type) {
+  const title = (step.title || '').trim();
+  const briefing = step.content || '';
+  // Case 1: quiz-sounding title on a code_exercise — add "Implement" banner
+  if (type === 'code_exercise' && _TITLE_QUIZ_PATTERNS.some(r => r.test(title))) {
+    const banner = `<div style="margin:0 0 12px 0; padding:10px 14px; background:#1a2440; border-left:3px solid #4a7cff; border-radius:6px; color:#cdd8ff; font-size:0.9rem;">
+      <strong>Exercise:</strong> This is an <em>Implement</em> step — read the briefing below, then write code in the editor to answer the question in the title.
+    </div>`;
+    return banner + briefing;
+  }
+  // Case 2: code_review — titles sometimes name a bug theme that doesn't
+  // match the actual planted bugs. Prepend a generic clarifier so the
+  // learner trusts the CODE over the TITLE.
+  if (type === 'code_review') {
+    const banner = `<div style="margin:0 0 12px 0; padding:10px 14px; background:#2a1f1a; border-left:3px solid #fbbf24; border-radius:6px; color:#fde9c9; font-size:0.88rem;">
+      <strong>How to solve:</strong> Read the code below line-by-line. Click any line you believe contains a bug. The title hints at bug <em>categories</em> but the actual planted bugs may differ — trust what you read, not what the title suggests.
+    </div>`;
+    return banner + briefing;
+  }
+  return briefing;
+}
+
+// Transform a step record into the data contract each template expects.
+function stepToTemplateData(step, type) {
+  const dd = step.demo_data || {};
+  const v = step.validation || {};
+  const softenedBriefing = _softenBriefingForMismatch(step, type);
+  const data = {
+    exercise_type: type,
+    title: step.title || '',
+    briefing: softenedBriefing,
+    problem_statement: softenedBriefing,
+  };
+  if (['code_exercise', 'code', 'code_read'].includes(type)) {
+    data.language = dd.language || v.language || step.language || 'python';
+    data.starter_code = step.code || dd.code || '';
+    data.hint = v.hint || '';
+    data.starter_files = dd.starter_files;
+    data.starter_repo = dd.starter_repo;
+    data.repo_path_var = dd.repo_path_var;
+    data.schema_setup = dd.schema_setup;
+    data.seed_rows = dd.seed_rows;
+    data.must_contain = v.must_contain || [];
+  } else if (type === 'parsons') {
+    const lines = dd.lines || [];
+    data.items = lines.map((l, i) => ({ id: `l${i}`, text: l }));
+  } else if (type === 'ordering') {
+    data.items = dd.items || [];
+  } else if (type === 'categorization') {
+    data.items = dd.items || [];
+    data.categories = dd.categories || [];
+  } else if (type === 'sjt') {
+    data.items = (dd.options || []).map((o, i) => ({
+      id: o.id || `o${i}`,
+      text: o.label || o.text || String(o),
+    }));
+  } else if (type === 'code_review') {
+    data.code = dd.code || step.code || '';
+    data.language = dd.language || 'python';
+  } else if (type === 'mcq') {
+    data.options = dd.options || [];
+    data.question = dd.question || step.content || '';
+  } else if (type === 'fill_in_blank') {
+    data.code = step.code || dd.code || '';
+    data.template = step.code || dd.code || '';
+    data.blanks = v.blanks || dd.blanks || [];
+  } else if (type === 'system_build') {
+    data.phases = dd.phases || [];
+    data.checklist = dd.checklist || [];
+    data.starter_repo = dd.starter_repo;
+    data.gha_workflow_check = v.gha_workflow_check || dd.gha_workflow_check;
+    data.endpoint_check = v.endpoint_check || dd.endpoint_check;
+    // v8.6.2 (2026-04-24) — zero-code rubric capstone fields. Template
+    // shows a paste-markdown widget when rubric is present AND no GHA
+    // /endpoint primitive is configured. Aliases: `rubric` (v8.6.2 standard)
+    // or `paste_rubric` (legacy).
+    data.rubric = v.rubric || v.paste_rubric || dd.rubric || '';
+    data.paste_prompt = dd.paste_prompt || v.paste_prompt || '';
+  } else if (type === 'terminal_exercise') {
+    // v8 (2026-04-22): BYO-execution. Fields from demo_data:
+    //   instructions  — HTML block with the commands/steps to run
+    //   byo_key_notice — bool; show the "your key stays on your machine" panel
+    //   asciinema_url — optional pre-recorded terminal demo
+    // hint (if any) comes through validation.hint like other types.
+    data.instructions = dd.instructions || step.code || '';
+    data.byo_key_notice = dd.byo_key_notice !== false; // default true for this type
+    data.asciinema_url = dd.asciinema_url;
+    data.hint = v.hint || '';
+    // v8.6.1 (2026-04-24) SWITCHING-UX pass-through — the terminal template
+    // renders a step-aware bootstrap banner + dependencies panel + structured
+    // paste slots when the Creator emits these in demo_data.
+    data.bootstrap_command = dd.bootstrap_command || '';
+    data.dependencies = Array.isArray(dd.dependencies) ? dd.dependencies : [];
+    data.paste_slots = Array.isArray(dd.paste_slots) ? dd.paste_slots : [];
+    // step_slug defaults to "M<modIdx>.S<stepIdx>" if Creator didn't set one
+    if (!dd.step_slug) {
+      try {
+        const mods = Array.isArray(state.modules) ? state.modules : [];
+        const mIdx = mods.findIndex(m => String(m.id) === String(state.currentModule));
+        if (mIdx >= 0) data.step_slug = `M${mIdx + 1}.S${state.currentStepIndex}`;
+      } catch (_) {}
+    } else {
+      data.step_slug = dd.step_slug;
+    }
+    data.step_task = dd.step_task || step.title || '';
+    // Dashboard deep-link — always include so learner can jump back.
+    // v8.6.1 (2026-04-24): user directive — Claude Preview MCP only
+    // resolves "localhost", not "127.0.0.1". If the user opened the
+    // dashboard on 127.0.0.1, normalize to localhost here so the deep-link
+    // pasted in their terminal works under preview.
+    try {
+      const origin = window.location.origin
+        .replace('://127.0.0.1:', '://localhost:')
+        .replace('://0.0.0.0:', '://localhost:');
+      data.dashboard_deeplink = origin + '/#' +
+        state.currentCourse.id + '/' + state.currentModule + '/' + state.currentStepIndex;
+    } catch (_) {}
+  }
+  return data;
+}
+
+function createTemplateHandlers(step, index) {
+  return {
+    // Submit for grading via the server. Also marks step complete on pass.
+    async judgeFn(payload) {
+      // 2026-04-22 fix: unified sessionStorage-backed counter (shared with
+      // legacy validateExercise path). Previous in-memory state._attempts
+      // appeared to reset between submits on some flows — beginner-agent
+      // saw "2 more retries" three attempts in a row on M4.S4 categorization.
+      const attempt = _sllRecordAttempt(step.id);
+      try {
+        const res = await fetch(`${API}/exercises/validate`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            step_id: step.id,
+            response_data: payload,
+            attempt_number: attempt,
+          }),
+        });
+        const result = await res.json();
+        if (result && (result.correct || (result.score || 0) >= 0.95)) {
+          try {
+            markStepComplete(state.currentCourse.id, state.currentModule, index);
+            if (typeof showCelebration === 'function') showCelebration();
+          } catch (_) {}
+        }
+        return result;
+      } catch (e) {
+        return { correct: false, score: 0, feedback: `Network error: ${e.message || e}` };
+      }
+    },
+    // Run learner code via the backend sandbox / Docker runner.
+    async executeFn(code, language, extras) {
+      return await executeCode(code, language, extras);
+    },
+    // GHA workflow check for system_build capstones that have gha_workflow_check.
+    async checkGhaFn(runUrl) {
+      try {
+        const res = await fetch(`${API}/exercises/check_gha`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ run_url: runUrl }),
+        });
+        return await res.json();
+      } catch (e) {
+        return { ok: false, detail: `Network error: ${e.message || e}` };
+      }
+    },
+  };
+}
+
+
 function renderStep(rawStep, index) {
   const container = document.getElementById('contentScroll');
   // Merge demo_data and validation into step so renderers can access fields directly.
@@ -3609,14 +4063,55 @@ function renderStep(rawStep, index) {
     html += `<div class="step-description">${step.description}</div>`;
   }
 
+  // P0-1 (2026-04-22): template-first dispatch for types covered by
+  // frontend/templates/{drag_drop,code,project}.*. When the template cache is
+  // loaded AND the type is covered, emit a placeholder instead of calling the
+  // legacy renderX function. The placeholder gets mounted in post-render.
+  // Legacy path (renderX + setupX) still runs for uncovered types
+  // (adaptive_roleplay / voice_mock_interview / incident_console / simulator_loop)
+  // or when templates haven't loaded yet.
+  // User directive 2026-04-22: templates cover EVERY non-interactive-first-slide
+  // exercise type. Legacy renderers for these types are dead. Only `concept`
+  // (interactive intro slides) + the rich custom renderers (adaptive_roleplay,
+  // voice_mock_interview, incident_console, simulator_loop, scenario_branch)
+  // still get LLM-authored HTML. Everything else = JSON data → template.
+  //
+  // 2026-04-22 v6: moved ABOVE the briefing-panel block (was below). The old
+  // order caused double-rendered briefings on every template type — the panel
+  // wrote step.content, then the template's [data-slot="briefing"] /
+  // [data-slot="problem_statement"] also rendered step.content (via
+  // stepToTemplateData's softenedBriefing). User screenshot caught this on
+  // code_review "Spot the Bug: Off-by-One in the Window Slide" showing the
+  // same text twice. Fix: compute _useTemplate first, then skip the upstream
+  // briefing panel when the template owns the render.
+  const _TEMPLATE_DISPATCH = {
+    'code_exercise': 'code', 'code': 'code', 'code_read': 'code',
+    'parsons': 'drag_drop', 'ordering': 'drag_drop',
+    'categorization': 'drag_drop', 'sjt': 'drag_drop',
+    'code_review': 'drag_drop',
+    'mcq': 'drag_drop',
+    'fill_in_blank': 'drag_drop',
+    'system_build': 'project',
+    // v8 (2026-04-22): BYO-execution. Learner runs on own machine, pastes output.
+    'terminal_exercise': 'terminal',
+  };
+  const _TPL_GLOBAL = {
+    'drag_drop': 'SllTemplateDragDrop',
+    'code': 'SllTemplateCode',
+    'project': 'SllTemplateProject',
+    'terminal': 'SllTemplateTerminal',
+  };
+  const _templateName = _TEMPLATE_DISPATCH[type];
+  const _useTemplate = _templateName
+    && window._sllTemplateHtmlCache
+    && window._sllTemplateHtmlCache[_templateName]
+    && window[_TPL_GLOBAL[_templateName]];
+
   // BRIEFING PANEL (user screenshot 2026-04-20: "No where it is written what to do"):
   // For non-concept exercise types, render step.content as a briefing panel
-  // ABOVE the widget so the Creator's 2-paragraph intro + bug-category-list /
-  // jargon definitions / worked examples land on screen. Without this, every
-  // code_review / ordering / categorization / fill_in_blank step dropped into
-  // its widget with only the short step.description and no instructions on
-  // WHAT to do. The briefings exist in step.content but were never rendered
-  // outside of the concept-step renderer.
+  // ABOVE the widget. Only fires for LEGACY-render types now — when _useTemplate
+  // is active, the template's own briefing/problem slot owns the render and
+  // adding this panel produces the double-text bug caught 2026-04-22 v6.
   //
   // Skip rendering when content is just a fallback stub (carries the
   // data-auto-review-stub="1" marker) — those are intentionally terse and
@@ -3625,7 +4120,7 @@ function renderStep(rawStep, index) {
     'code_review', 'ordering', 'categorization', 'fill_in_blank',
     'parsons', 'sjt', 'mcq', 'scenario_branch', 'code_exercise', 'system_build',
   ]);
-  if (NON_CONCEPT_TYPES_WITH_BRIEFING.has(type) && step.content) {
+  if (NON_CONCEPT_TYPES_WITH_BRIEFING.has(type) && step.content && !_useTemplate) {
     const isStub = /data-auto-review-stub="1"/.test(step.content);
     const plainLen = step.content.replace(/<[^>]+>/g, ' ').trim().length;
     // Threshold lowered 80 -> 20 on 2026-04-21 when the duplicate inline renders
@@ -3639,7 +4134,11 @@ function renderStep(rawStep, index) {
     }
   }
 
-  switch (type) {
+  if (_useTemplate) {
+    // Emit a placeholder. Real mount happens in the post-render block.
+    html += `<div class="sll-template-mount" data-template="${_templateName}" data-step-idx="${index}" style="margin-top:14px;"></div>`;
+  } else {
+    switch (type) {
     case 'concept':
       html += renderConceptStep(step, index);
       break;
@@ -3692,6 +4191,7 @@ function renderStep(rawStep, index) {
       html += `<div class="concept-content">${step.content || '<p>Unknown step type.</p>'}</div>`;
       break;
   }
+  }  // end else-block for _useTemplate fallback path
 
   html += '</div>';
   container.innerHTML = html;
@@ -3747,18 +4247,260 @@ function renderStep(rawStep, index) {
       // Fix A: wrap the widget body so setInterval/setTimeout are tracked.
       // The shimmed fns call the real ones and push the returned id into
       // window._widgetTimers. Teardown on next step nav clears them.
+      //
+      // 2026-04-22 BUG FIX (user report: "Interactive slide(1st) click does
+      // nothing" on Go course #created-575a53998df8/23070/0 — the content
+      // ships `<button onclick="showZeroValue('string')">` plus a `<script>`
+      // declaring `function showZeroValue`. Wrapping the whole script body
+      // in an IIFE made showZeroValue a LOCAL function to the IIFE — the
+      // inline onclick handler (which runs in global scope) couldn't find
+      // it, so clicks did nothing silently.
+      //
+      // Fix: scan the original script text for top-level `function NAME(`
+      // declarations and re-export them to `window` at the end of the IIFE.
+      // This preserves timer tracking while restoring the "widget buttons
+      // can call the widget script's functions" behavior the LLM assumes.
+      const _fnNameMatches = [...code.matchAll(/(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g)];
+      const _hoistedNames = Array.from(new Set(_fnNameMatches.map(m => m[1])));
+      const _hoistTail = _hoistedNames
+        .map(n => `try{window[${JSON.stringify(n)}]=${n};}catch(_e){}`)
+        .join('');
       code = `(function(){
         const _origInt = window.setInterval.bind(window);
         const _origTo  = window.setTimeout.bind(window);
         const _tracked = window._widgetTimers;
         const setInterval = (fn, d, ...a) => { const id = _origInt(fn, d, ...a); _tracked.intervals.push(id); return id; };
         const setTimeout  = (fn, d, ...a) => { const id = _origTo(fn, d, ...a);  _tracked.timeouts.push(id);  return id; };
-        try { ${code} } catch (e) { console.error('[widget script]', e); }
+        try { ${code}\n${_hoistTail} } catch (e) { console.error('[widget script]', e); }
       })();`;
       newScript.textContent = code;
     }
     oldScript.parentNode.replaceChild(newScript, oldScript);
   });
+
+  // P0-1 post-render: mount the template into the placeholder we emitted
+  // during the render-switch phase above. This replaces the legacy setupX
+  // call for covered types — templates handle their own event wiring.
+  if (_useTemplate) {
+    try {
+      const mountPoint = container.querySelector(
+        `.sll-template-mount[data-step-idx="${index}"]`);
+      if (!mountPoint) throw new Error('template mount point missing');
+      mountPoint.innerHTML = window._sllTemplateHtmlCache[_templateName];
+      const shellEl = mountPoint.querySelector(`[data-template="${_templateName}"]`);
+      if (!shellEl) throw new Error('template shell element missing');
+      const data = stepToTemplateData(step, type);
+      const handlers = createTemplateHandlers(step, index);
+      window[_TPL_GLOBAL[_templateName]].mount(shellEl, data, handlers);
+      // v8.6.1 (2026-04-24) — P0.4 BLOCKER fix from today's review agents:
+      // `code_read` is POLYMORPHIC based on whether the step has an
+      // `explanation_rubric`.
+      //
+      //   A) explanation_rubric PRESENT → learner must WRITE an explanation,
+      //      graded against the rubric by the backend's LLM-rubric grader.
+      //      Render a textarea + Submit below the (read-only) code editor.
+      //
+      //   B) explanation_rubric ABSENT → pure read-only reference material.
+      //      Auto-complete on view + hide Submit. This is the legacy path
+      //      preserved for code_read steps that never had a rubric (the
+      //      2026-04-22 v3→v4 fix.)
+      //
+      // Ontology (backend/ontology.py:338-348) declares explanation_rubric
+      // as REQUIRED on code_read steps going forward — but existing courses
+      // may have code_read steps without it, and we tolerate that.
+      if (type === 'code_read') {
+        const _crRubric = (step?.validation && (step.validation.explanation_rubric || step.validation.rubric)) || '';
+        // v8.6.2 (2026-04-24) — "text" language detection.
+        // Non-tech courses stash prompt/template/checklist REFERENCE TEXT
+        // in `code_read` steps with `demo_data.language === "text"`. The
+        // Monaco-like editor + line numbers + "What does this code do?"
+        // placeholder felt like a code exercise to the beginner reviewer.
+        // For `language === "text"`, swap the editor chrome for a styled
+        // reference-text block + keep the rubric-graded textarea below.
+        const _crLang = (step?.demo_data?.language || step?.demo_data?.lang || '').toLowerCase();
+        const _crIsText = _crLang === 'text' || _crLang === 'markdown' || _crLang === 'md' || _crLang === 'plaintext' || _crLang === 'plain';
+        // Editor stays read-only in BOTH branches — the learner reads code,
+        // they don't edit it.
+        try {
+          const edEl = shellEl.querySelector('[data-role="editor"]');
+          if (edEl) {
+            edEl.setAttribute('readonly', 'true');
+            edEl.style.cursor = 'default';
+          }
+        } catch (_) {}
+        // If the content is TEXT (not code), hide the code-editor shell entirely
+        // and render a plain styled reference block BEFORE the textarea. The
+        // step's concept HTML already shows the content; this block is a second
+        // confirmation the learner can scroll to. We hide the shell so the
+        // learner doesn't see "line 1: WEAK PROMPT:" treated as code.
+        try {
+          if (_crIsText) {
+            shellEl.style.display = 'none';
+            const rawText = ((step.demo_data && step.demo_data.code) || step.code || '').toString();
+            if (rawText.trim()) {
+              const container = shellEl.parentElement || shellEl;
+              if (!container.querySelector('.code-read-textref')) {
+                const block = document.createElement('div');
+                block.className = 'code-read-textref';
+                block.style.cssText = 'margin:14px 0; padding:16px 20px; background:#161b26; border:1px solid #2a3352; border-left:3px solid #4a7cff; border-radius:8px; color:#e8ecf4; white-space:pre-wrap; font-family: ui-sans-serif, system-ui; font-size:0.92rem; line-height:1.6; max-height:520px; overflow:auto;';
+                const header = document.createElement('div');
+                header.style.cssText = 'color:#8892a8; font-size:0.76rem; font-weight:700; letter-spacing:0.05em; text-transform:uppercase; margin-bottom:10px;';
+                header.textContent = 'Reference material — read below';
+                const body = document.createElement('div');
+                body.textContent = rawText;
+                block.appendChild(header);
+                block.appendChild(body);
+                shellEl.parentElement.insertBefore(block, shellEl);
+              }
+            }
+          }
+        } catch (_) {}
+        // "read-only reference" badge in both branches.
+        try {
+          const hdr = shellEl.querySelector('.tmpl-editor-header');
+          if (hdr && !hdr.querySelector('.sll-readonly-badge')) {
+            const badge = document.createElement('span');
+            badge.className = 'sll-readonly-badge';
+            badge.textContent = 'read-only reference';
+            badge.style.cssText = 'margin-left:10px; padding:2px 8px; border-radius:10px; background:#2dd4bf22; color:#2dd4bf; font-size:0.74rem; font-weight:600;';
+            hdr.appendChild(badge);
+          }
+        } catch (_) {}
+        // Hide Run / Reset (no code-execution path on code_read in either branch).
+        try {
+          shellEl.querySelectorAll('[data-action="run"], [data-action="reset-code"]').forEach(el => {
+            el.style.display = 'none';
+          });
+        } catch (_) {}
+
+        if (_crRubric) {
+          // === Branch A: explain-with-rubric ===
+          // Hide the code editor's Submit button — we render our own under
+          // the textarea so the learner's action target is unambiguous.
+          try {
+            shellEl.querySelectorAll('[data-action="submit"]').forEach(el => {
+              el.style.display = 'none';
+            });
+          } catch (_) {}
+          // Inject explanation textarea + grade-on-submit UI below the shell.
+          try {
+            const container = shellEl.parentElement || shellEl;
+            // Avoid double-mounting on re-render
+            if (!container.querySelector('.code-read-explain')) {
+              const block = document.createElement('div');
+              block.className = 'code-read-explain';
+              block.style.cssText = 'margin-top:14px; background:#161b26; border:1px solid #2a3352; border-radius:8px; padding:14px;';
+              // v8.6.2 — content-agnostic prompt copy. "code" vocabulary
+              // confuses non-coder learners when the reference material is
+              // actually prose/prompts/templates (language: text).
+              const _explainIntro = _crIsText
+                ? 'Read the material above, then explain the key differences, trade-offs, or what makes one approach stronger than another. 3-5 sentences. Grader checks your explanation against a rubric.'
+                : 'Read the code above, then explain what it does and the key design choices. 3-5 sentences. Grader checks your explanation against a rubric.';
+              const _explainPlaceholder = _crIsText
+                ? 'What do you notice? What makes one approach work better than the other? Be specific.'
+                : 'What does this code do? What are the important design choices a learner should notice?';
+              block.innerHTML = `
+                <div style="color:#e8ecf4; font-weight:600; font-size:0.92rem; margin-bottom:8px;">
+                  Write your explanation
+                </div>
+                <div style="color:#8892a8; font-size:0.82rem; margin-bottom:10px; line-height:1.5;">
+                  ${_explainIntro}
+                </div>
+                <textarea id="codeReadExplain" rows="6" placeholder="${_explainPlaceholder}"
+                  style="width:100%; background:#0e1218; color:#e8ecf4; border:1px solid #2a3352; border-radius:6px; padding:10px; font-family: ui-sans-serif, system-ui; font-size:0.9rem; line-height:1.5; resize:vertical;"></textarea>
+                <div style="margin-top:10px; display:flex; gap:10px; align-items:center;">
+                  <button id="codeReadSubmit" class="check-btn"
+                    style="background:#4a7cff; color:#fff; border:0; border-radius:6px; padding:8px 16px; cursor:pointer; font-weight:600;">
+                    Submit explanation
+                  </button>
+                  <span id="codeReadStatus" style="color:#8892a8; font-size:0.82rem;"></span>
+                </div>
+                <div id="codeReadResult" style="margin-top:14px;"></div>
+              `;
+              container.appendChild(block);
+              const btn = block.querySelector('#codeReadSubmit');
+              const ta = block.querySelector('#codeReadExplain');
+              const status = block.querySelector('#codeReadStatus');
+              const result = block.querySelector('#codeReadResult');
+              btn.addEventListener('click', async () => {
+                const txt = (ta.value || '').trim();
+                if (txt.length < 30) {
+                  status.textContent = 'Your explanation is too short — aim for 3-5 sentences.';
+                  status.style.color = '#fca5a5';
+                  return;
+                }
+                // v8.6.2 (2026-04-24) — clear stale feedback BEFORE firing the
+                // new grade request. Beginner reviewer 2026-04-24 saw attempt-2
+                // feedback "stuck" at attempt-1 score (20%) even though backend
+                // returned a different score. Root cause: async request could
+                // still be in flight when user clicks again, and the visible
+                // feedback pane wasn't cleared — giving the illusion the new
+                // submission didn't register. Clearing result.innerHTML up front
+                // makes "I clicked Submit but nothing changed" impossible.
+                result.innerHTML = '';
+                btn.disabled = true;
+                status.textContent = 'Grading…';
+                status.style.color = '#8892a8';
+                try {
+                  const res = await validateExercise(step.id, 'code_read', { explanation: txt });
+                  const score = typeof res.score === 'number' ? res.score : 0;
+                  const scorePct = Math.round(score * 100);
+                  const isCorrect = !!res.correct;
+                  const color = isCorrect ? '#2dd4bf' : (score >= 0.4 ? '#fbbf24' : '#fca5a5');
+                  result.innerHTML = `
+                    <div style="background:#0e1218; border:1px solid #2a3352; border-left:3px solid ${color}; border-radius:6px; padding:12px;">
+                      <div style="color:${color}; font-weight:600; font-size:0.92rem; margin-bottom:6px;">
+                        ${isCorrect ? '✓' : score >= 0.4 ? '◐' : '✗'} Score: ${scorePct}%
+                      </div>
+                      <div style="color:#c9d1df; font-size:0.88rem; line-height:1.5; white-space:pre-line;">
+                        ${esc(res.feedback || '')}
+                      </div>
+                      ${!isCorrect ? `<div style="margin-top:10px; color:#8892a8; font-size:0.78rem;">Iterate: refine your explanation and submit again.</div>` : ''}
+                    </div>
+                  `;
+                  status.textContent = '';
+                  // v8.6.2 — INVERTED-LOGIC FIX. Previous line was
+                  //   btn.disabled = !isCorrect;  // disabled on miss, enabled on pass
+                  // which is the OPPOSITE of the inline comment's intent
+                  // ("leave disabled on pass, allow retry on miss"). Beginner
+                  // reviewer saw button get DISABLED after first fail →
+                  // couldn't iterate → step felt broken. Correct semantics:
+                  // disable on pass (to signal done), keep enabled on miss
+                  // (so the learner can edit + retry).
+                  btn.disabled = isCorrect;
+                  if (isCorrect) {
+                    try { markStepComplete(state.currentCourse.id, state.currentModule, index, scorePct); } catch (_) {}
+                  }
+                } catch (e) {
+                  status.textContent = 'Grading failed. Try again.';
+                  status.style.color = '#fca5a5';
+                  btn.disabled = false;
+                }
+              });
+            }
+          } catch (e) { console.warn('code_read rubric UI mount failed:', e); }
+        } else {
+          // === Branch B: legacy read-only reference (no rubric) ===
+          // Hide Submit too — auto-complete path.
+          try {
+            shellEl.querySelectorAll('[data-action="submit"]').forEach(el => {
+              el.style.display = 'none';
+            });
+          } catch (_) {}
+          // Mark complete on view (legacy behavior).
+          try {
+            if (state.currentCourse && state.currentCourse.id && state.currentModule) {
+              markStepComplete(state.currentCourse.id, state.currentModule, index);
+            }
+          } catch (_) {}
+        }
+      }
+      return;  // skip legacy setup for this step
+    } catch (tpErr) {
+      console.warn('[tpl] post-render mount failed, legacy setupX will not run either:', tpErr);
+      return;  // avoid running legacy setup on a half-rendered container
+    }
+  }
 
   // Post-render setup
   switch (type) {
@@ -3815,6 +4557,7 @@ function renderBanner(type) {
   const banners = {
     concept: ['banner-concept', '&#128214; Concept'],
     code: ['banner-code', '&#9654; Read & Run'],
+    code_read: ['banner-concept', '&#128209; Read Reference'],
     code_exercise: ['banner-exercise', '&#128295; Exercise'],
     fill_in_blank: ['banner-interactive', '&#9999; Fill in the Blanks'],
     parsons: ['banner-interactive', '&#128256; Parsons Problem'],
@@ -3873,7 +4616,22 @@ function renderIncompleteStepNote(step) {
 }
 
 // ===================================================================
-// Code Step (Read & Run)
+// ⚠️ DEPRECATED RENDERERS (2026-04-22)
+// ===================================================================
+// Per the user directive "remove legacy renderers that were hardcoding —
+// only interactive first slides can have complete html/js rendered by LLM.
+// Else we should use LLMs as json return only" — the functions below are
+// NO LONGER CALLED for their primary exercise types. The template
+// dispatch in renderStep() routes:
+//   code / code_exercise / code_read      → frontend/templates/code.*
+//   parsons / ordering / categorization /
+//   sjt / code_review / mcq / fill_in_blank → frontend/templates/drag_drop.*
+//   system_build                           → frontend/templates/project.*
+// These renderX + setupX functions remain defined only as emergency
+// fallback when the template cache fails to load (e.g. /templates/* returns
+// 404 because of a deploy issue). On next cleanup PR, physically delete
+// the function bodies — the risk of in-place deletion in the same session
+// as the template switch is too high.
 // ===================================================================
 function renderCodeStep(step, index) {
   const code = loadCode(state.currentCourse.id, state.currentModule, index) || step.code || '';
@@ -5293,16 +6051,47 @@ function renderSystemBuildStep(step, index) {
   }
 
   // --- Verification Panel ---
+  // v8.6.2 (2026-04-24) — mode-switched submit UI based on validation shape.
+  // ZERO-CODE capstone (validation.rubric present) → paste-markdown textarea.
+  // GHA capstone (validation.gha_workflow_check) → GitHub Actions run URL input.
+  // ENDPOINT capstone (validation.endpoint_check) → live endpoint URL input.
+  // Generic for all system_build courses — no hardcoding per course.
+  const _sbVal = step.validation || {};
+  const _sbHasRubric = typeof _sbVal.rubric === 'string' && _sbVal.rubric.trim();
+  const _sbHasGha = _sbVal.gha_workflow_check && typeof _sbVal.gha_workflow_check === 'object';
+  const _sbHasEndpoint = _sbVal.endpoint_check && typeof _sbVal.endpoint_check === 'object';
+  const _sbPastePrompt = (step.demo_data && step.demo_data.paste_prompt) || 'Paste your complete deliverable (markdown, plaintext, or prompt library) below.';
+
   html += '<div class="sb-verify-panel">';
-  html += '<div class="sb-verify-title">Verification</div>';
-  html += '<input type="text" class="sb-endpoint-input" id="sbEndpointUrl" placeholder="https://your-deployment.example.com" />';
-  html += '<div class="sb-deploy-status" id="sbDeployStatus">';
-  html += '<div class="sb-status-dot" id="sbStatusDot"></div>';
-  html += '<span id="sbStatusText">Awaiting deployment URL...</span>';
-  html += '</div>';
+  html += '<div class="sb-verify-title">Submit Your Deliverable</div>';
+  if (_sbHasRubric) {
+    // Zero-code: markdown paste textarea.
+    html += `<div style="color:var(--text-secondary); font-size:0.85rem; margin:6px 0 10px;">${esc(_sbPastePrompt)}</div>`;
+    html += '<textarea id="sbPasteMarkdown" rows="14" placeholder="# Your Team Prompt Library&#10;&#10;## Template 1: ...&#10;&#10;(paste your full doc here)"'
+      + ' style="width:100%; background:#0e1218; color:#e8ecf4; border:1px solid #2a3352; border-radius:6px; padding:12px; font-family: ui-sans-serif, system-ui; font-size:0.9rem; line-height:1.5; resize:vertical; min-height:280px;"></textarea>';
+    html += '<div class="sb-deploy-status" id="sbDeployStatus" style="margin-top:8px;">';
+    html += '<div class="sb-status-dot" id="sbStatusDot"></div>';
+    html += '<span id="sbStatusText">Paste your doc above, then click Submit to grade against the rubric.</span>';
+    html += '</div>';
+  } else if (_sbHasGha) {
+    // GHA capstone: run URL input.
+    html += '<div style="color:var(--text-secondary); font-size:0.85rem; margin:6px 0 10px;">Paste the GitHub Actions RUN URL (e.g. <code>https://github.com/your/repo/actions/runs/1234567</code>).</div>';
+    html += '<input type="text" class="sb-endpoint-input" id="sbWorkflowUrl" placeholder="https://github.com/<your>/<fork>/actions/runs/<id>" />';
+    html += '<div class="sb-deploy-status" id="sbDeployStatus">';
+    html += '<div class="sb-status-dot" id="sbStatusDot"></div>';
+    html += '<span id="sbStatusText">Awaiting GHA run URL…</span>';
+    html += '</div>';
+  } else {
+    // Endpoint capstone or legacy: endpoint URL input.
+    html += '<input type="text" class="sb-endpoint-input" id="sbEndpointUrl" placeholder="https://your-deployment.example.com" />';
+    html += '<div class="sb-deploy-status" id="sbDeployStatus">';
+    html += '<div class="sb-status-dot" id="sbStatusDot"></div>';
+    html += '<span id="sbStatusText">Awaiting deployment URL...</span>';
+    html += '</div>';
+  }
   html += '</div>';
 
-  html += `<button class="sb-submit-btn" id="sbSubmitBtn" onclick="submitSystemBuild(${index})">Submit Build</button>`;
+  html += `<button class="sb-submit-btn" id="sbSubmitBtn" onclick="submitSystemBuild(${index})">${_sbHasRubric ? 'Submit Deliverable' : 'Submit Build'}</button>`;
   html += '<div id="sbResult"></div>';
 
   html += '</div>'; // end system-build
@@ -5431,17 +6220,26 @@ async function submitSystemBuild(index) {
     checklistData[id] = item.classList.contains('checked');
   });
 
-  // Gather endpoint URL
+  // v8.6.2 (2026-04-24) — mode-aware submission gathering.
+  // Pick up whichever of the three input kinds is present in the DOM:
+  //   - #sbPasteMarkdown (zero-code rubric capstone)
+  //   - #sbWorkflowUrl   (GHA run URL)
+  //   - #sbEndpointUrl   (endpoint_check live URL)
+  const pasteMarkdown = (document.getElementById('sbPasteMarkdown')?.value || '').trim();
+  const workflowRunUrl = (document.getElementById('sbWorkflowUrl')?.value || '').trim();
   const endpointUrl = (document.getElementById('sbEndpointUrl')?.value || '').trim();
 
   const btn = document.getElementById('sbSubmitBtn');
   btn.disabled = true;
-  btn.innerHTML = 'Deploying...';
+  btn.innerHTML = pasteMarkdown ? 'Grading…' : 'Deploying...';
 
   const responseData = {
     checklist: checklistData,
     phases_completed: phasesCompleted,
     endpoint_url: endpointUrl || undefined,
+    workflow_run_url: workflowRunUrl || undefined,
+    // Backend accepts paste_markdown / paste / submission aliases.
+    paste_markdown: pasteMarkdown || undefined,
   };
 
   try {
@@ -6408,41 +7206,103 @@ function renderSimulatorLoopStep(step, index) {
 }
 
 function renderSimInitialMetrics(state) {
+  // v8.6.2 (2026-04-24) — render compound state values (arrays of objects,
+  // nested dicts) as human-readable summaries instead of "[object Object]".
+  // Non-tech beginner review 2026-04-24 caught `inbox: [{...12 messages...}]`
+  // rendering as "[object Object],[object Object],..." — makes the whole
+  // dashboard unreadable. Generic: any simulator_loop whose initial_state
+  // includes list/dict values gets coerced to a {N items}/{K fields} summary.
   let html = '';
   for (const [k, v] of Object.entries(state)) {
-    html += `<div class="sim-metric"><label>${esc(k)}</label><div class="sim-metric-value" data-metric="${esc(k)}">${esc(formatSimValue(v))}</div></div>`;
+    const rendered = formatSimValue(v);
+    html += `<div class="sim-metric"><label>${esc(k)}</label><div class="sim-metric-value" data-metric="${esc(k)}">${esc(rendered)}</div></div>`;
   }
   return html;
 }
 
 function formatSimValue(v) {
+  if (v === null || v === undefined) return '—';
   if (typeof v === 'number') {
     if (Math.abs(v) >= 1000) return v.toLocaleString();
     if (!Number.isInteger(v)) return v.toFixed(2);
     return String(v);
   }
+  if (typeof v === 'boolean') return v ? 'yes' : 'no';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) {
+    // Collapsed array summary — no `[object Object]`.
+    if (v.length === 0) return 'empty';
+    return `${v.length} item${v.length === 1 ? '' : 's'}`;
+  }
+  if (typeof v === 'object') {
+    const keys = Object.keys(v);
+    if (keys.length === 0) return '{}';
+    // Try to find a single primitive value to surface (e.g. {count: 5})
+    if (keys.length === 1 && ['number', 'string', 'boolean'].includes(typeof v[keys[0]])) {
+      return `${keys[0]}: ${formatSimValue(v[keys[0]])}`;
+    }
+    return `${keys.length} field${keys.length === 1 ? '' : 's'}`;
+  }
   return String(v);
 }
 
+// v8.6.2 (2026-04-24) — module-scoped simulator session state.
+// Captured at setupSimulatorLoop time so navigation-race doesn't break
+// things. Expert + beginner reviews 2026-04-24 both flagged that
+// "Begin Simulation" navigated to M5 instead of starting the sim —
+// root cause was simloopStart(index) using `getSteps()[index]` after
+// an unrelated navigation mutation moved the current module. Fix:
+// capture step.id + demo_data at render time; never touch `getSteps()`
+// inside the sim action/advance paths.
 let _simSession = null;
+window._simSession = null;  // also expose globally so formatSimEventHuman can read
 
 function setupSimulatorLoop(step, index) {
-  _simSession = {stepId: step.id, sessionId: null};
+  // Capture everything we need at render time — any later mutation
+  // of `state` won't leak into the sim. `step.demo_data` is the
+  // full Creator payload; we cache the learner-facing bits on the
+  // session so event/metric renderers don't have to re-traverse
+  // the catalog. `window._simSession = _simSession` keeps the
+  // reference alive so formatSimEventHuman can reach it.
+  _simSession = {
+    stepId: step.id,
+    sessionId: null,
+    uiConfig: (step.demo_data && step.demo_data.ui_config) || {},
+    tickMs: (step.demo_data && step.demo_data.tick_ms) || 0,
+    maxTicks: (step.demo_data && step.demo_data.max_ticks) || 300,
+  };
+  window._simSession = _simSession;
 }
 
 async function simloopStart(index) {
   const btn = document.getElementById('simStartBtn');
   btn.disabled = true;
   btn.textContent = 'Starting...';
-  const step = getSteps()[index];
+  // v8.6.2 — use the stepId captured at setup, NOT getSteps()[index].
+  // getSteps() reads `state.currentModuleData.steps` which can shift
+  // when the router updates — causing simloopStart to POST with a
+  // different step's id (M5's capstone step) → the simloop engine
+  // either 400s or starts a session against the WRONG step's data.
+  const stepId = (_simSession && _simSession.stepId) || null;
+  if (!stepId) {
+    btn.disabled = false;
+    btn.textContent = 'Retry — not ready';
+    return;
+  }
   try {
     const res = await fetch(`${API}/simloop/start`, {
       method: 'POST', headers: {'Content-Type':'application/json'},
-      body: JSON.stringify({step_id: step.id}),
+      body: JSON.stringify({step_id: stepId}),
     });
     if (!res.ok) throw new Error(`Start failed: ${res.status}`);
     const data = await res.json();
     _simSession.sessionId = data.session_id;
+    // Also snapshot ui_config / tick_ms from the server response
+    // (authoritative over the demo_data in case a regen updated it).
+    if (data.ui_config) _simSession.uiConfig = data.ui_config;
+    if (data.tick_ms) _simSession.tickMs = data.tick_ms;
+    if (data.max_ticks) _simSession.maxTicks = data.max_ticks;
+    window._simSession = _simSession;
     renderSimActions(data.actions || [], index);
     updateSimMetrics(data.initial_state || {});
     document.getElementById('simAdvanceBtn').style.display = 'inline-block';
@@ -6531,9 +7391,74 @@ function appendSimEvent(ev, tick) {
   if (empty) empty.remove();
   const div = document.createElement('div');
   div.className = 'sim-event';
-  div.innerHTML = `<div class="tick">tick ${tick||'?'}</div><div class="text">${esc(ev.text || ev.type || JSON.stringify(ev))}</div>`;
+  const {timeStr, text} = formatSimEventHuman(ev, tick);
+  div.innerHTML = `<div class="tick">${esc(timeStr)}</div><div class="text">${esc(text)}</div>`;
   el.appendChild(div);
   el.scrollTop = el.scrollHeight;
+}
+
+// v8.6.2 (2026-04-24) — render a simulation event as human-readable text.
+// Expert review 2026-04-24 flagged Event Stream showing raw JSON like
+// `{"id":"ping_1","t_offset_ms":300000,"effect":{"focus_tokens":"- 1"}}`
+// to a non-coder PM audience. Root cause: appendSimEvent fell through to
+// JSON.stringify(ev) when ev.text / ev.type were absent. Fix: resolve ev.id
+// against demo_data.ui_config.{interruptions,ceo_email,events} lookup tables
+// populated by the Creator for inbox-style sims; fall back to a readable
+// placeholder based on ev.id. Generic across any simulator_loop course.
+function formatSimEventHuman(ev, tick) {
+  if (!ev || typeof ev !== 'object') {
+    return {timeStr: `tick ${tick || '?'}`, text: String(ev || 'event')};
+  }
+
+  // Resolve against the current simloop session's ui_config if present.
+  // _simSession is the module-scoped state object set by simloopStart().
+  const uiConfig = (window._simSession && window._simSession.uiConfig) || {};
+  const inbox = uiConfig.inbox || [];
+  const interruptions = uiConfig.interruptions || [];
+  const ceoEmail = uiConfig.ceo_email || null;
+  const uiEvents = uiConfig.events || [];
+
+  // 1. Prefer explicit `text` if the Creator provided one.
+  let text = ev.text || ev.label || ev.description || '';
+
+  // 2. Lookup by ID in all known Creator-populated event tables.
+  if (!text && ev.id) {
+    const match =
+      interruptions.find(i => i.id === ev.id) ||
+      uiEvents.find(i => i.id === ev.id) ||
+      (ceoEmail && ceoEmail.id === ev.id ? ceoEmail : null);
+    if (match) {
+      const who = match.from || match.sender || '';
+      const body = match.text || match.subject || match.content || '';
+      text = who ? `${who}: ${body}` : body;
+    }
+  }
+
+  // 3. Fallback — humanize the id. "ping_2" → "Ping 2", "ceo_email_arrives" → "Ceo Email Arrives".
+  if (!text && ev.id) {
+    text = String(ev.id)
+      .replace(/[_\-]+/g, ' ')
+      .replace(/\b\w/g, c => c.toUpperCase());
+  }
+  if (!text) text = 'Event';
+
+  // 4. Friendly time label: if the sim uses minute-scale ticks (tick_ms=60000),
+  // turn tick N into "9:0N AM" on a Monday-morning starting at 9:00. Else
+  // show "tick N". No raw t_offset_ms numbers.
+  const tickMs = (window._simSession && window._simSession.tickMs) || 0;
+  let timeStr;
+  if (tickMs === 60000 && typeof tick === 'number') {
+    const totalMin = tick;
+    const hh = 9 + Math.floor(totalMin / 60);
+    const mm = String(totalMin % 60).padStart(2, '0');
+    const period = hh >= 12 ? 'PM' : 'AM';
+    const hh12 = ((hh + 11) % 12) + 1;
+    timeStr = `${hh12}:${mm} ${period}`;
+  } else {
+    timeStr = `tick ${tick || 0}`;
+  }
+
+  return {timeStr, text};
 }
 
 function showSimDebrief(outcome, index) {
@@ -7299,9 +8224,6 @@ function _snapshotStep2Answers() {
     if (!qid) return;
     out[qid] = el.value || '';
   });
-  // Depth radio selection (segmented control in step 2)
-  const depthSel = document.querySelector('.depth-seg input[type="radio"]:checked');
-  if (depthSel) out.__depth = depthSel.value || depthSel.dataset.value || '';
   // Framing pills (step 1)
   const framings = [];
   document.querySelectorAll('.framing-pill.active').forEach(p => {
@@ -7403,15 +8325,10 @@ function _applyCreatorDraftToDOM(draft) {
   // rendered step 2 (for step 2) or step 1 (framing pills).
   if (draft.step2Answers) {
     Object.entries(draft.step2Answers).forEach(([qid, val]) => {
-      if (qid === '__depth' || qid === '__framings') return;
+      if (qid === '__framings') return;
       const el = document.querySelector(`.creator-answer[data-qid="${CSS.escape(qid)}"]`);
       if (el) el.value = val || '';
     });
-    if (draft.step2Answers.__depth) {
-      const radio = document.querySelector(
-        `.depth-seg input[type="radio"][value="${CSS.escape(draft.step2Answers.__depth)}"]`);
-      if (radio) radio.checked = true;
-    }
     if (Array.isArray(draft.step2Answers.__framings)) {
       draft.step2Answers.__framings.forEach(key => {
         const [dim, opt] = String(key).split(':');
@@ -8371,20 +9288,30 @@ async function creatorStart() {
         { delay: 13000, text: 'Wrapping up\u2026 (this one\u2019s taking a sec)' },
       ],
     );
-    let res, data;
+    // 2026-04-22 v8: /creator/start now enqueues a celery task and returns
+    // {session_id, task_id, status: "pending"} immediately. We poll
+    // /creator/session/{sid}/status until the task is done, then pull the
+    // actual {questions, initial_outline, ...} out of the task's response.
+    // Before this fix: the wizard jumped to step 2 with questions=[] and
+    // the UI showed "A few questions..." with zero question rows.
+    let enqueueRes, enqueueData, finalResp;
     try {
-      res = await fetch(`${API}/creator/start`, {
+      enqueueRes = await fetch(`${API}/creator/start`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify(body),
       });
-      if (!res.ok) throw new Error(`Failed: ${res.status}`);
-      data = await res.json();
+      if (!enqueueRes.ok) throw new Error(`Failed: ${enqueueRes.status}`);
+      enqueueData = await enqueueRes.json();
+      const sid = enqueueData.session_id;
+      if (!sid) throw new Error('No session_id returned');
+      finalResp = await _pollCreatorTaskUntilDone(sid);
     } finally { _stopStartPhases(); }
 
-    creatorState.sessionId = data.session_id;
-    creatorState.questions = data.questions || [];
-    creatorState.initialOutline = data.initial_outline || { modules: [] };
+    creatorState.sessionId = enqueueData.session_id;
+    const resp = finalResp || {};
+    creatorState.questions = resp.questions || [];
+    creatorState.initialOutline = resp.initial_outline || { modules: [] };
     creatorState.step = 2;
     _saveCreatorDraft();  // 2026-04-21 persist draft across back-nav
     renderCreatorWizard();
@@ -8396,18 +9323,71 @@ async function creatorStart() {
   }
 }
 
+// 2026-04-22 v8 — celery async polling helper for the Creator wizard.
+//
+// After the v7.5 celery switch, /creator/start, /creator/refine, and
+// /creator/generate all return {session_id, task_id, status: "pending"}
+// immediately instead of the actual response payload. The frontend must
+// poll /api/creator/session/{sid}/status until `status == "done"`, then
+// pull the real response out of the `response` field.
+//
+// Returns the parsed `response` object (questions + initial_outline for
+// start, outline + follow_up_questions for refine, course_id for generate).
+// Throws on timeout or task failure — caller decides how to surface the
+// error.
+async function _pollCreatorTaskUntilDone(sessionId, opts) {
+  opts = opts || {};
+  const timeoutMs = opts.timeoutMs || 15 * 60 * 1000;  // 15 min default
+  const pollIntervalMs = opts.pollIntervalMs || 2500;
+  const onProgress = typeof opts.onProgress === 'function' ? opts.onProgress : null;
+  const t0 = Date.now();
+  let lastState = null;
+  while (true) {
+    if (Date.now() - t0 > timeoutMs) {
+      throw new Error(`Creator task timed out after ${Math.round(timeoutMs/60000)} min`);
+    }
+    let r;
+    try {
+      r = await fetch(`${API}/creator/session/${encodeURIComponent(sessionId)}/status`);
+    } catch (e) {
+      // Transient network error — keep polling
+      await new Promise(res => setTimeout(res, pollIntervalMs));
+      continue;
+    }
+    if (!r.ok) {
+      // 404 on the first few polls is expected (race between enqueue and
+      // the status endpoint seeing the job). Back off and retry.
+      if (r.status === 404) {
+        await new Promise(res => setTimeout(res, pollIntervalMs));
+        continue;
+      }
+      throw new Error(`status poll HTTP ${r.status}`);
+    }
+    const s = await r.json();
+    if (s.status !== lastState) {
+      lastState = s.status;
+      if (onProgress) { try { onProgress(s); } catch (_) {} }
+    }
+    if (s.status === 'done') {
+      return s.response || {};
+    }
+    if (s.status === 'failed') {
+      throw new Error(s.error || 'Creator task failed (no detail)');
+    }
+    await new Promise(res => setTimeout(res, pollIntervalMs));
+  }
+}
+
 // ---------- Step 2: Answer Questions ----------
 function renderCreatorStep2() {
-  // Redesigned 2026-04-19 after UX audit: killed "Quick framing" band, made depth
-  // COMPULSORY as a segmented control at top, demoted audience to an optional
-  // disclosure, dropped the outline preview column (it created a "reward-for-not-
-  // answering" bias — outline gets shown on step 3 where it belongs).
-  const depthOptions = [
-    { id: 'immersive', label: 'Drop-in simulation', sub: 'Learners live it',       append: 'Prefer live multi-pane simulation (terminals, dashboards, Slack-style channels). Figure-it-out pedagogy.' },
-    { id: 'guided',    label: 'Guided practice',    sub: 'Scaffolded drills',       append: 'Use step-by-step scaffolding with inline hints and progressive reveal.' },
-    { id: 'basic',     label: 'Concept-first',      sub: 'Teach WHY before HOW',    append: 'Cover foundational concepts first; lighter simulation. Learner should understand WHY before practicing HOW.' },
-  ];
-  const audienceOptions = (FRAMING_DIMENSIONS.find(d => d.id === 'audience') || {}).options || [];
+  // Layout: single column of combo-input questions. Submit proceeds to step 3.
+  //
+  // 2026-04-22 cleanup: removed the "How hands-on should this feel?" depth
+  // picker (Drop-in simulation / Guided practice / Concept-first). It was
+  // compulsory in the UI but the selected value was stashed on creatorState
+  // and NEVER sent to the backend — /api/creator/refine receives only
+  // {session_id, answers}. Dead UX that gated submit for nothing. If/when
+  // we wire depth through, restore via the COURSE_MODE_REGISTRY path.
 
   // Questions render as a TYPEAHEAD COMBOBOX: input + dropdown of suggestions that
   // filters as you type, BUT always accepts free text. Fixes "none of the options fit" problem.
@@ -8449,77 +9429,18 @@ function renderCreatorStep2() {
     </div>`;
   }).join('');
 
-  // Compulsory depth — segmented control. No default selection; submit stays disabled until picked.
-  const depthControl = `
-    <fieldset id="creatorDepthFieldset" style="border:0; padding:0; margin:0 0 18px;">
-      <legend style="font-size:0.88rem; color:var(--text-primary); font-weight:600; padding:0; margin-bottom:8px;">
-        How hands-on should this feel? <span style="color:var(--error); margin-left:2px;" aria-label="required">*</span>
-      </legend>
-      <div class="depth-seg" role="radiogroup" aria-required="true" aria-labelledby="creatorDepthFieldset" style="display:grid; grid-template-columns:repeat(3,1fr); gap:8px;">
-        ${depthOptions.map(o => `
-          <button type="button"
-                  role="radio"
-                  aria-checked="false"
-                  class="depth-opt"
-                  data-depth="${esc(o.id)}"
-                  data-append="${escAttr(o.append)}"
-                  onclick="pickCreatorDepth(this)"
-                  style="background:var(--bg-tertiary); border:1.5px solid var(--border); border-radius:8px; padding:12px 14px; text-align:left; color:var(--text-secondary); cursor:pointer; transition:all 0.15s;">
-            <div style="font-size:0.9rem; font-weight:600; color:var(--text-primary);">${esc(o.label)}</div>
-            <div style="font-size:0.76rem; color:var(--text-muted); margin-top:3px;">${esc(o.sub)}</div>
-          </button>
-        `).join('')}
-      </div>
-    </fieldset>
-    <style>
-      .depth-opt:hover { border-color: var(--accent); }
-      .depth-opt.selected { background: rgba(124,58,237,0.15) !important; border-color: #a855f7 !important; color: #e9d5ff !important; }
-      .depth-opt.selected div:first-child { color: #f3e8ff !important; }
-      .depth-opt.selected div:last-child { color: #c4b5fd !important; }
-    </style>
-  `;
-
-  // Audience disclosure REMOVED 2026-04-19 after user feedback: the 4 options (individual /
-  // team-readiness / 30-60-90 / cert-prep) aren't mutually exclusive, and burying "AI-readiness"
-  // behind an optional disclosure hid the value prop. AI-readiness is now surfaced VISIBLY via
-  // the 3 pinned "AI power skills" templates at the top of Step 1's autocomplete dropdown.
-  const audienceDisclosure = '';
-
   // Single-column layout — the outline-preview right-panel was dropped. Outline shows on step 3.
   return `
     <div style="max-width:720px; margin:0 auto;">
-      ${depthControl}
-      ${audienceDisclosure}
-
       <h3 style="font-size:0.94rem; color:var(--text-primary); margin:10px 0 14px;">A few questions so we can tailor the course</h3>
       ${questionsHtml}
 
       <div class="creator-actions">
         <button class="creator-btn" onclick="creatorState.step=1;renderCreatorWizard();">&larr; Back</button>
-        <button class="creator-btn primary" id="creatorRefineBtn" onclick="creatorRefine()" disabled title="Choose how hands-on the course should feel">Submit Answers &rarr;</button>
+        <button class="creator-btn primary" id="creatorRefineBtn" onclick="creatorRefine()">Submit Answers &rarr;</button>
       </div>
-      <div id="creatorSubmitHelper" style="font-size:0.78rem; color:var(--text-muted); margin-top:6px; text-align:right;">Pick a depth above to continue.</div>
     </div>
   `;
-}
-
-// ---------- Compulsory depth picker ----------
-function pickCreatorDepth(btn) {
-  const container = btn.parentElement;
-  [...container.querySelectorAll('.depth-opt')].forEach(b => {
-    b.classList.remove('selected');
-    b.setAttribute('aria-checked', 'false');
-  });
-  btn.classList.add('selected');
-  btn.setAttribute('aria-checked', 'true');
-  // Stash selection + append-text on creatorState for creatorRefine to consume
-  creatorState.depth = btn.dataset.depth;
-  creatorState.depthAppend = btn.dataset.append || '';
-  // Unlock submit
-  const submitBtn = document.getElementById('creatorRefineBtn');
-  if (submitBtn) { submitBtn.disabled = false; submitBtn.title = ''; }
-  const helper = document.getElementById('creatorSubmitHelper');
-  if (helper) { helper.style.display = 'none'; }
 }
 
 async function creatorRefine(isRetry) {
@@ -8556,46 +9477,26 @@ async function creatorRefine(isRetry) {
     ],
   );
 
-  async function attempt(timeoutMs) {
-    const ctrl = new AbortController();
-    const to = setTimeout(() => ctrl.abort(), timeoutMs);
-    try {
-      const res = await fetch(`${API}/creator/refine`, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ session_id: creatorState.sessionId, answers }),
-        signal: ctrl.signal,
-      });
-      clearTimeout(to);
-      if (!res.ok) {
-        let detail = '';
-        try { detail = (await res.json()).detail || ''; } catch {}
-        throw new Error(`HTTP ${res.status}${detail ? ': '+detail : ''}`);
-      }
-      return await res.json();
-    } finally {
-      clearTimeout(to);
+  // 2026-04-22 v8: /creator/refine is now async (celery). Enqueue then poll.
+  async function enqueueRefine() {
+    const res = await fetch(`${API}/creator/refine`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ session_id: creatorState.sessionId, answers }),
+    });
+    if (!res.ok) {
+      let detail = '';
+      try { detail = (await res.json()).detail || ''; } catch {}
+      throw new Error(`HTTP ${res.status}${detail ? ': '+detail : ''}`);
     }
+    return await res.json();  // {session_id, task_id, status: "pending"}
   }
 
   try {
-    // Try with generous 180s timeout. If it fails, retry ONCE automatically with 210s.
-    let data;
-    try {
-      data = await attempt(180000);
-    } catch (firstErr) {
-      // Auto-retry once on transient failures (LLM timeouts, 502/503)
-      const msg = String(firstErr && firstErr.message || firstErr);
-      if (msg.includes('502') || msg.includes('503') || msg.includes('504')
-          || msg.toLowerCase().includes('timeout') || msg.toLowerCase().includes('abort')
-          || (firstErr && firstErr.name === 'AbortError')) {
-        btn.textContent = 'Retrying (1/1)...';
-        await new Promise(r => setTimeout(r, 1200));
-        data = await attempt(210000);
-      } else {
-        throw firstErr;
-      }
-    }
+    await enqueueRefine();
+    const data = await _pollCreatorTaskUntilDone(creatorState.sessionId, {
+      timeoutMs: 5 * 60 * 1000,  // 5 min — refine is faster than generate
+    });
 
     _stopRefinePhases();
     creatorState.refinedOutline = data.outline || { modules: [] };
@@ -8769,6 +9670,10 @@ async function creatorGenerate() {
 
   try {
     const creatorNotes = null;
+    // 2026-04-22 v8: /creator/generate enqueues a celery task and returns
+    // {session_id, task_id, status: "pending"} immediately. Poll /session/{sid}/status
+    // until status=done, then pull course_id from the status payload's top level
+    // (the status endpoint attaches the successful task's course_id there).
     const res = await fetch(`${API}/creator/generate`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
@@ -8778,23 +9683,43 @@ async function creatorGenerate() {
         creator_notes: creatorNotes,
       }),
     });
-    stopPolling = true;
     if (!res.ok) throw new Error(`Failed: ${res.status}`);
-    const data = await res.json();
+    // Enqueue confirmed — start polling for completion. The existing
+    // _renderCreatorProgress timer handles per-module/per-step live updates
+    // (reads /api/creator/progress/{sid}); this separate poll handles the
+    // task-level done / failed signal.
+    const courseId = await (async () => {
+      const timeoutMs = 20 * 60 * 1000;  // 20 min hard wall
+      const t0 = Date.now();
+      let lastState = null;
+      while (true) {
+        if (Date.now() - t0 > timeoutMs) throw new Error('Generate task timed out');
+        let r;
+        try { r = await fetch(`${API}/creator/session/${encodeURIComponent(creatorState.sessionId)}/status`); }
+        catch (_) { await new Promise(res => setTimeout(res, 3000)); continue; }
+        if (r.status === 404) { await new Promise(res => setTimeout(res, 3000)); continue; }
+        if (!r.ok) throw new Error(`status HTTP ${r.status}`);
+        const s = await r.json();
+        if (s.status !== lastState) lastState = s.status;
+        if (s.status === 'done') return s.course_id;
+        if (s.status === 'failed') throw new Error(s.error || 'generate task failed');
+        await new Promise(res => setTimeout(res, 3000));
+      }
+    })();
+    stopPolling = true;
 
-    creatorState.generatedCourseId = data.course_id;
-    creatorState.generatedCourse = data.course || null;
+    creatorState.generatedCourseId = courseId;
+    creatorState.generatedCourse = null;
     creatorState.step = 4;
     _clearCreatorDraft();  // 2026-04-21: course persisted, drop the in-progress draft
     renderCreatorWizard();
     // Product feature 2026-04-20: kick off the auto-review banner poller.
-    // Backend fired review_and_iterate() when /api/creator/generate returned;
-    // this just mounts the UI banner and polls /review_status for progress.
-    try { startReviewStatusPolling(data.course_id); } catch (_) {}
+    try { startReviewStatusPolling(courseId); } catch (_) {}
   } catch (e) {
     stopPolling = true;
+    const errMsg = String(e && e.message || e);
     body.innerHTML = `<div class="creator-loading" style="color:var(--error)">
-      <p>Failed to generate course. Please try again.</p>
+      <p>Failed to generate course: ${esc(errMsg)}</p>
       <button class="creator-btn primary" onclick="creatorState.step=3;renderCreatorWizard();">Go Back</button>
     </div>`;
   }

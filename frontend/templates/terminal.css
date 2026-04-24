@@ -1,0 +1,216 @@
+/* terminal_exercise template styles — dark-theme, paste-oriented UI */
+.tmpl-terminal {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.tmpl-terminal .tmpl-header .tmpl-briefing {
+  color: var(--text-primary, #e8ecf4);
+  font-size: 0.95rem;
+  line-height: 1.55;
+  margin: 0 0 8px 0;
+}
+
+/* BYO-key INFO panel — key NEVER touches the page. This panel is
+   purely informational: tells the learner where the key goes (their
+   own shell / Claude Code login) and promises we don't ask for it. */
+.tmpl-terminal .tmpl-byo-info {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  background: rgba(74, 124, 255, 0.06);
+  border: 1px solid rgba(74, 124, 255, 0.3);
+  border-radius: 8px;
+  padding: 10px 14px;
+  color: #cdd8ff;
+  font-size: 0.86rem;
+  line-height: 1.5;
+}
+.tmpl-terminal .tmpl-byo-info strong { color: #e8ecf4; }
+.tmpl-terminal .tmpl-byo-info code {
+  background: rgba(128, 140, 170, 0.2);
+  padding: 1px 5px;
+  border-radius: 3px;
+  font-size: 0.82rem;
+  color: #2dd4bf;
+}
+.tmpl-terminal .tmpl-byo-icon { font-size: 1.1rem; flex-shrink: 0; }
+
+/* Instructions — rendered as HTML; commands + steps */
+.tmpl-terminal .tmpl-instructions {
+  background: #161b26;
+  border: 1px solid #2a3352;
+  border-radius: 8px;
+  padding: 14px 18px;
+  color: #e8ecf4;
+  line-height: 1.6;
+}
+.tmpl-terminal .tmpl-instructions pre,
+.tmpl-terminal .tmpl-instructions code {
+  background: #0d1117;
+  color: #2dd4bf;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-family: monospace;
+  font-size: 0.9rem;
+}
+.tmpl-terminal .tmpl-instructions pre {
+  padding: 12px 14px;
+  overflow-x: auto;
+  white-space: pre;
+  margin: 10px 0;
+}
+.tmpl-terminal .tmpl-instructions h3 {
+  color: #cdd8ff;
+  font-size: 1.02rem;
+  margin: 14px 0 6px 0;
+}
+.tmpl-terminal .tmpl-instructions ol,
+.tmpl-terminal .tmpl-instructions ul {
+  margin: 8px 0 8px 22px;
+  padding: 0;
+}
+.tmpl-terminal .tmpl-instructions li {
+  margin: 4px 0;
+}
+
+/* Paste textarea */
+.tmpl-terminal .tmpl-paste-wrapper {
+  border: 1px solid #2a3352;
+  border-radius: 8px;
+  overflow: hidden;
+}
+.tmpl-terminal .tmpl-paste-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  background: #1e2538;
+  padding: 8px 14px;
+  font-size: 0.82rem;
+  color: #9097aa;
+  border-bottom: 1px solid #2a3352;
+}
+.tmpl-terminal .tmpl-paste-count {
+  font-family: monospace;
+}
+.tmpl-terminal .tmpl-paste {
+  display: block;
+  width: 100%;
+  min-height: 180px;
+  background: #0d1117;
+  color: #e8ecf4;
+  border: 0;
+  padding: 14px 16px;
+  font-family: monospace;
+  font-size: 0.88rem;
+  line-height: 1.55;
+  box-sizing: border-box;
+  resize: vertical;
+}
+.tmpl-terminal .tmpl-paste:focus {
+  outline: none;
+}
+
+/* Actions row — shared-looking with other templates */
+.tmpl-terminal .tmpl-actions {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+
+.tmpl-terminal .tmpl-feedback {
+  padding: 0;
+}
+
+/* v8.6.1 (2026-04-24) SWITCHING-UX additions */
+
+/* Bootstrap command block — copy-to-clipboard start command */
+.tmpl-terminal .tmpl-bootstrap {
+  background: #0c1118;
+  border: 1px solid #2a3352;
+  border-left: 3px solid #4a7cff;
+  border-radius: 8px;
+  padding: 12px 14px;
+  margin: 10px 0 14px 0;
+}
+.tmpl-terminal .tmpl-bootstrap-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 8px;
+}
+.tmpl-terminal .tmpl-bootstrap-label {
+  color: #e8ecf4;
+  font-weight: 600;
+  font-size: 0.88rem;
+}
+.tmpl-terminal .tmpl-bootstrap-code {
+  background: #050810;
+  color: #c9d1df;
+  border: 1px solid #1c2333;
+  border-radius: 6px;
+  padding: 10px 12px;
+  margin: 0;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.8rem;
+  line-height: 1.55;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 220px;
+  overflow-y: auto;
+}
+.tmpl-terminal .tmpl-bootstrap-foot {
+  margin-top: 6px;
+  color: #8892a8;
+  font-size: 0.75rem;
+}
+
+/* Compact button variant */
+.tmpl-terminal .tmpl-btn-compact {
+  padding: 4px 10px !important;
+  font-size: 0.78rem !important;
+}
+
+/* Dependencies panel */
+.tmpl-terminal .tmpl-deps {
+  background: #141a2a;
+  border: 1px solid #2a3352;
+  border-radius: 8px;
+  padding: 10px 14px;
+  margin: 0 0 14px 0;
+}
+.tmpl-terminal .tmpl-deps-header {
+  color: #e8ecf4;
+  font-weight: 600;
+  font-size: 0.84rem;
+  margin-bottom: 6px;
+}
+.tmpl-terminal .tmpl-deps-list {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.tmpl-terminal .tmpl-dep-item {
+  color: #c9d1df;
+  font-size: 0.82rem;
+  line-height: 1.7;
+}
+.tmpl-terminal .tmpl-dep-marker {
+  color: #4a7cff;
+  margin-right: 6px;
+}
+.tmpl-terminal .tmpl-dep-extra {
+  color: #8892a8;
+}
+
+/* Structured paste slots — stack vertically */
+.tmpl-terminal .tmpl-paste-block + .tmpl-paste-block {
+  margin-top: 12px;
+}
+.tmpl-terminal .tmpl-slot-hint {
+  color: #8892a8;
+  font-weight: 400;
+  font-size: 0.8rem;
+}

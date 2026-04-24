@@ -111,3 +111,23 @@
 .tmpl-project .tmpl-feedback.pass { background: #0e2620; color: #86efac; border-left: 3px solid #2dd4bf; display: block; }
 .tmpl-project .tmpl-feedback.fail { background: #2a1a22; color: #fca5a5; border-left: 3px solid #f87171; display: block; }
 .tmpl-project .tmpl-feedback.partial { background: #2a2718; color: #fbbf24; border-left: 3px solid #fbbf24; display: block; }
+
+/* v8.6.2 (2026-04-24) — zero-code paste widget for rubric-graded capstones. */
+.tmpl-project .tmpl-paste-widget {
+  margin-top: 16px; padding: 16px 18px; background: #141a24;
+  border: 1px solid #2a3352; border-left: 3px solid #4a7cff; border-radius: 8px;
+}
+.tmpl-project .tmpl-paste-prompt {
+  margin: 0 0 10px; color: #c9d1df; font-size: 0.88rem; line-height: 1.5;
+}
+.tmpl-project .tmpl-paste-textarea {
+  width: 100%; min-height: 320px;
+  background: #0e1218; color: #e8ecf4;
+  border: 1px solid #2a3352; border-radius: 6px; padding: 12px;
+  font-family: ui-monospace, 'SF Mono', Menlo, monospace; font-size: 0.88rem;
+  line-height: 1.55; resize: vertical; box-sizing: border-box;
+}
+.tmpl-project .tmpl-paste-textarea:focus { outline: 0; border-color: #4a7cff; }
+.tmpl-project .tmpl-paste-hint {
+  margin-top: 8px; color: #8892a8; font-size: 0.78rem;
+}

@@ -28,3 +28,9 @@ fake-PYREPL_TRACE-value
 
 # Transient logs from review pipeline
 reviews/*.log
+
+# Redis dump files (runtime artifact)
+dump.rdb
+
+# Celery control-exchange files (runtime artifact)
+control/

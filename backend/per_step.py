@@ -464,7 +464,7 @@ async def regenerate_single_step(
     normalize_code_review_bugs: Any = None,  # D.1 fix 2026-04-21
     critic_code_review: Any = None,  # B+C critic 2026-04-21
     critic_code_exercise: Any = None,  # B+C critic 2026-04-21
-    max_retries: int = 1,
+    max_retries: int = 6,
 ) -> dict[str, Any]:
     """Regenerate one step in place, with full prior-course context.
 
@@ -522,6 +522,29 @@ async def regenerate_single_step(
         "is_capstone_module": False,
         "prior_course_context": prior_ctx,  # NEW: shared context for dependencies
     }
+    # v8.6 (2026-04-24) — language detection + pin, mirror of the fix in
+    # _creator_generate_impl. Previously this path shipped NO language key,
+    # so per-step regens on TS courses re-generated in Python (same bug that
+    # nuked TS v12/v13). Import the detector lazily to avoid circular import
+    # (per_step.py is imported by main.py before _detect_course_language
+    # is defined at module top level).
+    try:
+        from backend.main import _detect_course_language
+        _desc_text = (getattr(course_row, "description", "") or "")
+        _lang = _detect_course_language(course_row.title or "", _desc_text)
+        if _lang:
+            course_context["language"] = _lang
+            logger.info(
+                "per-step regen: COURSE LANGUAGE detected + pinned: %r for course=%r",
+                _lang, (course_row.title or "")[:80],
+            )
+        else:
+            logger.warning(
+                "per-step regen: COURSE LANGUAGE not detected from title+desc — "
+                "GATE A will skip. Title=%r", (course_row.title or "")[:100],
+            )
+    except Exception as _lang_err:
+        logger.warning("per-step regen: language-detection failed (soft-pass): %s", _lang_err)
 
     all_mods_res = await db.execute(
         select(Module).where(Module.course_id == course_id).order_by(Module.position.desc())
@@ -560,6 +583,15 @@ async def regenerate_single_step(
     ex_type = step_row.exercise_type or "concept"
     llm_content: dict[str, Any] | None = None
     last_reason = ""
+    # v8.6 (2026-04-24) — classify the last failure so callers can tell
+    # WHY a regen exhausted retries. Pre-fix: all failures returned
+    # "completeness_failed_after_retries" regardless of true cause.
+    # Classes: "llm_error" (exception during LLM call), "llm_returned_non_dict"
+    # (bad JSON — should be near-zero post tool-use), "completeness_failed"
+    # (shape/filler/placeholder check rejected), "invariant_failed" (Docker
+    # solution/starter invariant rejected — the most actionable class, has
+    # full retry-feedback dump reference).
+    last_failure_class = ""
 
     for attempt in range(max_retries + 1):
         attempt_desc = effective_desc
@@ -568,6 +600,24 @@ async def regenerate_single_step(
                 f"\n\nRETRY NOTE: previous attempt failed completeness check ({last_reason}). "
                 f"Return a complete, non-placeholder response satisfying the schema for {ex_type}."
             )
+        # v8.6 (2026-04-24) MIRROR COURSE-GEN RETRY-ORDER — per user directive
+        # "see if 3-4-5 tries of Opus solves". Full-course retry loop in
+        # _creator_generate_impl uses: attempts 2-3 Sonnet, attempts 4-7 Opus,
+        # attempt 8 Opus on simplified. Per-step regen used to ALWAYS use
+        # Sonnet (via default model in _llm_generate_step_content). Now:
+        # first 3 attempts Sonnet, attempts 3-6 Opus at full difficulty.
+        # (Per-step max_retries defaults to 6 → 7 total attempts.)
+        _model_override = None
+        if ex_type == "code_exercise" and attempt >= 3:
+            try:
+                from backend.main import _OPUS_MODEL
+                _model_override = _OPUS_MODEL
+                logger.info(
+                    "per_step regen attempt %d: escalating to Opus (mirror of course-gen Opus×4 phase)",
+                    attempt,
+                )
+            except ImportError:
+                pass
         try:
             candidate = await asyncio.to_thread(
                 llm_generate_step_content,
@@ -576,14 +626,18 @@ async def regenerate_single_step(
                 step_row.title,
                 ex_type,
                 attempt_desc,
+                retry_hint="",
+                model_override=_model_override,
             )
         except Exception as e:
             logger.exception("per_step regen LLM call failed on attempt %d: %s", attempt, e)
             last_reason = f"llm_error:{e}"
+            last_failure_class = "llm_error"
             continue
 
         if not isinstance(candidate, dict):
-            last_reason = "llm_returned_non_dict"
+            last_reason = "llm_returned_non_dict (tool-use should prevent this class)"
+            last_failure_class = "llm_returned_non_dict"
             continue
 
         # D.1 (2026-04-21): for code_review, normalize bugs[].line via line_content
@@ -614,14 +668,57 @@ async def regenerate_single_step(
                 logger.warning("per_step code_exercise critic failed: %s", e)
 
         ok, reason = _minimal_completeness_check(candidate, ex_type)
-        if ok:
-            llm_content = candidate
-            break
-        last_reason = reason
-        logger.info("per_step regen attempt %d failed completeness: %s", attempt, reason)
+        if not ok:
+            last_reason = reason
+            last_failure_class = "completeness_failed"
+            logger.info("per_step regen attempt %d failed completeness: %s", attempt, reason)
+            continue
+
+        # v8.6 (2026-04-24) UNIFY WITH COURSE GEN — user directive post-v14:
+        # "don't duplicate code for step regen". Shared invariant-check
+        # helper `validate_code_exercise_invariant` in main.py encapsulates:
+        # Pydantic pre-gate → hidden_tests presence → Docker invariant → raw
+        # head+tail retry feedback assembly. Both this path AND the full
+        # course-gen path call it — one place to maintain.
+        if ex_type == "code_exercise":
+            try:
+                from backend.main import validate_code_exercise_invariant
+                inv_ok, inv_reason = await validate_code_exercise_invariant(
+                    candidate, course_context, step_row.title,
+                )
+                if not inv_ok:
+                    last_reason = inv_reason
+                    last_failure_class = "invariant_failed"
+                    logger.warning(
+                        "per_step regen attempt %d invariant FAIL (%d chars)",
+                        attempt, len(inv_reason),
+                    )
+                    continue
+            except ImportError:
+                # Helper not present — fall back to completeness-only
+                logger.warning("validate_code_exercise_invariant not importable; skipping invariant gate")
+
+        llm_content = candidate
+        break
 
     if llm_content is None:
-        return {"ok": False, "reason": f"completeness_failed_after_retries:{last_reason}"}
+        # v8.6 (2026-04-24) — return structured failure info so callers know
+        # WHY the regen exhausted (previously everything was labeled
+        # "completeness_failed_after_retries" regardless of root cause).
+        # Classification: llm_error | llm_returned_non_dict | completeness_failed
+        # | invariant_failed. Reason tail capped at 2000 chars (full version
+        # is on disk under /tmp/retry_feedback/).
+        _class = last_failure_class or "unknown"
+        _reason_short = (last_reason or "no_reason_captured")
+        if len(_reason_short) > 2000:
+            _reason_short = _reason_short[:1000] + "\n[... truncated; full in /tmp/retry_feedback/ ...]\n" + _reason_short[-900:]
+        return {
+            "ok": False,
+            "reason": f"{_class}_after_retries:{_reason_short}",
+            "failure_class": _class,
+            "last_reason_tail": _reason_short,
+            "attempts_used": max_retries + 1,
+        }
 
     content_html = llm_content.get("content")
     if content_html:

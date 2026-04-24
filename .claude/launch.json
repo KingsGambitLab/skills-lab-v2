@@ -6,6 +6,13 @@
       "runtimeExecutable": "/Users/tushar/Desktop/codebases/skills-lab-v2/scripts/run_uvicorn.sh",
       "runtimeArgs": [],
       "port": 8001
+    },
+    {
+      "name": "skills-lab-v2-attach",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "echo attach; sleep 86400"],
+      "port": 8001,
+      "url": "http://127.0.0.1:8001/"
     }
   ]
 }

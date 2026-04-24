@@ -66,6 +66,18 @@
   display: block; padding: 2px 6px; border-radius: 3px; cursor: pointer;
   border-left: 3px solid transparent;
 }
+/* 2026-04-22 v7 — empty/whitespace-only lines: shorter height, no pointer
+   cursor, muted line number. Stops the code from looking sparsely
+   double-spaced and prevents learners from flagging a blank line. */
+.tmpl-drag-drop .tmpl-code-pre .cr-line--empty {
+  padding: 0 6px;
+  cursor: default;
+  opacity: 0.35;
+  min-height: 0.6em;
+}
+.tmpl-drag-drop .tmpl-code-pre .cr-line--empty:hover {
+  background: transparent;
+}
 .tmpl-drag-drop .tmpl-code-pre .cr-line.flagged {
   background: rgba(251, 191, 36, 0.12); border-left-color: #fbbf24;
 }
@@ -74,4 +86,17 @@
 }
 .tmpl-drag-drop .tmpl-code-pre .cr-line.wrong-click {
   background: rgba(248, 113, 113, 0.15); border-left-color: #f87171;
+}
+/* 2026-04-22 v2 — amber outline for bugs the learner MISSED (revealed
+   after attempt 3 or on pass). Visually distinct from flagged (also amber
+   but deeper saturation + left border) and from correct/wrong clicks. */
+.tmpl-drag-drop .tmpl-code-pre .cr-line.missed-bug {
+  background: rgba(251, 191, 36, 0.08);
+  border-left: 3px dashed #fbbf24;
+  position: relative;
+}
+.tmpl-drag-drop .tmpl-code-pre .cr-line.missed-bug::after {
+  content: '← missed';
+  position: absolute; right: 8px;
+  color: #fbbf24; font-size: 0.78rem; font-style: italic;
 }

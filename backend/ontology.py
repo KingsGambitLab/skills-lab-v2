@@ -348,6 +348,27 @@ register_assignment(AssignmentType(
 ))
 
 register_assignment(AssignmentType(
+    id="terminal_exercise",
+    description=(
+        "Learner runs commands in their OWN terminal (BYO-key: their own "
+        "Anthropic key / local tools) and pastes the output back. Graded "
+        "on LLM-rubric of pasted output + optional must_contain substrings. "
+        "Used for courses where the skill lives on the learner's workstation "
+        "(e.g. Claude Code, kubectl, git workflows, local build tools). "
+        "Zero platform LLM cost to execute the exercise — we only pay for "
+        "the grading rubric call (~500 tokens)."
+    ),
+    grade_primitives=["llm_rubric", "must_contain"],
+    grade_weights={"llm_rubric": 0.8, "must_contain": 0.2},
+    required_demo_data=["instructions"],  # the command(s) learner should run
+    required_validation=["any_of:rubric,must_contain"],
+    runtime=None,  # runs on learner's machine, not ours
+    interaction_mode="byo_execution",
+    reality_score="real",
+    is_code_assignment=False,
+))
+
+register_assignment(AssignmentType(
     id="system_build",
     description="Learner ships a real deliverable (deploy / PR / cluster state). At least ONE real-attestation primitive required.",
     grade_primitives=["gha_workflow_check", "endpoint_check", "state_assertion", "artifact_flag"],
@@ -518,11 +539,19 @@ register_assignment(AssignmentType(
 
 register_assignment(AssignmentType(
     id="simulator_loop",
-    description="Generic tick-based simulation primitive.",
+    description="Generic tick-based simulation primitive. REQUIRES initial_state + actions + events + win_conditions in demo_data to be runnable by /api/simloop/*.",
     grade_primitives=["sim_win_condition"],
     grade_weights={"sim_win_condition": 1.0},
-    required_demo_data=["initial_state"],
-    required_validation=["win_conditions"],
+    # 2026-04-24 v8.6.2 — the simloop runtime expects ALL of these in demo_data:
+    #   initial_state (dict)        — what the dashboard shows on start
+    #   actions (list[{id,label,...,effect?,cost_ticks?}]) — what the learner can DO each tick
+    #   events (list[{id,t_offset_ms,...,effect?}])       — scheduled interruptions (manager pings / CEO email)
+    #   win_conditions (list[{expression,outcome}])        — how the sim ends successfully
+    # Without actions+events+win_conditions the sim is non-functional (400 from /api/simloop/start,
+    # no interrupts fire, and no terminal outcome) — the beginner reviewer's v1 "simulator
+    # broken" report traced to exactly this drop-fields-on-gen class.
+    required_demo_data=["initial_state", "actions", "events", "win_conditions"],
+    required_validation=[],
     runtime=None,
     interaction_mode="simulation",
     is_code_assignment=False,
@@ -1070,18 +1099,772 @@ def validate_step_against_ontology(
 # PUBLIC API SURFACE
 # ═══════════════════════════════════════════════════════════════════════════
 
+# ═══════════════════════════════════════════════════════════════════════════
+# LAYER 6 — TRACK PROGRESSION (2026-04-22 v8)
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# WHY: until now the Creator picked exercise types from a flat pool filtered
+# by a chain of overlapping heuristics (_is_non_engineering_subject,
+# _is_cli_tool_subject, _outline_critic_pass, ENG_CAPSTONES vs CASE_CAPSTONES).
+# Two systematic misses surfaced (2026-04-22):
+#   1. Claude Code course — Creator picked `code_exercise` capstone when
+#      `terminal_exercise` was the only right answer for a CLI-tool course.
+#   2. PM AI course — Creator picked `scenario_branch` everywhere including
+#      the M7 "Defend to VP Marketing" + M9 "Defend to hostile CFO" capstone
+#      where `adaptive_roleplay` was explicitly promised in the course copy.
+#
+# User proposal: for every TRACK, declare an ordered progression
+#     T1 ORIENT → T2 RECOGNIZE → T3 REASON → T4 PERFORM
+# where T4 = the "real skill under pressure" tier. The Creator MUST traverse
+# all four tiers, and the capstone MUST be from T4. No hardcoded module /
+# step counts — only tier + type COVERAGE is enforced; shape adapts to
+# content.
+#
+# This layer sits ALONGSIDE TECH_DOMAIN_REGISTRY (which is engineering-only)
+# — TrackProgression applies universally (PM, Legal, CLI, Engineering).
+#
+# HOLISTIC INVARIANT: a track's tier_progression lists N exercise types.
+# Every one of those N types must appear ≥1 time in the course, so learning
+# traverses the full declared progression — not just a safe subset.
+
+from typing import Optional
+
+
+PEDAGOGICAL_TIER_LABELS: dict[int, str] = {
+    1: "Orient — get started, no friction ('I understand what this is')",
+    2: "Recognize — surface understanding ('I can spot right vs wrong from a list')",
+    3: "Reason — apply under hypothesis ('I can pick the right move when options are given')",
+    4: "Perform — real-skill under pressure ('I can produce the move from scratch when nothing's given')",
+}
+
+
+@dataclass
+class TrackProgression:
+    """A pedagogical progression through tiered exercise types for a course track.
+
+    Semantically: a course in this track MUST include at least one step from
+    each declared tier, every declared exercise type must appear ≥1 time,
+    and the capstone (last step of last module) MUST be from a tier ≥
+    `capstone_required_tier` (default 4 — the "real skill" tier).
+
+    Registration is the ONLY edit a new track needs — the Creator prompt is
+    auto-assembled from this registry, and `_is_complete()` auto-enforces
+    the progression invariants.
+
+    Adding a new track (Sales AI, Legal AI, Security AI, etc.) = one
+    register_track(...) call, no prompt rewrite.
+    """
+    id: str
+    label: str
+    description: str
+    # Signal phrases that select this track from a course's title+description.
+    # Matched as lowercased substrings against the title+description blob.
+    # An explicit track_id on /api/creator/start always wins over signals.
+    match_signals: list[str]
+    # {tier_number: [assignment_type_id, ...]} — 1..4 inclusive. Every listed
+    # assignment_type_id MUST exist in ASSIGNMENT_REGISTRY. Same type MAY
+    # appear in multiple tiers if semantically appropriate in both contexts
+    # (rare — usually a type lives at one tier per track).
+    tier_progression: dict[int, list[str]]
+    # Capstone must be an assignment_type from a tier >= this value.
+    capstone_required_tier: int = 4
+    # If True: every assignment_type in tier_progression MUST appear ≥1 time
+    # in the course. Enforces "holistic coverage" — learner touches every
+    # pedagogical shape the track offers. Turn off for tiny primer courses.
+    require_all_declared_types: bool = True
+    # Minimum distinct types per tier that must appear in the course.
+    # Default 1 — relax only if a track has deliberately sparse tiers.
+    min_distinct_types_per_tier: int = 1
+
+
+TRACK_REGISTRY: dict[str, TrackProgression] = {}
+
+
+def register_track(t: TrackProgression) -> TrackProgression:
+    # Defensive: every type the track references must be a known AssignmentType.
+    all_types_in_progression = [tid for types in t.tier_progression.values() for tid in types]
+    for tid in all_types_in_progression:
+        if tid not in ASSIGNMENT_REGISTRY:
+            raise ValueError(
+                f"Track {t.id!r} references unknown assignment_type {tid!r}. "
+                f"Register the assignment_type first, or fix the track's "
+                f"tier_progression."
+            )
+    # Defensive: all four tiers (1..4) must be present.
+    for tier in (1, 2, 3, 4):
+        if tier not in t.tier_progression or not t.tier_progression[tier]:
+            raise ValueError(
+                f"Track {t.id!r} is missing tier {tier} in tier_progression. "
+                f"Every track must declare assignment types for all 4 tiers."
+            )
+    TRACK_REGISTRY[t.id] = t
+    return t
+
+
+def get_track(track_id: str) -> Optional[TrackProgression]:
+    return TRACK_REGISTRY.get(track_id)
+
+
+def _lowered_blob(*parts: str) -> str:
+    return " ".join(p for p in parts if p).lower()
+
+
+def detect_track(
+    title: str,
+    description: str = "",
+    *,
+    explicit_track_id: Optional[str] = None,
+) -> TrackProgression:
+    """Pick the right track for a course.
+
+    Policy:
+      1. If `explicit_track_id` is provided AND registered, use it. Wins over
+         signal detection (future: this is what the Creator wizard passes).
+      2. Else, score each registered track by count of its match_signals
+         that appear in title+description (lowercased substring match).
+         Highest-scoring track wins.
+      3. Ties broken by registration order (first wins).
+      4. If no track has any signal match, fall back to the 'general' track.
+    """
+    if explicit_track_id and explicit_track_id in TRACK_REGISTRY:
+        return TRACK_REGISTRY[explicit_track_id]
+    blob = _lowered_blob(title, description)
+    best: Optional[TrackProgression] = None
+    best_score = -1
+    for t in TRACK_REGISTRY.values():
+        score = sum(1 for sig in t.match_signals if sig.lower() in blob)
+        if score > best_score:
+            best, best_score = t, score
+    if best is None or best_score <= 0:
+        # Fallback to general. Guaranteed to exist (registered below).
+        return TRACK_REGISTRY["general"]
+    return best
+
+
+def tier_of_type_in_track(assignment_type_id: str, track: TrackProgression) -> Optional[int]:
+    """Return the tier number where this assignment_type lives in the track,
+    or None if the track doesn't include it."""
+    for tier, type_ids in track.tier_progression.items():
+        if assignment_type_id in type_ids:
+            return tier
+    return None
+
+
+def validate_outline_against_track(
+    outline: dict,
+    track: TrackProgression,
+) -> tuple[bool, list[str]]:
+    """Check that the outline traverses the track's pedagogical progression.
+
+    Outline shape: {"modules": [{"title": ..., "steps": [{"exercise_type": ...}, ...]}, ...]}
+    Returns (ok, violations). Violations are human-readable strings the
+    Creator prompt can consume to regenerate the offending step(s).
+
+    Checks (in order):
+      (a) Every declared tier (1..4) has ≥1 step whose type belongs to that tier.
+      (b) If `require_all_declared_types`: every declared type appears ≥1 time.
+      (c) Capstone (last step of last module) has type in tier >=
+          capstone_required_tier.
+      (d) Every step's exercise_type is in the track's progression (no
+          off-track types — this catches e.g. a PM course emitting
+          `code_exercise`).
+    """
+    violations: list[str] = []
+    modules = outline.get("modules") or []
+    if not modules:
+        return False, ["outline has no modules"]
+
+    # Flat list of (module_index, step_index, type_id)
+    all_steps: list[tuple[int, int, str]] = []
+    for mi, m in enumerate(modules):
+        for si, s in enumerate(m.get("steps") or []):
+            t = s.get("exercise_type") or s.get("type") or ""
+            all_steps.append((mi, si, t))
+
+    if not all_steps:
+        return False, ["outline has no steps"]
+
+    all_declared_types = {tid for types in track.tier_progression.values() for tid in types}
+    type_to_tier = {tid: tier for tier, types in track.tier_progression.items() for tid in types}
+
+    # (d) off-track types
+    off_track = [(mi, si, t) for mi, si, t in all_steps if t not in all_declared_types]
+    for mi, si, t in off_track:
+        violations.append(
+            f"Module {mi + 1}, Step {si + 1}: exercise_type {t!r} is not in "
+            f"track {track.id!r}'s progression. Valid types: {sorted(all_declared_types)}."
+        )
+
+    # (a) tier coverage
+    tiers_present = set()
+    for _, _, t in all_steps:
+        tier = type_to_tier.get(t)
+        if tier is not None:
+            tiers_present.add(tier)
+    for required_tier in (1, 2, 3, 4):
+        if required_tier not in tiers_present:
+            types_for_tier = track.tier_progression.get(required_tier, [])
+            violations.append(
+                f"Tier {required_tier} ({PEDAGOGICAL_TIER_LABELS.get(required_tier, '')}) "
+                f"has 0 steps. Need ≥1 step with type in {types_for_tier}."
+            )
+
+    # (b) holistic: every declared type appears
+    if track.require_all_declared_types:
+        types_present = {t for _, _, t in all_steps if t in all_declared_types}
+        missing_types = sorted(all_declared_types - types_present)
+        for t in missing_types:
+            tier = type_to_tier.get(t)
+            violations.append(
+                f"Declared type {t!r} (tier {tier}) is not used in the course. "
+                f"Track {track.id!r} requires every declared type ≥1 time."
+            )
+
+    # (c) capstone tier
+    last_mi, last_si, last_type = all_steps[-1]
+    capstone_tier = type_to_tier.get(last_type)
+    if capstone_tier is None:
+        violations.append(
+            f"Capstone (Module {last_mi + 1}, Step {last_si + 1}) type {last_type!r} "
+            f"is not in track {track.id!r}'s progression."
+        )
+    elif capstone_tier < track.capstone_required_tier:
+        t4_types = track.tier_progression.get(track.capstone_required_tier, [])
+        violations.append(
+            f"Capstone (Module {last_mi + 1}, Step {last_si + 1}) has type "
+            f"{last_type!r} at tier {capstone_tier}, but track {track.id!r} "
+            f"requires capstone tier >= {track.capstone_required_tier}. Pick from: {t4_types}."
+        )
+
+    return len(violations) == 0, violations
+
+
+def build_track_progression_brief(track: TrackProgression) -> str:
+    """Render the track's progression as a Creator-prompt section.
+
+    This replaces the ad-hoc `subject_guidance` + `CODE-WRITING BACKBONE`
+    + `ENG_CAPSTONES`-mention prose with a declarative tier-by-tier list.
+    """
+    lines = [
+        f"=== TRACK: {track.label} ({track.id}) ===",
+        track.description,
+        "",
+        "PEDAGOGICAL PROGRESSION (you MUST traverse all 4 tiers):",
+    ]
+    for tier in (1, 2, 3, 4):
+        label = PEDAGOGICAL_TIER_LABELS.get(tier, f"Tier {tier}")
+        types = track.tier_progression.get(tier, [])
+        lines.append(f"  T{tier} — {label}")
+        for tid in types:
+            a = ASSIGNMENT_REGISTRY.get(tid)
+            desc = a.description if a else "(unknown)"
+            # Keep the one-liner short so the prompt doesn't balloon.
+            one_liner = desc.split(".")[0][:120]
+            lines.append(f"    - {tid}: {one_liner}")
+    lines.append("")
+    lines.append("HARD RULES for this course (enforced by _is_complete gate):")
+    lines.append(f"  1. Include at least ONE step from EACH tier (T1..T4). No skipping tiers.")
+    if track.require_all_declared_types:
+        lines.append("  2. EVERY listed assignment_type above must appear at least ONCE in the course. Learning is holistic — learners must touch every shape the track offers.")
+    lines.append(f"  3. CAPSTONE (last step of last module) MUST be a T{track.capstone_required_tier} type — the real-skill tier. No exceptions.")
+    lines.append("  4. Do NOT use any exercise_type not listed above. Off-track types will be rejected.")
+    lines.append("  5. Module and step COUNTS are flexible — pick whatever shape the content needs, as long as the coverage rules above are satisfied. Do not pad with filler to hit a number.")
+    return "\n".join(lines)
+
+
+# ---------------------------------------------------------------------------
+# Track PROPOSER — when detect_track can't find a match, the Creator LLM
+# proposes a new track on-the-fly using the existing registered tracks as
+# few-shot examples (2026-04-22 user directive: "For the ones where we
+# don't have this info, build it on the fly using the same data as
+# examples to the agent").
+# ---------------------------------------------------------------------------
+
+
+def _render_tracks_as_few_shot_examples(max_examples: int = 5) -> str:
+    """Render registered tracks as few-shot examples for the proposer prompt.
+
+    Skips the 'general' fallback (not a useful example) and the track the
+    caller is excluding (if any).
+    """
+    lines: list[str] = []
+    examples_shown = 0
+    for tid, track in TRACK_REGISTRY.items():
+        if tid == "general":
+            continue
+        if examples_shown >= max_examples:
+            break
+        examples_shown += 1
+        lines.append(f"Track id: {tid}")
+        lines.append(f"  label: {track.label}")
+        lines.append(f"  description: {track.description}")
+        lines.append(f"  match_signals: {track.match_signals[:6]}")
+        for tier in (1, 2, 3, 4):
+            types = track.tier_progression.get(tier, [])
+            lines.append(f"  T{tier}: {types}")
+        lines.append(f"  require_all_declared_types: {track.require_all_declared_types}")
+        lines.append(f"  capstone_required_tier: {track.capstone_required_tier}")
+        lines.append("")
+    return "\n".join(lines).strip()
+
+
+def build_track_proposer_prompt(title: str, description: str = "") -> tuple[str, str]:
+    """Build (system_prompt, user_prompt) for the track proposer LLM call.
+
+    The prompt uses existing tracks as few-shot examples + lists every
+    known assignment_type so the LLM can only emit valid ids.
+    """
+    known_assignment_ids = sorted(
+        [aid for aid, a in ASSIGNMENT_REGISTRY.items() if aid != "concept"]
+    )
+    # Always include concept + mcq as T1 options — the LLM shouldn't omit them.
+    system_prompt = (
+        "You are designing a pedagogical track for a new course on the Skills "
+        "Lab v2 platform. A track is a reusable category declaring which "
+        "exercise types live at each pedagogical tier (T1 Orient → T2 "
+        "Recognize → T3 Reason → T4 Perform), plus detection keywords. "
+        "Every course in the track MUST traverse all 4 tiers, and the "
+        "CAPSTONE must be a T4 type — the 'real skill under pressure' tier. "
+        "Return ONLY valid JSON matching the schema the user message requests. "
+        "Use only assignment_type ids from the provided list."
+    )
+    user_prompt = f"""Propose a pedagogical track for this new course:
+
+TITLE: {title}
+
+DESCRIPTION:
+{description or '(none provided)'}
+
+TIER MEANINGS:
+- T1 Orient: get started with no friction ('I understand what this is'). Default: [concept, mcq].
+- T2 Recognize: surface understanding ('I can spot right vs wrong from a list'). Default: [categorization, ordering].
+- T3 Reason: apply under hypothesis ('I can pick the right move when options are given').
+- T4 Perform: real skill under pressure ('I can produce the move from scratch when nothing's given'). Capstone comes from here.
+
+AVAILABLE ASSIGNMENT TYPES (use only these ids):
+{known_assignment_ids}
+
+CRITICAL: T4 MUST contain at least one of these "real-skill-under-pressure" types:
+- adaptive_roleplay (text live chat with hidden-state counterparty)
+- voice_mock_interview (live voice interview, browser mic)
+- terminal_exercise (learner runs commands on their own machine, BYO-key)
+- code_exercise (writes code against hidden tests, starter-fails invariant)
+- system_build (ships a real deliverable — deploy / PR / cluster state)
+- incident_console (scripted production-outage drill)
+- simulator_loop (evolving state-machine simulator)
+
+EXISTING TRACKS (few-shot examples — do not duplicate these; use them as style guides):
+
+{_render_tracks_as_few_shot_examples(max_examples=5)}
+
+Now propose a new track for the course above. Think about:
+  1. What IS the real skill the course teaches?
+  2. Where does that skill live (learner's terminal? a live conversation? code on disk? cluster state?)
+  3. Which T4 type(s) actually deliver that real skill under pressure?
+  4. What 5-10 lowercase SUBSTRINGS in future course titles would identify this track?
+
+Return ONLY this JSON object:
+{{
+  "id": "<snake_case_id_not_matching_any_existing_track>",
+  "label": "<short human-friendly title>",
+  "description": "<2-3 sentences: who the track is for + what the real skill is + why T4 is what it is>",
+  "match_signals": ["<lowercase substring 1>", "<lowercase substring 2>", ...],
+  "tier_progression": {{
+    "1": ["concept", "mcq"],
+    "2": ["categorization", "ordering"],
+    "3": ["<pick 2-3 from assignment list>"],
+    "4": ["<pick 1-3 real-skill types>"]
+  }},
+  "capstone_required_tier": 4,
+  "require_all_declared_types": true
+}}
+"""
+    return system_prompt, user_prompt
+
+
+def _validate_llm_track_proposal(
+    payload: dict,
+) -> tuple[bool, list[str]]:
+    """Check an LLM-proposed track for structural + semantic validity.
+    Returns (ok, errs). Used to decide whether to accept the proposal or
+    fall back to the general track.
+    """
+    import re as _re
+    errs: list[str] = []
+    # Required fields
+    for k in ("id", "label", "description", "match_signals", "tier_progression"):
+        if k not in payload:
+            errs.append(f"missing required field {k!r}")
+    if errs:
+        return False, errs
+    # id format
+    tid = payload["id"]
+    if not isinstance(tid, str) or not _re.match(r"^[a-z][a-z0-9_]{2,48}$", tid):
+        errs.append(f"id {tid!r} must be snake_case, 3-49 chars")
+    if tid in TRACK_REGISTRY:
+        errs.append(f"id {tid!r} collides with existing track (registry has: {list(TRACK_REGISTRY.keys())})")
+    # match_signals shape
+    if not isinstance(payload["match_signals"], list) or not payload["match_signals"]:
+        errs.append("match_signals must be a non-empty list")
+    # tier_progression shape
+    tp = payload["tier_progression"]
+    if not isinstance(tp, dict):
+        errs.append("tier_progression must be a dict")
+        return False, errs
+    # Accept both string and int keys from JSON
+    def _tier_list(tier: int) -> list[str]:
+        v = tp.get(str(tier), tp.get(tier, []))
+        return v if isinstance(v, list) else []
+    real_skill_types = {
+        "adaptive_roleplay", "voice_mock_interview", "terminal_exercise",
+        "code_exercise", "system_build", "incident_console", "simulator_loop",
+    }
+    for tier in (1, 2, 3, 4):
+        types = _tier_list(tier)
+        if not types:
+            errs.append(f"tier {tier} is empty")
+            continue
+        for t in types:
+            if not isinstance(t, str) or t not in ASSIGNMENT_REGISTRY:
+                errs.append(f"tier {tier} references unknown assignment_type {t!r}")
+    # T4 must contain a real-skill type
+    t4 = _tier_list(4)
+    if not any(t in real_skill_types for t in t4):
+        errs.append(
+            f"T4 must include at least one real-skill-under-pressure type "
+            f"(one of: {sorted(real_skill_types)}). Got: {t4}"
+        )
+    return (len(errs) == 0), errs
+
+
+def track_from_proposal(payload: dict) -> TrackProgression:
+    """Convert a validated LLM payload into a TrackProgression instance.
+
+    Caller MUST have already run _validate_llm_track_proposal and checked ok.
+    Does NOT register the track — caller decides (session-only vs. persist).
+    """
+    def _tier_list(tier: int) -> list[str]:
+        v = payload["tier_progression"].get(str(tier), payload["tier_progression"].get(tier, []))
+        return list(v) if isinstance(v, list) else []
+    return TrackProgression(
+        id=payload["id"],
+        label=payload["label"],
+        description=payload["description"],
+        match_signals=[s.lower() for s in payload.get("match_signals", []) if isinstance(s, str)],
+        tier_progression={
+            1: _tier_list(1), 2: _tier_list(2),
+            3: _tier_list(3), 4: _tier_list(4),
+        },
+        capstone_required_tier=int(payload.get("capstone_required_tier", 4)),
+        require_all_declared_types=bool(payload.get("require_all_declared_types", True)),
+        min_distinct_types_per_tier=int(payload.get("min_distinct_types_per_tier", 1)),
+    )
+
+
+def propose_track_via_llm(
+    title: str,
+    description: str,
+    llm_call: "Callable[[str, str], dict | None]",
+) -> Optional[TrackProgression]:
+    """Propose a new track using an injected LLM callable.
+
+    `llm_call(system_prompt, user_prompt)` must return parsed JSON (dict) or
+    None on LLM failure. Kept as an injected dependency so ontology.py has
+    no direct dependency on any LLM client — callers wire in their own
+    (`_llm_json_call` in main.py, a mock in tests).
+
+    Returns a validated TrackProgression, or None if the LLM failed or the
+    proposal didn't validate. Does NOT register the track — caller decides.
+    """
+    system_prompt, user_prompt = build_track_proposer_prompt(title, description)
+    try:
+        payload = llm_call(system_prompt, user_prompt)
+    except Exception:
+        return None
+    if not isinstance(payload, dict):
+        return None
+    ok, _errs = _validate_llm_track_proposal(payload)
+    if not ok:
+        return None
+    try:
+        return track_from_proposal(payload)
+    except Exception:
+        return None
+
+
+def detect_or_propose_track(
+    title: str,
+    description: str = "",
+    *,
+    explicit_track_id: Optional[str] = None,
+    llm_call: "Callable[[str, str], dict | None] | None" = None,
+    allow_propose: bool = True,
+    min_signal_score_for_accept: int = 1,
+) -> tuple[TrackProgression, str]:
+    """One-stop track resolution.
+
+    Policy:
+      1. If `explicit_track_id` given AND registered → use it (source="explicit")
+      2. Else detect_track → if the match is better than general fallback, use it (source="signal")
+      3. Else if `allow_propose` AND `llm_call` provided → propose via LLM
+         (source="proposed"). If proposal validates, return it; otherwise
+         fall through to (4).
+      4. Use the `general` fallback track (source="fallback").
+
+    Returns (track, source) where source ∈ {"explicit", "signal", "proposed", "fallback"}
+    so callers can log/telemetry.
+
+    Note: this function does NOT register a proposed track. Caller may
+    choose to register it (e.g. after a course ships successfully).
+    """
+    if explicit_track_id and explicit_track_id in TRACK_REGISTRY:
+        return TRACK_REGISTRY[explicit_track_id], "explicit"
+
+    # Score-based detection — replicates detect_track()'s logic to know if
+    # we hit a real match vs fell to general.
+    blob = _lowered_blob(title, description)
+    best_track: Optional[TrackProgression] = None
+    best_score = -1
+    for t in TRACK_REGISTRY.values():
+        if t.id == "general":
+            continue
+        score = sum(1 for sig in t.match_signals if sig.lower() in blob)
+        if score > best_score:
+            best_track, best_score = t, score
+    if best_track is not None and best_score >= min_signal_score_for_accept:
+        return best_track, "signal"
+
+    if allow_propose and llm_call is not None:
+        proposed = propose_track_via_llm(title, description, llm_call)
+        if proposed is not None:
+            return proposed, "proposed"
+
+    return TRACK_REGISTRY["general"], "fallback"
+
+
+# ---------------------------------------------------------------------------
+# Seed tracks — the minimum set to cover current v8 course directions.
+# Each track = one register_track(...) call. Add new tracks by appending.
+# ---------------------------------------------------------------------------
+
+register_track(TrackProgression(
+    id="pm_strategy",
+    label="Product Management + Strategy",
+    description=(
+        "AI-enablement or craft courses for Product Managers and adjacent "
+        "strategy roles (PMM, BizOps, Chief of Staff). Primary skill = "
+        "rigorous decision-making under pressure with real stakeholders. "
+        "Capstone = generate-under-pressure defense in a live chat, not a "
+        "multiple-choice decision tree."
+    ),
+    match_signals=[
+        "product manager", "product management", "for pms", " pm ", "pm:",
+        "chief of staff", "product strategy", "strategy for product",
+        "pmm", "product marketing", "bizops", "business operations",
+        "stakeholder management", "roadmap", "prioritization",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["scenario_branch", "sjt"],
+        4: ["adaptive_roleplay", "voice_mock_interview"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="cli_tool_agent",
+    label="CLI Tool / Agent Teaching",
+    description=(
+        "Courses teaching mastery of a command-line or agent tool the "
+        "learner runs on their OWN machine (Claude Code, kubectl, gh CLI, "
+        "terraform, docker CLI, aws CLI). Real skill lives in the learner's "
+        "terminal, not in our sandbox. Capstone = terminal_exercise "
+        "(BYO-execution, LLM-rubric on pasted output) or system_build "
+        "(ship a real artifact like an MCP server)."
+    ),
+    match_signals=[
+        "claude code", "claude cli", "kubectl", "docker cli", "docker command",
+        "git workflow", "gh cli", "github cli", "aws cli", "gcloud cli",
+        "az cli", "terraform cli", "helm cli", "shell scripting workflow",
+        "command line productivity",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["code_review", "fill_in_blank"],
+        4: ["terminal_exercise", "system_build"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="engineering_mastery",
+    label="Language / Algorithm Mastery",
+    description=(
+        "Hands-on coding courses where the real skill is writing production-"
+        "quality code in a specific language (Go, TypeScript, Rust, Java) "
+        "or against a specific algorithmic challenge. Capstone = "
+        "code_exercise with hidden tests + starter-fails invariant, or "
+        "system_build (ship a deployable artifact)."
+    ),
+    # 2026-04-23 v8.1: signal list broadened. Original list had "java programming"
+    # but course titles like "Modern Java:" / "Java for Backend" didn't contain
+    # that literal phrase → fell to `general` track. New list uses space-padded
+    # language tokens (" java " / "java:" / "java for") so common title patterns
+    # match without false-positiving on "go to market" / "java script". For
+    # titles that still miss, detect_or_propose_track's LLM fallback catches it.
+    match_signals=[
+        # Go
+        "go basics", "go programming", " go:", " go for ", "golang",
+        # TypeScript
+        "typescript", " ts ", " ts:",
+        # Rust
+        "rust programming", " rust ", "rust:", "systems programming",
+        # Java
+        "java programming", " java ", "java:", "java for", "modern java",
+        # Python
+        "python essentials", " python ", "python:", "python for",
+        # Kotlin
+        " kotlin ", "kotlin:", "kotlin for",
+        # Swift
+        " swift ", "swift:", "swift programming",
+        # C++ / C#
+        " c++ ", "c++:", " c# ", "c#:",
+        # Ruby
+        " ruby ", "ruby:", "ruby programming",
+        # Scala
+        " scala ", "scala:",
+        # Algorithm-style
+        "data structures", "algorithms", "ds&a", "leetcode",
+        "competitive programming",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["code_review", "parsons", "fill_in_blank"],
+        4: ["code_exercise", "system_build"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="framework_build",
+    label="Framework Build (FastAPI / React / Spring Boot)",
+    description=(
+        "Courses teaching a specific framework where the real skill = ship "
+        "a running service / app. Builds on engineering_mastery with "
+        "deployment + integration. Capstone = system_build (deploy to "
+        "Vercel / Railway / AWS) or a ladder of code_exercise steps that "
+        "build to a working service."
+    ),
+    match_signals=[
+        "fastapi", "flask", "django", "react", "nextjs", "next.js", "vue",
+        "spring boot", "express", "rails", "nestjs",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["code_review", "code_exercise"],
+        4: ["system_build"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="soft_skills",
+    label="Soft Skills / Leadership / Communication",
+    description=(
+        "Non-engineering courses on communication, negotiation, leadership, "
+        "hiring, difficult conversations. Real skill = navigate a hostile "
+        "or high-stakes interaction live. Capstone = adaptive_roleplay or "
+        "voice_mock_interview where the counterparty adapts to learner "
+        "moves."
+    ),
+    match_signals=[
+        "negotiation", "difficult conversation", "leadership", "hiring",
+        "interview", "communication skills", "executive presence", "feedback",
+        "managing up", "managing down", "crisis communication", "sales coaching",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["scenario_branch", "sjt"],
+        4: ["adaptive_roleplay", "voice_mock_interview"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="ops_sre_security",
+    label="Ops / SRE / Security",
+    description=(
+        "Incident-response, production-ops, and security courses where the "
+        "real skill = triage under pressure with an evolving system state. "
+        "Capstone = incident_console (scripted drill) or simulator_loop "
+        "(evolving state machine)."
+    ),
+    match_signals=[
+        "sre", "site reliability", "incident response", "oncall", "on-call",
+        "production ops", "security operations", "soc", "threat hunt",
+        "kubernetes", "k8s ops", "observability",
+    ],
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["scenario_branch", "code_review"],
+        4: ["incident_console", "simulator_loop", "system_build"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=True,
+))
+
+register_track(TrackProgression(
+    id="general",
+    label="General (fallback)",
+    description=(
+        "Fallback track for courses that don't match any specialized track. "
+        "Broad exercise mix; capstone = a meaty scenario_branch or "
+        "adaptive_roleplay. Prefer to register a specific track if this "
+        "course is part of a growing domain."
+    ),
+    match_signals=[],  # never matched by signal; only fallback
+    tier_progression={
+        1: ["concept", "mcq"],
+        2: ["categorization", "ordering"],
+        3: ["scenario_branch", "sjt"],
+        4: ["adaptive_roleplay", "system_build"],
+    },
+    capstone_required_tier=4,
+    require_all_declared_types=False,  # general track is permissive
+))
+
+
 __all__ = [
     # Dataclasses
     "SlideType", "AssignmentType", "CourseMode", "TechDomain", "Runtime",
+    "TrackProgression",
     # Registries (mutable — extensions can add entries)
     "SLIDE_REGISTRY", "ASSIGNMENT_REGISTRY", "COURSE_MODE_REGISTRY",
-    "TECH_DOMAIN_REGISTRY", "RUNTIME_REGISTRY",
+    "TECH_DOMAIN_REGISTRY", "RUNTIME_REGISTRY", "TRACK_REGISTRY",
     # Registration helpers
     "register_slide", "register_assignment", "register_course_mode",
     "register_tech_domain", "register_runtime", "bind_runtime_handler",
+    "register_track",
     # Prompt assembly
     "build_creator_ontology_brief", "describe_assignment_for_prompt",
-    "describe_domain_for_prompt",
+    "describe_domain_for_prompt", "build_track_progression_brief",
     # Gate helpers
     "validate_step_against_ontology", "is_code_language", "CODE_LANGUAGES",
+    "detect_track", "get_track", "validate_outline_against_track",
+    "tier_of_type_in_track", "PEDAGOGICAL_TIER_LABELS",
+    # LLM-on-the-fly track proposer
+    "propose_track_via_llm", "detect_or_propose_track",
+    "build_track_proposer_prompt", "_validate_llm_track_proposal",
+    "track_from_proposal",
 ]

@@ -5,6 +5,7 @@ Serves the course catalog, sandboxed code execution, exercise validation,
 progress tracking, and the Clicky AI assistant endpoint.
 """
 
+import asyncio
 import json
 import logging
 import os
@@ -64,6 +65,12 @@ _MODEL_PRICES = {
 # stays on Sonnet for cost. Override via env var if needed.
 _OUTLINE_MODEL = os.getenv("CREATOR_OUTLINE_MODEL", "claude-opus-4-7")
 _STEP_CONTENT_MODEL = os.getenv("CREATOR_STEP_MODEL", "claude-sonnet-4-20250514")
+# Opus for the LAST retry of code_exercise only (v8.3 escalation per user
+# directive: "try Opus for one retry as well"). Sonnet handles 5 tries;
+# Opus gets one final shot with all prior failure context in the prompt.
+# ~5× the cost per call but fires on <5% of steps, so net cost impact is
+# small and it unblocks hard exercises that Sonnet genuinely can't crack.
+_OPUS_MODEL = os.getenv("CREATOR_LAST_RETRY_MODEL", "claude-opus-4-7")
 
 
 def _read_budget() -> dict:
@@ -114,13 +121,36 @@ def _llm_enabled() -> bool:
     return _ANTHROPIC_AVAILABLE and not _budget_exhausted()
 
 
-# Initialize Anthropic client (for Clicky + Course Creator) if key is set
+# Initialize Anthropic client (for Clicky + Course Creator) if key is set.
+#
+# v8.6 (2026-04-24) — LAYER 0 RESILIENCE FIX per buddy-Opus post-TS-v11:
+# Anthropic SDK default timeout is 600s (10min). That was the silent root
+# cause of TS v11 S9's 17-min `ThreadPoolExecutor.__exit__` hang: one fan-out
+# branch made an LLM call that never returned a full response, and the SDK
+# patiently waited 10min before raising. Compound that with `with
+# ThreadPoolExecutor:` blocking on `shutdown(wait=True)`, and one slow LLM
+# call stalled the entire outer-attempt → wall-time cap fired before
+# `simplify=True` trigger could arm → 8 good steps rolled back with S9.
+#
+# Fix: explicit httpx.Timeout(connect=10, read=180, write=10, pool=10).
+# read=180s is the load-bearing value — caps how long a streaming response
+# body can sit silent. A genuinely slow LLM call (complex output, high-load
+# Anthropic cluster) will typically return in 30-90s; 180s covers the 99th
+# percentile with margin. Past 180s, we fail fast and let the retry loop
+# re-dispatch with differential-retry feedback.
+#
+# Kept the SDK's default max_retries=2 for automatic 5xx/429 backoff — this
+# is SEPARATE from our own Creator retry loop (the SDK retries transport
+# failures; we retry semantic failures like "invariant rejected the code").
 _ANTHROPIC_CLIENT = None
 _ANTHROPIC_AVAILABLE = False
 try:
     if os.getenv("ANTHROPIC_API_KEY") and not _FORCE_MOCK:
         from anthropic import Anthropic
-        _ANTHROPIC_CLIENT = Anthropic()
+        import httpx as _httpx
+        _ANTHROPIC_CLIENT = Anthropic(
+            timeout=_httpx.Timeout(connect=10.0, read=180.0, write=10.0, pool=10.0),
+        )
         _ANTHROPIC_AVAILABLE = True
 except Exception as _e:
     logging.warning("Anthropic SDK init failed: %s", _e)
@@ -228,6 +258,15 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# v8 AUTH (2026-04-23): wire session middleware + auth router. Middleware
+# attaches request.state.user / request.state.session on every request based
+# on the sll_session cookie. Auth router exposes /api/auth/{register,login,
+# logout,me,enroll/{id},my-courses,courses/{id}/publish,...}. Safe to include
+# even if no User rows exist — register is the bootstrap path.
+from backend import auth as _auth
+app.middleware("http")(_auth.session_middleware)
+app.include_router(_auth.router)
 
 FRONTEND_DIR = Path(__file__).resolve().parent.parent / "frontend"
 
@@ -398,6 +437,124 @@ async def get_course(course_id: str, db: AsyncSession = Depends(get_db)):
     return course_data
 
 
+# ── Content-layer safeguards (2026-04-22) ──────────────────────────
+# Per user directive: "for content issues, avoid running in circles editing
+# Creator prompts. Everything we can control ourselves via templates, we
+# should." These two helpers move content-quality fixes OUT of the Creator
+# prompt loop and INTO the serve-time sanitizer. Trade-off: Creator may
+# still emit the debris, but the learner never sees it.
+
+import re as _re_content_guard
+
+# Phrases that look like authorial self-correction left in docstrings /
+# comments / prose. Stripped whenever they appear. Not case-sensitive.
+_AUTHOR_DEBRIS_PATTERNS = [
+    # "but wait, that's wrong" / "wait, that's wrong" — M5.S4 Union-Find docstring
+    r"(?i)(?:^|[\s,;#/])-?\s*(?:but\s+)?wait[, ]\s*that'?s?\s+wrong[^\n]*",
+    # "Actually:", "Actually," at start of a docstring segment
+    r"(?i)(?:^|[\s,;#/])-?\s*actually[:,]\s*",
+    # "on second thought"
+    r"(?i)(?:^|[\s,;#/])-?\s*on\s+second\s+thought[^\n]*",
+    # "let me reconsider" / "hmm, let me"
+    r"(?i)(?:^|[\s,;#/])-?\s*(?:hmm[, ]\s*)?let\s+me\s+reconsider[^\n]*",
+    # "scratch that"
+    r"(?i)(?:^|[\s,;#/])-?\s*scratch\s+that[^\n]*",
+    # "I mean" / "I meant" at start of line
+    r"(?i)(?:^|[\s,;#/])-?\s*I\s+(?:mean|meant)[,:]\s*",
+]
+
+def _strip_author_debris(text: str) -> str:
+    """Remove authorial self-correction phrases from a code/content string."""
+    if not text or not isinstance(text, str):
+        return text
+    out = text
+    for pat in _AUTHOR_DEBRIS_PATTERNS:
+        out = _re_content_guard.sub(pat, "", out)
+    # Collapse "  ->  " or ">  -> " style debris leftovers
+    out = _re_content_guard.sub(r"[ \t]+->[ \t]+(?:[ \t]*->[ \t]+)+", " -> ", out)
+    # Collapse ">>> " repeated arrows
+    out = _re_content_guard.sub(r">>>+\s*", "", out)
+    # Collapse trailing whitespace on lines
+    out = _re_content_guard.sub(r"[ \t]+$", "", out, flags=_re_content_guard.MULTILINE)
+    # Collapse duplicate blank lines
+    out = _re_content_guard.sub(r"\n{3,}", "\n\n", out)
+    return out
+
+
+# Comment-patterns on a code line that likely LEAK the bug answer in a
+# code_review starter. We strip these from Python/JS/TS/Go code lines.
+# Rationale: a code_review exercise is "find the bug." If the Creator puts
+# a descriptive comment on the buggy line ("# Off-by-one: missing last
+# valid window"), the answer is trivially revealed.
+_ANSWER_LEAK_MARKERS = [
+    # Explicit bug-category markers
+    r"(?i)off-?by-?one",
+    r"(?i)missing\s+(?:the\s+)?(?:last|first|final|initial|null|empty|base|edge)",
+    r"(?i)should\s+(?:be|return|check|handle|increment|decrement|raise|catch|use|include)",
+    r"(?i)bug[\s:]+",
+    r"(?i)wrong[\s:]+",
+    r"(?i)incorrect[\s:]+",
+    r"(?i)broken[\s:]+",
+    r"(?i)todo[\s:]+fix",
+    r"(?i)fixme[\s:]",
+    r"(?i)hint[\s:]+",
+    r"(?i)answer[\s:]+",
+    r"(?i)solution[\s:]+",
+    # "this is wrong / this fails / this doesn't"
+    r"(?i)this\s+(?:is\s+)?(?:wrong|fails|doesn'?t|won'?t|can'?t)",
+    # Off-by-one variants: "forgot the +1", "range is off", "index is off"
+    r"(?i)forgot\s+(?:the\s+)?(?:\+|\-)?\s*\d",
+    r"(?i)(?:range|index|loop)\s+is\s+off",
+    # "not incremented / decremented"
+    r"(?i)not\s+(?:incremented|decremented|updated|called|checked)",
+    # Direct mentions of common bug categories
+    r"(?i)race\s+condition",
+    r"(?i)null\s+pointer",
+    r"(?i)memory\s+leak",
+    r"(?i)deadlock",
+    r"(?i)n\+?1\s+query",
+]
+
+def _strip_answer_comments_from_code(code: str) -> str:
+    """Remove # or // comments that would reveal bugs in a code_review starter.
+
+    We strip the COMMENT ONLY, not the code line. If the entire line is a
+    comment, we drop the whole line. If the comment is trailing after code,
+    we keep the code and trim the comment.
+
+    Detection: a comment whose body matches any of _ANSWER_LEAK_MARKERS is
+    considered answer-leaking.
+    """
+    if not code or not isinstance(code, str):
+        return code
+    lines = code.split("\n")
+    out = []
+    for ln in lines:
+        stripped = ln.strip()
+        # Detect comment-syntax used on this line
+        for marker in ("#", "//"):
+            if marker in ln:
+                # Find the comment portion (everything after the FIRST marker
+                # that isn't inside a string — naive: assume no '#' in
+                # strings for code_review starter, which is typical.)
+                idx = ln.find(marker)
+                code_part = ln[:idx]
+                comment_part = ln[idx:]
+                # Check if any leak marker matches the comment body
+                is_leak = any(_re_content_guard.search(pat, comment_part) for pat in _ANSWER_LEAK_MARKERS)
+                if is_leak:
+                    if code_part.strip() == "":
+                        # whole-line comment → drop the line entirely
+                        ln = None
+                    else:
+                        # trailing comment → keep code, drop comment
+                        ln = code_part.rstrip()
+                break  # only process the first comment marker on the line
+        if ln is not None:
+            out.append(ln)
+    return "\n".join(out)
+
+
 def _sanitize_step_for_learner(step_dict: dict) -> dict:
     """Strip ALL answer-key fields before the learner's GET response.
 
@@ -484,6 +641,31 @@ def _sanitize_step_for_learner(step_dict: dict) -> dict:
     # 4) code_review: bugs[] reveals the planted flaws — replace with opaque marker
     if "bugs" in dd and isinstance(dd["bugs"], list):
         dd["bugs"] = [{"hidden": True} for _ in dd["bugs"]]
+
+    # 4b) 2026-04-22 — strip answer-leaking comments from code_review starter.
+    # Beginner-agent walkthrough M1.S4 caught the Creator leaving inline
+    # comments like "# Off-by-one: missing last valid window" and "# Should
+    # return empty list" directly on the buggy lines — trivially reveals the
+    # answer to a "find the bugs" exercise. Per user 2026-04-22: "for content
+    # issues, use template/backend safeguards, avoid Creator prompt churn."
+    # So we strip at serve time rather than regen.
+    if ex_type_here == "code_review":
+        if "code" in dd and isinstance(dd["code"], str):
+            dd["code"] = _strip_answer_comments_from_code(dd["code"])
+        if "code" in step and isinstance(step["code"], str):
+            step["code"] = _strip_answer_comments_from_code(step["code"])
+
+    # 4c) 2026-04-22 — strip author-debris from ALL code/content fields across
+    # every exercise type. Creator sometimes leaves self-correction notes
+    # like "# wait, that's wrong" / "# actually: {0,1,2} and {3,4}" in
+    # docstrings (beginner-agent M5.S4 capstone). These erode learner trust
+    # and provide accidental hints. Same rationale as 4b — template-layer
+    # safeguard, not a Creator prompt round-trip.
+    for k in ("code", "content", "starter_code", "solution"):
+        if k in dd and isinstance(dd[k], str):
+            dd[k] = _strip_author_debris(dd[k])
+        if k in step and isinstance(step[k], str):
+            step[k] = _strip_author_debris(step[k])
 
     # 5) scenario_branch nested shape: demo_data.steps[].options[].correct / .explanation
     if "steps" in dd and isinstance(dd["steps"], list):
@@ -1006,7 +1188,13 @@ async def execute_code(req: CodeExecuteRequest):
 
     D.2 Phase 1 (2026-04-21): python / sql (in-memory SQLite) / yaml.
     D.2 Phase 2 (2026-04-21): dockerfile (lint) / shell (bash -n syntax check).
-    Unknown languages fall back to the python sandbox so legacy frontends keep working.
+    2026-04-22 WIRING FIX: route go/javascript/typescript through the Docker
+    runner (same runtime the grader uses). Previously fell to the Python
+    sandbox, producing `SyntaxError: invalid decimal literal (<user-code>,
+    line 11)` when a learner hit Run on Go code — user-reported on
+    #created-575a53998df8/23074/2. Root cause: /api/execute had no branch
+    for compiled / non-Python languages; the `else` caught them and ran
+    `exec()` on the Go source.
     """
     lang = (req.language or "python").lower()
     if lang == "sql":
@@ -1021,6 +1209,46 @@ async def execute_code(req: CodeExecuteRequest):
         result = _exec_dockerfile(req.code)
     elif lang in ("shell", "bash", "sh"):
         result = _exec_shell(req.code)
+    elif lang in ("go", "golang", "javascript", "js", "typescript", "ts"):
+        # Docker-required runtimes: compile / run via run_in_docker(code, lang,
+        # tests=None) which dispatches the no-tests path in _cmd_for_lang
+        # (`go run solution.go` / `node solution.js`). Result shape is already
+        # {output, error, execution_time, exit_code} — just relay.
+        try:
+            from backend.docker_runner import run_in_docker, is_docker_available
+            if not is_docker_available():
+                result = {
+                    "output": "",
+                    "error": (
+                        f"Docker is not available on this host, and {lang} code "
+                        f"can't run in the Python sandbox. Install/start Docker "
+                        f"or use a different language for Run preview."
+                    ),
+                    "execution_time": 0,
+                }
+            else:
+                docker_result = await asyncio.to_thread(
+                    run_in_docker, req.code or "", lang, timeout_s=30,
+                )
+                raw_out = docker_result.get("output", "") or ""
+                # Strip the `EXIT_CODE=N` trailer emitted by _cmd_for_lang's
+                # shell wrapper — it's there so host-side parsers can read
+                # the exit code, but learners hitting Run should see a clean
+                # program output.
+                import re as _re_ec
+                cleaned_out = _re_ec.sub(r"\s*EXIT_CODE=-?\d+\s*$", "", raw_out)
+                result = {
+                    "output": cleaned_out,
+                    "error": docker_result.get("error", "") or "",
+                    "execution_time": docker_result.get("execution_time", 0) or 0,
+                }
+        except Exception as _e:
+            logger.exception("execute_code: docker path failed for lang=%s", lang)
+            result = {
+                "output": "",
+                "error": f"Runtime error while launching {lang} container: {_e}",
+                "execution_time": 0,
+            }
     else:
         # python + unknown → sandboxed Python (existing behavior).
         # F26 (2026-04-21): thread starter_files/repo_path_var through so the
@@ -1052,6 +1280,23 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
     validation = step.validation or {}
     demo_data = step.demo_data or {}
     response = req.response_data
+
+    # v8.6 (2026-04-24) DEAD-LETTER short-circuit. Steps persisted with
+    # quality_flag=needs_author_review have no hidden_tests / no answer key —
+    # they're pending author review. Return a neutral "not-yet-graded" verdict
+    # so learners don't get a crashed grader or a silent 0/100 score.
+    if validation.get("quality_flag") == "needs_author_review":
+        return ExerciseSubmitResponse(
+            correct=False,
+            score=0.0,
+            feedback=(
+                "⚠ This exercise is pending author review and is not yet "
+                "graded. The course author has been notified; check back later."
+            ),
+            item_results=[],
+            correct_answer=None,
+            explanations=[],
+        )
 
     # Merge demo_data into validation — correctness data may be in either place
     # (course files sometimes store `options[].correct`, `items[].correct_category` in demo_data)
@@ -1092,6 +1337,12 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
                 "user_position": ir.get("user_position"),
                 "user_category": ir.get("user_category"),
                 "user_rank": ir.get("user_rank"),
+                # 2026-04-22 v2 — code_review needs `line` to wire per-line
+                # styling. Safe because this row either describes the learner's
+                # own click OR is scrubbed below when it's a missed-bug reveal.
+                "line": ir.get("line"),
+                "bug_on_line": ir.get("bug_on_line"),
+                "found_by_user": ir.get("found_by_user"),
             }
             return {k: v for k, v in safe.items() if v is not None}
         # F22 fix 2026-04-21 (revised from F1): for scenario_branch, the full
@@ -1132,17 +1383,83 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
                 # correctness of options they didn't pick (still the answer key).
                 if user_choices.get(si_int) == oi_int:
                     gated_item_results.append(_strip_item_result(ir))
+        elif exercise_type == "code_review":
+            # 2026-04-22 v2 — same gating principle for code_review as for
+            # scenario_branch: on attempts 1-2, only expose rows about lines
+            # the learner actually FLAGGED. Missed-bug rows (bug_on_line=True,
+            # found_by_user=False) would leak the answer key. On attempt 3
+            # the reveal branch runs below via the non-gate path.
+            user_bug_lines_raw = (response or {}).get("bug_lines") or \
+                                  (response or {}).get("flagged_lines") or \
+                                  (response or {}).get("bugs") or []
+            user_bug_lines = set()
+            for v in user_bug_lines_raw:
+                try:
+                    user_bug_lines.add(int(v))
+                except (ValueError, TypeError):
+                    continue
+            gated_item_results = []
+            for ir in (item_results or []):
+                if not isinstance(ir, dict):
+                    continue
+                ln = ir.get("line")
+                try:
+                    ln_int = int(ln) if ln is not None else None
+                except (ValueError, TypeError):
+                    ln_int = None
+                # Keep only rows for lines the learner flagged.
+                if ln_int is not None and ln_int in user_bug_lines:
+                    gated_item_results.append(_strip_item_result(ir))
         else:
             gated_item_results = [_strip_item_result(ir) for ir in (item_results or [])]
         # Rewrite the feedback string to be a concept-level hint, not the
         # verbose "Step 0: Correct choice Step 1:..." answer-leak string.
+        # 2026-04-22 fix: previous text said "marked in red above" but the
+        # templates don't actually render red markers (beginner-agent caught
+        # this — the phrase leads learners to look for visual cues that don't
+        # exist). New text names the concrete thing that happened.
+        #
+        # v8.6 GATE B (2026-04-24): EXECUTION SIGNAL IS NOT AN ANSWER KEY.
+        # Beginner-agent review of TS v12 caught that wrong-submissions on
+        # code_exercise steps returned the GENERIC fallback string even when
+        # the Docker grader produced rich "N/M tests passed, stderr tail"
+        # output. The reveal gate over-reached: it was designed to hide
+        # correct_* answer fields (per-item teaching leaks) but it also nuked
+        # `feedback` regardless of type. For code_exercise, `feedback` is
+        # docker stdout/stderr — that's execution signal, not answer key, and
+        # learners NEED it to iterate. Structural split: by exercise-type.
         attempts_left = 2 - attempt_num + 1
-        hint_feedback = (
-            f"{score*100:.0f}% on this attempt. "
-            f"{attempts_left} more retr{'y' if attempts_left == 1 else 'ies'} before we show the full breakdown. "
-            f"Look back at the step's concept content and try again — focus on the items you got wrong "
-            f"(marked in red above)."
-        )
+        n_wrong = sum(1 for r in (item_results or []) if isinstance(r, dict) and not r.get("correct"))
+        # Code exercise + test-runner types: PRESERVE the raw grader feedback.
+        # These types don't produce `item_results` (no per-answer leak risk),
+        # and the grader's feedback string IS the failing-test names + stderr
+        # tail — that's what the learner needs to iterate.
+        if exercise_type in ("code_exercise", "code_read", "system_build"):
+            original_feedback = str(vresult.get("feedback") or "") or (
+                "Your submission didn't meet the hidden-test expectations. "
+                "The runner didn't return a feedback string."
+            )
+            hint_feedback = (
+                f"{score*100:.0f}% on this attempt. "
+                f"{attempts_left} more retr{'y' if attempts_left == 1 else 'ies'} before the full breakdown reveals.\n\n"
+                f"{original_feedback}"
+            )
+        else:
+            if n_wrong:
+                specifics = (
+                    f"{n_wrong} of your responses did not match the expected answer. "
+                    f"Look at which items you chose vs what the exercise asked for and try again."
+                )
+            else:
+                specifics = (
+                    "Your submission didn't match what the exercise expects. "
+                    "Re-read the briefing and the starter code carefully."
+                )
+            hint_feedback = (
+                f"{score*100:.0f}% on this attempt. "
+                f"{attempts_left} more retr{'y' if attempts_left == 1 else 'ies'} before the full breakdown reveals. "
+                f"{specifics}"
+            )
         return ExerciseSubmitResponse(
             correct=False,
             score=score,
@@ -1310,16 +1627,39 @@ def _build_item_results(exercise_type: str, validation: dict, response: dict) ->
                 user_lines_set.add(int(v))
             except (ValueError, TypeError):
                 continue
+        bug_lines_set = set()
         for b in bugs:
             raw_line = b.get("line", b.get("line_number"))
             try:
                 line = int(raw_line)
             except (ValueError, TypeError):
                 line = raw_line
+            bug_lines_set.add(line)
+            # 2026-04-22 v2 fix: beginner-agent caught that lines the learner
+            # correctly flagged as bugs were painted RED in the UI because
+            # the client filtered by `r.correct` but the backend emitted
+            # `r.found_by_user`. Add `correct` (mirrors found_by_user) so
+            # the shared item_results contract + sanitizer pass it through,
+            # and `bug_on_line=True` so the client can highlight missed bugs
+            # separately after the reveal.
             out.append({
                 "line": line,
                 "description": b.get("description"),
                 "found_by_user": line in user_lines_set,
+                "correct": line in user_lines_set,
+                "bug_on_line": True,
+            })
+        # Emit rows for FALSE POSITIVES so the client knows which of the
+        # user's clicks were wrong (not just "not in correct set" by absence).
+        # These are safe to emit at any attempt — they describe the learner's
+        # OWN pick, not the answer key.
+        for ln in sorted(user_lines_set - bug_lines_set):
+            out.append({
+                "line": ln,
+                "description": None,
+                "found_by_user": False,
+                "correct": False,
+                "bug_on_line": False,
             })
     elif et == "scenario_branch":
         # Scenario branch stores options on each step
@@ -1798,6 +2138,172 @@ async def get_budget():
         "llm_enabled": _llm_enabled(),
         "last_call_at": state.get("last_call_at"),
     }
+
+
+@app.get("/api/admin/system-resources")
+async def get_system_resources():
+    """Expose server resource state for operational monitoring.
+
+    Added 2026-04-23 (user directive: "keep a look out of server resources
+    and let me know if things are near breaking"). Designed to be polled
+    from a remote monitor (curl every few minutes) — no auth gate because
+    the sclr.ac nginx front layer already enforces basic-auth on the whole
+    origin, so this endpoint is effectively already protected.
+
+    Fields:
+      disk_free_gb            — free bytes on / (GB)
+      disk_used_pct           — % used on /
+      docker_images_total_gb  — sum of all local image sizes
+      docker_containers_total_gb — stopped-container disk cost
+      docker_reclaimable_gb   — docker system df says could be pruned
+      memory_total_gb / memory_available_gb / memory_used_pct
+      load_1min / load_5min / load_15min
+      uvicorn_rss_mb / celery_rss_mb — our process RSS
+      db_size_mb              — skills_lab.db size
+      thresholds              — when to alert
+
+    All values are best-effort; on Linux uses /proc + `df` + `docker`; on
+    macOS uses `vm_stat` + `df -g`. Never raises — missing subsystems
+    return None.
+    """
+    import subprocess
+    import shutil as _shutil
+    import platform as _platform
+    state: dict = {"platform": _platform.system().lower()}
+
+    # Disk (GB)
+    try:
+        usage = _shutil.disk_usage("/")
+        state["disk_total_gb"] = round(usage.total / 1024**3, 1)
+        state["disk_free_gb"] = round(usage.free / 1024**3, 1)
+        state["disk_used_pct"] = round(100 * (usage.total - usage.free) / usage.total, 1)
+    except Exception:
+        state["disk_free_gb"] = None
+
+    # Docker (GB) — parse `docker system df`
+    try:
+        out = subprocess.run(
+            ["docker", "system", "df", "--format", "{{.Type}}\t{{.Size}}\t{{.Reclaimable}}"],
+            capture_output=True, text=True, timeout=10,
+        )
+        total_size_gb = 0.0
+        reclaimable_gb = 0.0
+        images_gb = 0.0
+        containers_gb = 0.0
+        for line in (out.stdout or "").splitlines():
+            parts = line.split("\t")
+            if len(parts) < 3:
+                continue
+            kind, size_s, reclaim_s = parts[0].strip(), parts[1].strip(), parts[2].strip()
+            def _to_gb(s: str) -> float:
+                s = s.strip()
+                if s.endswith("GB"): return float(s[:-2])
+                if s.endswith("MB"): return float(s[:-2]) / 1024.0
+                if s.endswith("kB") or s.endswith("KB"): return float(s[:-2]) / 1024.0 / 1024.0
+                if s.endswith("B"): return float(s[:-1]) / 1024.0 / 1024.0 / 1024.0
+                try: return float(s)
+                except: return 0.0
+            size_gb = _to_gb(size_s)
+            # "Reclaimable" comes as e.g. "48.71GB (78%)" — take the size
+            reclaim_gb = _to_gb(reclaim_s.split(" ")[0]) if reclaim_s else 0.0
+            total_size_gb += size_gb
+            reclaimable_gb += reclaim_gb
+            if "image" in kind.lower(): images_gb = size_gb
+            elif "container" in kind.lower(): containers_gb = size_gb
+        state["docker_total_gb"] = round(total_size_gb, 2)
+        state["docker_images_gb"] = round(images_gb, 2)
+        state["docker_containers_gb"] = round(containers_gb, 2)
+        state["docker_reclaimable_gb"] = round(reclaimable_gb, 2)
+    except Exception:
+        state["docker_total_gb"] = None
+
+    # Memory — use /proc/meminfo on Linux (the sclr.ac box)
+    try:
+        if state["platform"] == "linux":
+            with open("/proc/meminfo") as f:
+                meminfo = {}
+                for line in f:
+                    parts = line.split(":")
+                    if len(parts) != 2:
+                        continue
+                    k = parts[0].strip()
+                    v = parts[1].strip().replace(" kB", "")
+                    try:
+                        meminfo[k] = int(v)
+                    except ValueError:
+                        pass
+            total_kb = meminfo.get("MemTotal", 0)
+            available_kb = meminfo.get("MemAvailable", 0)
+            state["memory_total_gb"] = round(total_kb / 1024 / 1024, 1)
+            state["memory_available_gb"] = round(available_kb / 1024 / 1024, 1)
+            state["memory_used_pct"] = round(100 * (total_kb - available_kb) / total_kb, 1) if total_kb else None
+    except Exception:
+        state["memory_total_gb"] = None
+
+    # Load avg
+    try:
+        state["load_1min"], state["load_5min"], state["load_15min"] = os.getloadavg()
+    except Exception:
+        pass
+
+    # Our processes' RSS
+    try:
+        out = subprocess.run(
+            ["ps", "axo", "pid=,rss=,command="], capture_output=True, text=True, timeout=5,
+        )
+        uvicorn_rss_mb = 0
+        celery_rss_mb = 0
+        for line in (out.stdout or "").splitlines():
+            parts = line.strip().split(None, 2)
+            if len(parts) != 3:
+                continue
+            try:
+                rss_kb = int(parts[1])
+            except ValueError:
+                continue
+            cmd = parts[2]
+            if "uvicorn" in cmd and "backend.main:app" in cmd:
+                uvicorn_rss_mb = max(uvicorn_rss_mb, rss_kb // 1024)
+            elif "celery" in cmd and "backend.celery_app" in cmd:
+                celery_rss_mb = max(celery_rss_mb, rss_kb // 1024)
+        state["uvicorn_rss_mb"] = uvicorn_rss_mb or None
+        state["celery_rss_mb"] = celery_rss_mb or None
+    except Exception:
+        state["uvicorn_rss_mb"] = None
+
+    # DB file size
+    try:
+        from pathlib import Path as _P
+        db_path = _P("skills_lab.db")
+        if db_path.exists():
+            state["db_size_mb"] = round(db_path.stat().st_size / 1024 / 1024, 2)
+    except Exception:
+        state["db_size_mb"] = None
+
+    # Thresholds (what would trigger a "near breaking" alert)
+    state["thresholds"] = {
+        "disk_free_gb_min": 10,
+        "docker_total_gb_max": 80,
+        "memory_used_pct_max": 90,
+        "load_1min_max": 16,  # tuned per host core count; over for single-box
+        "db_size_mb_max": 5000,
+    }
+
+    # Computed alerts
+    alerts = []
+    if state.get("disk_free_gb") is not None and state["disk_free_gb"] < state["thresholds"]["disk_free_gb_min"]:
+        alerts.append(f"disk free = {state['disk_free_gb']}GB (< {state['thresholds']['disk_free_gb_min']}GB)")
+    if state.get("docker_total_gb") is not None and state["docker_total_gb"] > state["thresholds"]["docker_total_gb_max"]:
+        alerts.append(f"docker total = {state['docker_total_gb']}GB (> {state['thresholds']['docker_total_gb_max']}GB)")
+    if state.get("memory_used_pct") is not None and state["memory_used_pct"] > state["thresholds"]["memory_used_pct_max"]:
+        alerts.append(f"memory used = {state['memory_used_pct']}% (> {state['thresholds']['memory_used_pct_max']}%)")
+    if state.get("load_1min") is not None and state["load_1min"] > state["thresholds"]["load_1min_max"]:
+        alerts.append(f"load1 = {state['load_1min']:.2f} (> {state['thresholds']['load_1min_max']})")
+    if state.get("db_size_mb") is not None and state["db_size_mb"] > state["thresholds"]["db_size_mb_max"]:
+        alerts.append(f"db size = {state['db_size_mb']}MB (> {state['thresholds']['db_size_mb_max']}MB)")
+    state["alerts"] = alerts
+    state["healthy"] = len(alerts) == 0
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -3136,6 +3642,40 @@ DEPTH TIER (auto-choose from course description):
 - **immersive**: 1-3 modules with ONE dominant simulation capstone. Modules are pre-briefing + drill + debrief. For "3am pager" / "earnings-call live Q&A" / "board grilling" style experiences where the drill itself IS the course.
 Pick the tier that matches the skill. Don't produce a 2h course on "Complete L7 System Design" — that's an overpromise. Either tier up to deep_dive or narrow the title scope.
 
+EXERCISE-TYPE PICKER — anti-patterns to refuse (v8.6.1 2026-04-24 generic rules):
+
+F2 — **Writing a document is NOT a code_exercise.** If the step's deliverable is a
+     prose / markdown / yaml / plaintext authoring artifact (e.g. "write a CLAUDE.md
+     for this repo", "author a post-mortem", "draft a decision record"), DO NOT map
+     to `code_exercise` with hidden_tests. Hidden-test graders force the LLM to
+     invent a parser for the document, which turns an authoring task into a
+     regex exercise. Correct choice: `terminal_exercise` (learner pastes the doc,
+     LLM-rubric grades against `validation.rubric`) OR `code_review` if the step
+     is critiquing an existing document. Rule of thumb: if the deliverable is
+     rendered text a human reads for meaning, the grader is an LLM rubric, not
+     a unit test.
+
+F3 — **Teaching an MCP / plugin / integration REQUIRES wiring mechanics.** When
+     the step asks the learner to USE a pre-built MCP server (or any CLI plugin
+     / integration), the step MUST include the real configuration path: the
+     exact CLI subcommand (e.g. `claude mcp add`), the exact settings.json /
+     config file location + the JSON/YAML block to paste, the transport (stdio
+     vs HTTP), and a verification step (e.g. `claude /mcp list`) showing the
+     tool is reachable. A step that only has the learner "read the MCP + explain
+     which tools earn their place" is TOY — it leaves learners unable to add an
+     MCP to their real environment. For any MCP-consumption step, emit the
+     wiring mechanics verbatim from the MCP's README; do not paraphrase.
+
+F1 — **Never invent CLI commands, subcommands, or flags.** This bit the course
+     on 2026-04-24 — the Creator invented `claude auth` in an M0 hint. Real
+     commands are `claude /login` (interactive) or `ANTHROPIC_API_KEY` env var.
+     For every CLI invocation in instructions / hints / rubrics, either (a)
+     quote verbatim from the runtime-deps brief / source_material, (b) use a
+     command you KNOW is in the tool's public docs, or (c) use generic phrasing
+     ("configure your credentials per the tool's login flow"). Invented CLI
+     syntax is the #1 trust-breaker on first CLI touch.
+
+
 COURSE SUBJECT INFERENCE (critical — pick right exercise types):
 - **OPERATIONAL/SANDBOX-FIRST subjects** (SRE, DevOps, SecEng, DataAnalyst, MLops, Accountant, Legal-contract-review, BI): the learner's job is to TOUCH real tools. Use the new sandbox types (see below) heavily. A 2h course on AWS DevOps without `live_sql_playground`, `observability_sandbox`, or `code_exercise_live` is "MCQ cosplay" — reject that design.
 - ENGINEERING subjects (API, backend, ML, DevOps, code, deployment): use code_exercise / code_review / system_build capstones, fill_in_blank for syntax
@@ -3195,19 +3735,362 @@ VALIDATION REQUIREMENTS (non-negotiable for scoring):
 Always respond with valid JSON matching the exact schema requested. No preamble, no explanation outside the JSON."""
 
 
-def _llm_json_call(system: str, user: str, max_tokens: int = 2000, model: str | None = None) -> dict | None:
-    """Call Claude and parse JSON response. Returns None if unavailable, budget-exhausted, or invalid.
+# v8.6 (2026-04-24) — ANTHROPIC TOOL-USE MODE for JSON enforcement.
+# Context: for large payloads (code_exercise steps with TS capstones = ~14k
+# chars), Sonnet routinely emits invalid JSON (bad escape in a code string,
+# unterminated string, missing closing brace). Prior mitigation = bump
+# max_tokens and hope, + prompt-level "Return STRICT JSON only". Still bit
+# us on 4 of 7 capstone regen attempts.
+#
+# Fix: Anthropic tool-use. Passing `tools=[...]` + `tool_choice={...}` forces
+# the model to call the tool with JSON-schema-validated input. The inference
+# layer physically cannot emit invalid JSON — the schema is enforced during
+# token generation. Cost: zero behavioral change other than response shape
+# (resp.content[0].input is the dict instead of parsing resp.content[0].text).
+#
+# This schema matches CodeExerciseAssignmentModel (schemas.py:~279) +
+# ontology's required fields for code_exercise. Kept LOOSE on optional
+# fields so the LLM isn't over-constrained — only `content`/`code`/`validation`/
+# `demo_data` are required structurally; everything else is "additionalProperties".
+_CODE_EXERCISE_TOOL_SCHEMA = {
+    "name": "emit_code_exercise",
+    "description": (
+        "Emit a complete, invariant-compliant code_exercise step. Every field "
+        "MUST be in the course's pinned language. The starter (`code`) must "
+        "FAIL the hidden_tests; `solution_code` must PASS them. Hidden_tests "
+        "must import from './solution' (same directory as the solution file)."
+    ),
+    # v8.6.1 (2026-04-24) FLATTENED SCHEMA — Anthropic tool_use enforces the
+    # top-level object shape but does NOT strictly enforce nested object
+    # schemas. When we had `validation: {type: "object"}`, the LLM kept
+    # emitting validation as a QUOTED STRING of a JSON object (doubly-encoded)
+    # — passing the top-level schema check but breaking all downstream
+    # consumers. Flattening to a single object avoids the stringification
+    # class entirely. The harness re-shapes to `{validation: {...}, demo_data:
+    # {...}}` before the rest of the pipeline.
+    "input_schema": {
+        "type": "object",
+        "properties": {
+            "content": {
+                "type": "string",
+                "description": "HTML briefing, 2-4 styled cards, dark theme, 400-2500 chars.",
+            },
+            "code": {
+                "type": "string",
+                "description": (
+                    "Starter code, 20-60 lines, production-flavored. The "
+                    "function(s) the hidden_tests import MUST be "
+                    "unimplemented: first real body statement is "
+                    "`raise NotImplementedError('TODO')` (Python), "
+                    "`throw new Error('TODO')` (TS/JS), "
+                    "`panic(\"TODO\")` (Go), `todo!()` (Rust), or a "
+                    "wrong-sentinel return."
+                ),
+            },
+            "expected_output": {
+                "type": "string",
+                "description": "One-sentence description of what the working solution produces.",
+            },
+            "language": {
+                "type": "string",
+                "enum": [
+                    "python", "javascript", "typescript", "ts", "js",
+                    "go", "golang", "rust", "java",
+                    "sql", "yaml", "dockerfile", "shell",
+                ],
+                "description": "The course's pinned language. Must match starter + solution + tests.",
+            },
+            "hint": {
+                "type": "string",
+                "description": "One-liner nudge for stuck learners (no spoilers).",
+            },
+            "hidden_tests": {
+                "type": "string",
+                "description": (
+                    "Complete test file source. pytest for python; jest "
+                    "for ts/js; `go test` for go; cargo test for rust; "
+                    "JUnit for java. 4-8 tests minimum."
+                ),
+            },
+            "solution_code": {
+                "type": "string",
+                "description": "Complete working implementation. MUST pass all hidden_tests.",
+            },
+            "must_contain": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": "Low-weight substring checks, 4-8 entries.",
+            },
+            "requirements": {
+                "type": "string",
+                "description": (
+                    "Optional. requirements.txt / package.json / go.mod "
+                    "contents (raw). Only emit if the step needs a "
+                    "library NOT in the runtime-deps brief."
+                ),
+            },
+        },
+        "required": [
+            "content", "code", "language", "hidden_tests", "solution_code",
+        ],
+    },
+}
 
-    Budget-respecting: returns None when spend cap is hit; caller should use fallbacks.
-    `model` defaults to Sonnet 4; pass Opus for quality-critical outlining.
+
+def _reshape_flat_code_exercise(flat: dict | None) -> dict | None:
+    """Reshape flat tool_use output into the nested {validation:…, demo_data:…}
+    form the rest of the code_exercise pipeline expects. Returns None if input
+    is None. Missing optional fields (`hint`, `must_contain`, `requirements`)
+    are omitted, not defaulted, to preserve existing downstream semantics.
+
+    v8.6.1 (2026-04-24) — robust against LLM still emitting a nested
+    `validation` / `demo_data` object despite the flat schema. The textual
+    prompt still references `validation.hidden_tests`, `demo_data.language`
+    for legacy reasons, and the LLM's prior pulls it back into a nested
+    shape. We merge top-level AND nested-if-present.
+    """
+    if flat is None:
+        return None
+    if not isinstance(flat, dict):
+        return None
+
+    # Coerce any stringified validation/demo_data that slipped past the
+    # top-level coerce (happens when LLM emits these as extra properties
+    # that are strings containing JSON).
+    #
+    # v8.6.1 (2026-04-24) LANGUAGE-AGNOSTIC MALFORMED-JSON RECOVERY:
+    # When `json.loads`/`raw_decode` both fail (truncation, bad escaping
+    # in embedded code), try a regex scan for specific top-level keys
+    # (`hidden_tests`, `solution_code`, `requirements`, `must_contain`,
+    # `hint`, `language`) — these are language-agnostic (same key names
+    # across Python, TS, Go, Rust, Java, SQL, YAML). We recover what we
+    # can rather than drop the entire payload.
+    import json as _json_rs
+    import re as _re_rs
+    def _unstringify(x):
+        if not isinstance(x, str):
+            return x
+        s = x.strip()
+        if not (s.startswith("{") or s.startswith("[")):
+            return x
+        # Strict JSON parse (raw_decode for partial tolerance)
+        try:
+            decoder = _json_rs.JSONDecoder()
+            parsed, _ = decoder.raw_decode(s)
+            if isinstance(parsed, (dict, list)):
+                return parsed
+        except Exception:
+            pass
+        # Malformed-JSON regex recovery (language-agnostic field names)
+        recovered = {}
+        # Match "key": "VALUE" where VALUE may contain escaped quotes.
+        # Non-greedy, tolerant of newlines in the value (DOTALL).
+        pat = _re_rs.compile(
+            r'"(hidden_tests|solution_code|requirements|hint|language)"\s*:\s*'
+            r'"((?:[^"\\]|\\.)*)"',
+            _re_rs.DOTALL,
+        )
+        for m in pat.finditer(s):
+            key = m.group(1)
+            raw_value = m.group(2)
+            # Unescape the basic JSON escapes. Full JSON escape decoding
+            # would need ast.literal_eval with safety — stick to the
+            # common cases.
+            value = (raw_value
+                     .replace(r'\"', '"')
+                     .replace(r'\\', '\\')
+                     .replace(r'\n', '\n')
+                     .replace(r'\t', '\t')
+                     .replace(r'\r', '\r'))
+            if key not in recovered:
+                recovered[key] = value
+        # Match arrays: "must_contain": [ "a", "b", ... ]
+        arr_pat = _re_rs.compile(
+            r'"(must_contain)"\s*:\s*\[([^\]]*)\]',
+            _re_rs.DOTALL,
+        )
+        for m in arr_pat.finditer(s):
+            key = m.group(1)
+            inner = m.group(2)
+            # Extract all quoted strings from inner
+            items = _re_rs.findall(r'"((?:[^"\\]|\\.)*)"', inner)
+            if items and key not in recovered:
+                recovered[key] = [
+                    it.replace(r'\"', '"').replace(r'\\', '\\') for it in items
+                ]
+        if recovered:
+            logging.info(
+                "reshape_flat: malformed-JSON regex recovery extracted %d fields: %s",
+                len(recovered), list(recovered.keys()),
+            )
+            return recovered
+        return x
+
+    nested_val = _unstringify(flat.get("validation"))
+    nested_demo = _unstringify(flat.get("demo_data"))
+
+    # If LLM emitted nested validation AS A DICT (not stringified),
+    # and the top-level fields are missing, fall back to nested.
+    shaped = {
+        "content": flat.get("content") or "",
+        "code": flat.get("code") or "",
+        "expected_output": flat.get("expected_output") or "",
+        "validation": {},
+        "demo_data": {},
+    }
+    # Merge top-level flat fields first (preferred per schema)
+    for k in ("hint", "hidden_tests", "solution_code", "must_contain", "requirements"):
+        if k in flat and flat[k] is not None and not isinstance(flat[k], dict):
+            shaped["validation"][k] = flat[k]
+    # If nested validation was a dict, merge its fields (flat takes precedence)
+    if isinstance(nested_val, dict):
+        for k, v in nested_val.items():
+            if k not in shaped["validation"] and v is not None:
+                shaped["validation"][k] = v
+    # Language: top-level preferred, fall back to nested demo_data
+    lang = flat.get("language")
+    if not lang and isinstance(nested_demo, dict):
+        lang = nested_demo.get("language")
+    if lang:
+        shaped["demo_data"]["language"] = lang
+    # Pass-through any extra keys the outer loop may rely on
+    for extra in ("_internal_scaffold",):
+        if extra in flat:
+            shaped[extra] = flat[extra]
+    return shaped
+
+
+def _llm_tool_use_call(
+    system: str,
+    user: str,
+    tool_schema: dict,
+    *,
+    max_tokens: int = 8000,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> dict | None:
+    """Call Claude with forced tool-use — API-level JSON schema enforcement.
+
+    Unlike `_llm_json_call` which begs the model for JSON and crosses fingers,
+    this forces a specific tool call with schema validation at the inference
+    layer. Cannot return invalid JSON — either succeeds with a structured
+    dict or fails at the API level with a clear reason.
+
+    Returns the tool's `input` dict (parsed & validated). Returns None on
+    budget exhaustion, API error, or no-tool-use response.
     """
     if not _llm_enabled():
         return None
     use_model = model or "claude-sonnet-4-20250514"
+    use_temp = 1.0 if temperature is None else temperature
     try:
         response = _ANTHROPIC_CLIENT.messages.create(
             model=use_model,
             max_tokens=max_tokens,
+            temperature=use_temp,
+            system=system,
+            messages=[{"role": "user", "content": user}],
+            tools=[tool_schema],
+            tool_choice={"type": "tool", "name": tool_schema["name"]},
+        )
+        if hasattr(response, "usage"):
+            _record_llm_cost(response.usage.input_tokens, response.usage.output_tokens, use_model)
+        if not response.content:
+            logging.warning("tool_use: empty response.content")
+            return None
+        # Tool-use response: content is a list of blocks; find the tool_use block.
+        for block in response.content:
+            btype = getattr(block, "type", "")
+            if btype == "tool_use":
+                tool_input = getattr(block, "input", None)
+                if isinstance(tool_input, dict):
+                    # v8.6 (2026-04-24) AGGRESSIVE COERCION — per buddy-Opus
+                    # consult: "Coerce aggressively, log the miss, don't
+                    # fallback." Anthropic's tool-use enforces top-level
+                    # schema but occasionally serializes nested objects as
+                    # JSON-stringified values. Pre-fix: we only coerced
+                    # strings that matched `{...}` exactly, missing strings
+                    # with leading whitespace / BOM / trailing commentary.
+                    # Post-fix: try json.loads on EVERY string value; if it
+                    # parses to a dict, swap it in. If parse fails, leave
+                    # as-is (unhelpful but not destructive).
+                    import json as _json_coerce
+                    def _aggressive_coerce(d: dict, path: str = "") -> None:
+                        for k, v in list(d.items()):
+                            kp = f"{path}.{k}" if path else k
+                            if isinstance(v, str):
+                                _v_strip = v.strip()
+                                # v8.6.1 (2026-04-24) — PARTIAL-JSON-TOLERANT:
+                                # the strict startswith+endswith pre-filter missed
+                                # real cases where the LLM emitted validation as
+                                # a JSON string truncated by max_tokens (starts
+                                # with `{` but never closes). Use raw_decode so
+                                # we parse as much valid JSON as present at the
+                                # start of the string, rather than an all-or-
+                                # nothing match. Only attempt on strings that
+                                # START with `{` or `[` to avoid parsing code.
+                                if _v_strip.startswith("{") or _v_strip.startswith("["):
+                                    try:
+                                        decoder = _json_coerce.JSONDecoder()
+                                        parsed, end_idx = decoder.raw_decode(_v_strip)
+                                        if isinstance(parsed, (dict, list)):
+                                            d[k] = parsed
+                                            unparsed_tail = _v_strip[end_idx:].strip()
+                                            note = ""
+                                            if unparsed_tail:
+                                                note = f" (+{len(unparsed_tail)} chars of unparsed trailing garbage dropped)"
+                                            logging.info(
+                                                "tool_use: coerced stringified nested %s at key=%r%s",
+                                                type(parsed).__name__, kp, note,
+                                            )
+                                            if isinstance(parsed, dict):
+                                                _aggressive_coerce(parsed, kp)
+                                    except Exception as _coerce_exc:
+                                        logging.warning(
+                                            "tool_use: coerce FAILED at key=%r (%d chars, starts with %r): %s",
+                                            kp, len(_v_strip), _v_strip[:50], _coerce_exc,
+                                        )
+                            elif isinstance(v, dict):
+                                _aggressive_coerce(v, kp)
+                    _aggressive_coerce(tool_input)
+                    return tool_input
+                logging.warning("tool_use: block input is not a dict: %r", type(tool_input))
+                return None
+        logging.warning(
+            "tool_use: no tool_use block in response (stop_reason=%s, content types=%s)",
+            getattr(response, "stop_reason", "?"),
+            [getattr(b, "type", "?") for b in response.content],
+        )
+        return None
+    except Exception as e:
+        logging.warning("tool_use call failed: %s", e)
+        return None
+
+
+def _llm_json_call(
+    system: str,
+    user: str,
+    max_tokens: int = 2000,
+    model: str | None = None,
+    temperature: float | None = None,
+) -> dict | None:
+    """Call Claude and parse JSON response. Returns None if unavailable, budget-exhausted, or invalid.
+
+    Budget-respecting: returns None when spend cap is hit; caller should use fallbacks.
+    `model` defaults to Sonnet 4; pass Opus for quality-critical outlining.
+    `temperature` is explicit — default 1.0 (Anthropic's default). Retries
+    should pass 1.0 so identical prompts sample differently. If you want
+    deterministic output (debugging), pass 0.0 explicitly.
+    """
+    if not _llm_enabled():
+        return None
+    use_model = model or "claude-sonnet-4-20250514"
+    use_temp = 1.0 if temperature is None else temperature
+    try:
+        response = _ANTHROPIC_CLIENT.messages.create(
+            model=use_model,
+            max_tokens=max_tokens,
+            temperature=use_temp,
             system=system,
             messages=[{"role": "user", "content": user}],
         )
@@ -3337,6 +4220,29 @@ _NON_ENG_FALLBACK_MAP = {
 _NON_ENG_WORD_BOUNDARY_RE = None  # lazy-compiled on first call
 
 
+# 2026-04-22 v8: CLI-tool course detection. Courses about using a CLI /
+# terminal tool (Claude Code, kubectl, git, docker, gh, aws CLI, etc.) should
+# prefer `terminal_exercise` over `code_exercise` for every hands-on step,
+# since the skill is "run commands on your machine", not "write code on
+# ours." The Creator previously picked code_exercise for these and failed
+# because the tests-harness can't grade a "run this kubectl command" step.
+_CLI_TOOL_PHRASES = [
+    "claude code", "terminal exercise", "claude cli", "claude code +",
+    "kubectl", "docker cli", "docker command", "git workflow",
+    "gh cli", "github cli", "aws cli", "gcloud cli", "az cli",
+    "shell scripting workflow", "command line productivity",
+    "terraform cli", "helm cli", "k3d", "kind cluster",
+]
+
+
+def _is_cli_tool_subject(title: str, description: str = "") -> bool:
+    """Detect courses where the learner's skill lives on their own machine
+    running CLI commands — not writing code in a sandbox. These should use
+    `terminal_exercise` (BYO-execution) instead of `code_exercise`."""
+    blob = f"{title or ''} {description or ''}".lower()
+    return any(p in blob for p in _CLI_TOOL_PHRASES)
+
+
 def _is_non_engineering_subject(title: str, description: str = "", course_type: str = "") -> bool:
     """Word-boundary match (2026-04-21 fix): substring matching caused
     'b**ui**ld' / 't**hr**eshold' / 'l**ux**ury' false-positives that flipped
@@ -3360,6 +4266,100 @@ def _is_non_engineering_subject(title: str, description: str = "", course_type: 
         _NON_ENG_WORD_BOUNDARY_RE = _re_neb.compile(pat, _re_neb.IGNORECASE)
     blob = f"{title} {description}"
     return bool(_NON_ENG_WORD_BOUNDARY_RE.search(blob))
+
+
+# ---------------------------------------------------------------------------
+# Zero-code course detection (v8.6.2 2026-04-24) — non-coder browser-only courses.
+# ---------------------------------------------------------------------------
+# User directive 2026-04-24: "If this works, create the non tech course, in similar
+# hands-on style leading to real skills learning." Non-coder courses (PMs, ops leads,
+# CSMs, legal, etc. using claude.ai in the browser for prompt workflows) promise
+# ZERO code / CLI / git / deploy. But course_type="technical" can still be set
+# legitimately (technical != engineering) — so _is_non_engineering_subject isn't
+# the right detector. The beginner-review for AI-Powered Workday caught the Creator
+# emitting `gha_workflow_check` (GitHub Actions URL paste) on the capstone — which
+# violated the zero-code promise and broke the course for a non-coder PM audience.
+#
+# THE SIGNAL: a course is "zero-code" if the title/description/source_material
+# explicitly says browser-only / prompt-workflow / no-code / paste-markdown /
+# non-coder targeting. The detection is OR-of-signals — any one of these strong
+# markers flips the course into zero-code mode.
+#
+# WHAT ZERO-CODE COURSES MUST NOT EMIT:
+# - gha_workflow_check validation (learner would need git + GitHub + CI knowledge)
+# - endpoint_check validation (learner would need to deploy a service)
+# - terminal_exercise (learner uses browser claude.ai, not CLI)
+# - fill_in_blank with language!=text (learner shouldn't be writing code)
+# - system_build's `deployment_config` block (no Docker / hyperscaler)
+#
+# WHAT ZERO-CODE CAPSTONES DO INSTEAD:
+# - Learner pastes a markdown/plaintext doc (prompt template library, workflow map,
+#   audit checklist) into a textarea
+# - Backend grades via LLM rubric (validation.rubric present → _validate_system_build
+#   dispatches to the rubric grader, same path as non-engineering branch)
+#
+# Extensible: add a marker to _ZERO_CODE_MARKERS and every future course that matches
+# inherits the entire guard-rail set.
+_ZERO_CODE_MARKERS: tuple[str, ...] = (
+    "no code", "no-code", "zero code", "zero-code",
+    "non-coder", "non coder", "without code", "without coding",
+    "browser-only", "browser only", "claude.ai browser", "claude via the browser",
+    "no cli", "no terminal", "no api keys", "no install", "no git",
+    "prompt workflow", "prompt template", "prompt library",
+    "no code/no cli", "no code / no cli",
+    # Audience signals — non-coder professionals
+    "pm", "product manager", "ops lead", "cs lead", "csm", "customer success",
+    "marketer", "people ops", "legal", "finance analyst", "recruiter",
+)
+
+
+def _is_zero_code_course(
+    title: str = "",
+    description: str = "",
+    source_material: str = "",
+    tags: list | tuple | None = None,
+) -> bool:
+    """Return True when the course explicitly targets a non-coder audience or
+    explicitly promises no code / CLI / git / deploy.
+
+    STRONG signals (any one flips): "no code", "non-coder", "browser-only",
+    "prompt workflow", "claude.ai browser" in title/description/source_material.
+
+    SOFTER audience signals ("PM", "product manager", "CSM") only flip when
+    COMBINED with a pedagogy signal ("prompt", "workflow", "template") in the
+    same blob — a FastAPI-for-PMs course is still a code course.
+    """
+    blob = f"{title}\n{description}\n{source_material}".lower()
+    if tags:
+        try:
+            blob += "\n" + " ".join(str(t).lower() for t in tags)
+        except Exception:
+            pass
+
+    # STRONG markers — any of these alone is enough
+    strong = (
+        "no code", "no-code", "zero code", "zero-code",
+        "non-coder", "non coder", "without code", "without coding",
+        "browser-only", "browser only", "claude.ai browser",
+        "claude via the browser", "no cli", "no terminal",
+        "no api keys, no terminal", "prompt template", "prompt library",
+        "prompt workflow",
+    )
+    if any(m in blob for m in strong):
+        return True
+
+    # AUDIENCE + PEDAGOGY combo — audience alone is not enough (a FastAPI course
+    # for PMs is still code), but audience + prompt/workflow/template content is.
+    audience = (
+        "product manager", "pm / ops", "pm/ops", "pms / ops", "pms/ops",
+        "ops lead", "csm", "customer success", "people ops",
+        "non-tech professional", "non tech professional",
+    )
+    pedagogy = ("prompt", "workflow", "template", "claude.ai", "inbox")
+    if any(a in blob for a in audience) and any(p in blob for p in pedagogy):
+        return True
+
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -3867,6 +4867,44 @@ def _enforce_exercise_type_fit(outline: dict, title: str, description: str = "",
     return outline
 
 
+def _track_proposer_llm_call(system_prompt: str, user_prompt: str) -> dict | None:
+    """Adapter between backend.ontology.propose_track_via_llm and our
+    `_llm_json_call` — keeps ontology.py pure of LLM dependencies while
+    letting it call our Anthropic client via dependency injection.
+
+    Called only during outline refinement when `SLL_USE_TRACK_ONTOLOGY=1`
+    AND detect_track found no signal match. Cheap (~500 tokens).
+    """
+    try:
+        return _llm_json_call(system_prompt, user_prompt, max_tokens=1500)
+    except Exception:
+        logger.exception("track proposer LLM call failed")
+        return None
+
+
+def _resolve_track_for_course(
+    title: str, description: str, explicit_track_id: str | None = None,
+):
+    """Thin wrapper around ontology.detect_or_propose_track that injects our
+    LLM adapter. Returns (track, source) where source is 'explicit' / 'signal'
+    / 'proposed' / 'fallback'. Used at outline-refine time."""
+    from backend.ontology import detect_or_propose_track
+    return detect_or_propose_track(
+        title,
+        description,
+        explicit_track_id=explicit_track_id,
+        llm_call=_track_proposer_llm_call,
+        allow_propose=True,
+    )
+
+
+def _track_ontology_enabled() -> bool:
+    """Feature flag for the v8 track-progression contract. Default OFF until
+    Phase D smoke-test validates the full path. Enable via env var
+    `SLL_USE_TRACK_ONTOLOGY=1`."""
+    return os.environ.get("SLL_USE_TRACK_ONTOLOGY", "0").strip() in ("1", "true", "yes", "on")
+
+
 def _llm_refined_outline(
     title: str,
     description: str,
@@ -3875,14 +4913,87 @@ def _llm_refined_outline(
     answers: list[dict],
     feedback: str = "",
     source_material: str = "",
+    track_id: str | None = None,
 ) -> dict | None:
-    """Generate detailed outline with steps and exercise types via LLM."""
+    """Generate detailed outline with steps and exercise types via LLM.
+
+    2026-04-22 v8: when SLL_USE_TRACK_ONTOLOGY is enabled, the subject
+    guidance + CODE-WRITING BACKBONE hard-coded sections below are REPLACED
+    with a track-progression brief assembled from the ontology registry.
+    Falls back to the old heuristic path when the flag is off, so every
+    existing course regeneration stays byte-compatible.
+    """
     answers_text = "\n".join(f"- Q: {a.get('question', a.get('question_id'))}\n  A: {a.get('answer')}" for a in answers)
 
-    is_non_eng = _is_non_engineering_subject(title, description, course_type)
-    subject_guidance = ""
-    if is_non_eng:
-        subject_guidance = """
+    # ── v8 TRACK-ONTOLOGY PATH (flag-gated) ───────────────────────────────
+    _track = None
+    _track_source = None
+    if _track_ontology_enabled():
+        try:
+            from backend.ontology import build_track_progression_brief
+            _track, _track_source = _resolve_track_for_course(
+                title, description, explicit_track_id=track_id,
+            )
+            logger.info(
+                "track resolved: id=%s source=%s title=%r",
+                _track.id, _track_source, title[:80],
+            )
+            subject_guidance = (
+                "\n"
+                "TRACK-BASED PEDAGOGICAL CONTRACT (authoritative for this course):\n"
+                f"(source: {_track_source})\n\n"
+                + build_track_progression_brief(_track)
+                + "\n\nOverride for the old heuristic guidance: use ONLY the "
+                "exercise types listed in the tier progression above. Tier and "
+                "type coverage rules are enforced — an outline that skips a "
+                "tier or omits a declared type will be regenerated."
+            )
+        except Exception:
+            logger.exception("track resolution failed — falling back to heuristic path")
+            _track = None
+            _track_source = None
+
+    # Defaults (overridden in the legacy path below). Track path bypasses
+    # is_cli_tool / is_non_eng heuristics entirely — the track contract is
+    # authoritative. These defaults keep the downstream f-string + critic
+    # pass from NameError when track is used.
+    is_non_eng = False
+    is_cli_tool = False
+
+    # ── LEGACY HEURISTIC PATH (when flag off OR track resolution failed) ──
+    if _track is None:
+        is_non_eng = _is_non_engineering_subject(title, description, course_type)
+        is_cli_tool = _is_cli_tool_subject(title, description)
+        subject_guidance = ""
+        if is_cli_tool:
+            # 2026-04-22 v8: CLI-tool courses — EVERY hands-on step is `terminal_exercise`.
+            subject_guidance = """
+THIS IS A CLI-TOOL / TERMINAL-SKILL COURSE. The learner's skill lives on their
+OWN MACHINE running commands. They run commands in their terminal and paste the
+output back into the browser.
+
+HARD RULES:
+- EVERY hands-on step MUST be `terminal_exercise` — NOT `code_exercise`, NOT
+  `fill_in_blank`, NOT `parsons`, NOT `system_build`. The `terminal_exercise`
+  template shows the commands + a paste box + an LLM-graded rubric.
+- NEVER emit a step that asks the learner to write Python / Go / JS "to use
+  this tool" — the whole point is that they USE THE TOOL'S CLI, not code
+  around it.
+- We NEVER collect API keys. The BYO-key panel is informational only. Do NOT
+  write a step that says "paste your ANTHROPIC_API_KEY here". Learners
+  authenticate on their own machine (`claude /login` or env var).
+- Platform-aware installs: early steps must include macOS / Linux / Windows+WSL
+  variants side-by-side (the terminal_exercise template renders these).
+- Capstone remains a `terminal_exercise` — something real like "author a custom
+  slash command + register an MCP server + use it end-to-end", graded on the
+  paste showing a successful run.
+- Concept steps (1-2 per module) stay `concept` for teaching narrative.
+- Code-writing backbone rule IS INVERTED: at least 60% of non-concept steps
+  must be `terminal_exercise` (not code_exercise) — running commands is THE
+  skill we're teaching.
+"""
+        elif is_non_eng:
+            subject_guidance = """
 THIS IS A NON-ENGINEERING COURSE (research/design/business/leadership/writing/negotiation/etc).
 STRICT RULES:
 - DO NOT use `code_exercise`, `fill_in_blank`, `parsons`, or `code` — these require Python and are inappropriate.
@@ -3890,8 +5001,8 @@ STRICT RULES:
 - You MAY use `code_review` but re-interpret it as "document review" — the learner critiques a non-code artifact (research plan, contract, letter, spec).
 - Capstone should be a comprehensive `scenario_branch` or `system_build` where the deliverable is a document/strategy, not a deployed API.
 """
-    else:
-        subject_guidance = "This is an engineering course — use code_exercise/fill_in_blank/parsons/system_build freely."
+        else:
+            subject_guidance = "This is an engineering course — use code_exercise/fill_in_blank/parsons/system_build freely."
 
     primer = _topic_primer(title, description)
     tier = _pick_depth_tier(title, description)
@@ -3993,26 +5104,84 @@ REQUIREMENTS (ontology-driven — do NOT add types outside the registry above):
 - {shape_cap}
 - IF a DOMAIN PRIMER is present above, you MUST produce at least one module per required surface it names. Primer surfaces are non-negotiable.
 
-CODE-WRITING BACKBONE (non-negotiable for `course_type == "technical"`):
+{"" if (is_cli_tool or _track is not None) else f'''CODE-WRITING BACKBONE (non-negotiable for `course_type == "technical"`):
 - The registry-declared code-writing assignment types are: {_code_assignment_list}. Prefer these over {', '.join(sorted(_non_code_ids))} for hands-on programming courses.
 - AT LEAST 40% of non-concept steps MUST be `code_exercise` (or another `is_code_assignment=True` type from the registry) — real write-it-yourself coding. `code_review` is READ-ONLY bug-finding and does NOT count toward the code-writing backbone.
 - For deep_dive technical courses: at least 6 code-writing steps across the course, at least 1 per module that touches hardware/infrastructure/API/data code.
 - DO NOT default to scenario_branch / categorization / ordering for technical topics just because they're easier to author. Those are ancillary.
-- Capstone for technical-mastery MUST have at least one real-attestation primitive in its validation ({{gha_workflow_check, endpoint_check, state_assertion, artifact_flag}}) — NOT a checkbox attestation list."""
+- Capstone for technical-mastery MUST have at least one real-attestation primitive in its validation ({{gha_workflow_check, endpoint_check, state_assertion, artifact_flag}}) — NOT a checkbox attestation list.'''}"""
 
     # Critical step for Creator quality — use Opus 4.7 here (Sonnet consistently
     # underweighted the code_exercise-count floor for tech-mastery topics across
     # Aarav/Sophia/Tomás v1-v3 iterations).
-    result = _llm_json_call(CREATOR_SYSTEM_PROMPT, prompt, max_tokens=4000, model=_OUTLINE_MODEL)
+    # 2026-04-23: bumped 4000 → 8000 tokens. v8 track-ontology outlines
+    # explicitly emit every declared exercise type (often 8-10 types across
+    # 4-9 modules) — the JSON gets long enough that 4000 truncates the
+    # response mid-structure. Phase D smoke-test exhibit: PM course got
+    # `Unterminated string starting at line 220 column 20 (char 11158)`.
+    # 8000 comfortably accommodates the ~12K-char outlines we see at the
+    # high end.
+    result = _llm_json_call(CREATOR_SYSTEM_PROMPT, prompt, max_tokens=8000, model=_OUTLINE_MODEL)
     if result:
-        # Enforce exercise-type-subject fit (remap code_exercise→scenario_branch for non-eng courses, etc.)
-        result = _enforce_exercise_type_fit(result, title, description, course_type)
-        # Multi-pass critic: if tech-mastery course has too few code_exercise steps,
-        # ask the LLM to rewrite some scenario_branch/ordering steps as code_exercise.
-        # Even Opus 4.7 systematically underdelivered on the 40% floor — prompt engineering
-        # alone couldn't break through. Adding a dedicated second-pass "critic" fixes it.
-        if course_type == "technical" and not is_non_eng:
-            result = _outline_critic_pass(result, title, description, course_type)
+        if _track is not None:
+            # v8 track-ontology path — the track contract IS the quality gate.
+            # Skip the legacy _enforce_exercise_type_fit (remaps types based on
+            # non-eng substring heuristic, not needed when we have a hard
+            # type allow-list from the track) and _outline_critic_pass (pushes
+            # toward code_exercise, would override our track's T4 choice).
+            #
+            # Instead: validate the outline against the track. If violations,
+            # re-prompt ONCE with the specific violation list so the LLM can
+            # fix targeted issues rather than redo the whole outline.
+            try:
+                from backend.ontology import validate_outline_against_track
+                ok, violations = validate_outline_against_track(result, _track)
+                if not ok:
+                    logger.warning(
+                        "track validation failed (track=%s, %d violations) — retrying outline",
+                        _track.id, len(violations),
+                    )
+                    # Single targeted retry: feed violations back to the LLM.
+                    fix_prompt = (
+                        prompt
+                        + "\n\nYour previous outline FAILED the track's "
+                        "pedagogical contract. Fix these specific violations:\n"
+                        + "\n".join(f"  - {v}" for v in violations)
+                        + "\n\nReturn the corrected full outline JSON. The track "
+                        "contract is non-negotiable."
+                    )
+                    fix_result = _llm_json_call(
+                        CREATOR_SYSTEM_PROMPT, fix_prompt,
+                        max_tokens=8000, model=_OUTLINE_MODEL,
+                    )
+                    if fix_result:
+                        ok2, violations2 = validate_outline_against_track(fix_result, _track)
+                        if ok2:
+                            logger.info("track validation passed after retry (track=%s)", _track.id)
+                            result = fix_result
+                        else:
+                            logger.warning(
+                                "track validation still failing after retry (track=%s, %d violations). "
+                                "Proceeding with best-effort outline; _is_complete will surface remaining gaps.",
+                                _track.id, len(violations2),
+                            )
+                            # Return the fix attempt — downstream _is_complete
+                            # will catch lingering issues on per-step basis.
+                            result = fix_result
+                else:
+                    logger.info("track validation passed first try (track=%s)", _track.id)
+            except Exception:
+                logger.exception("track validation errored — shipping outline as-is")
+        else:
+            # Legacy path.
+            result = _enforce_exercise_type_fit(result, title, description, course_type)
+            if course_type == "technical" and not is_non_eng and not is_cli_tool:
+                # 2026-04-22 v8: skip the code_exercise-floor critic pass for CLI-tool
+                # courses. For Claude Code / kubectl / etc, the primary hands-on type
+                # is terminal_exercise, not code_exercise. Running the critic would
+                # push us back toward code_exercise and undo the subject_guidance
+                # steering above.
+                result = _outline_critic_pass(result, title, description, course_type)
     return result
 
 
@@ -4595,7 +5764,21 @@ def _critic_code_exercise(content_obj: dict, llm_json_call=None) -> dict:
     if not isinstance(content_obj, dict):
         return content_obj or {}
     code = (content_obj.get("code") or "").strip()
-    val = content_obj.get("validation") or {}
+    # v8.6 (2026-04-24) — defensive: `validation` occasionally arrives as
+    # a stringified JSON from tool-use despite schema enforcement. Handle
+    # both dict and str cleanly (don't crash the critic).
+    _val_raw = content_obj.get("validation")
+    if isinstance(_val_raw, dict):
+        val = _val_raw
+    elif isinstance(_val_raw, str):
+        try:
+            import json as _json_cri
+            _parsed = _json_cri.loads(_val_raw)
+            val = _parsed if isinstance(_parsed, dict) else {}
+        except Exception:
+            val = {}
+    else:
+        val = {}
     must_contain = val.get("must_contain") or []
     if not code or not isinstance(must_contain, list) or not must_contain:
         return content_obj
@@ -4751,6 +5934,1646 @@ def _extract_canonical_entities(source_text: str) -> list[str]:
     return sorted(entities, key=lambda e: (-len(e), e))[:60]
 
 
+# ═══════════════════════════════════════════════════════════════════════════
+# RUNTIME-DEPS BRIEF (2026-04-23 v8.2) — pinned library versions per runtime
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Policy lives in CLAUDE.md §RUNTIME-DEPS BRIEF. TL;DR: whenever we ask
+# Claude to write code_exercise solution + tests, we MUST tell it what
+# libraries + versions are actually available in the Docker runner image.
+# Otherwise the LLM writes plausible modern-TS/modern-Rust/etc. code that
+# targets versions we don't ship → compile errors, transform errors,
+# import-not-found errors — all of which the LLM can't fix because the
+# mismatch is environmental.
+#
+# When bumping a version in an sll-*-runner Dockerfile, ALSO bump the
+# matching entry here. Mismatch = future wasted retry budget.
+
+_RUNTIME_DEPS_BY_LANG: dict[str, str] = {
+    "python": """RUNTIME ENVIRONMENT (Python) — your solution + tests run under:
+  - Python 3.11 (slim), Alpine-free
+  - pytest 8.3.4 + pytest-asyncio 0.25.0 + pytest-mock 3.14.0 + pytest-json-report 1.5.0
+    (pre-installed in the Docker image — do NOT pin these in your requirements.txt)
+  - Available stdlib: full 3.11 stdlib (asyncio, dataclasses, typing, etc.)
+  - Available 3rd-party libs (baked into sll-python-runner, import freely, do NOT
+    re-pin in requirements.txt unless your solution genuinely needs a different version):
+    pydantic 2.10.4, pydantic-settings 2.7.0, fastapi 0.115.6, uvicorn 0.34.0,
+    httpx 0.28.1 (incl. AsyncClient + ASGITransport), requests, anyio,
+    tenacity 9.0.0, orjson 3.10.12, numpy 2.2.1, pandas 2.2.3,
+    hypothesis 6.122.3, freezegun 1.5.1,
+    sqlalchemy 2.0.36, alembic 1.14.0, aiosqlite 0.20.0, asyncpg 0.30.0,
+    aiofiles 24.1.0, aiohttp 3.11.11, redis 5.2.1,
+    passlib 1.7.4, bcrypt 4.2.1, pyjwt 2.10.1, python-multipart 0.0.20,
+    psycopg2-binary 2.9.10, slowapi 0.1.9, strawberry-graphql 0.256.0,
+    confluent-kafka 2.6.1, opentelemetry-* 1.29.0
+  - NOT available: django, flask (unless explicitly imported via requirements),
+    anthropic SDK (tests must not call real LLM APIs), sqlmodel (use sqlalchemy 2 directly)
+
+⚠️  REQUIREMENTS.TXT RULES — CRITICAL (2026-04-23 v8.5 Phase 1):
+  - Only emit `validation.requirements` if your solution needs a package NOT in
+    the baked list above. For FastAPI/Pydantic/SQLAlchemy/asyncpg/alembic/etc.,
+    leave `requirements` EMPTY — the image already has them.
+  - NEVER pin `pytest`, `pytest-asyncio`, `pytest-mock`, `pytest-json-report` in
+    requirements.txt. The image ships them at specific versions; re-pinning causes
+    pip to resolve a new dep graph that can break the pytest binary (`sh: 1: pytest:
+    not found` — we've seen this three times). The grader auto-reinstalls pytest
+    after your requirements.txt anyway, but avoiding the conflict is cheaper.
+  - NEVER pin `pydantic`, `sqlalchemy`, `fastapi` unless the solution genuinely
+    requires a different major version. The baked versions are production-tested.
+  - If your solution needs `pydantic-settings` with `.env` support: DON'T add
+    `pydantic-settings[dotenv]` — that extra doesn't exist. Just add `python-dotenv`
+    (already baked). Better yet: skip requirements.txt entirely.
+  - Format requirements.txt as one package per line. NO comments, NO `-r` includes,
+    NO `-e` editable installs, NO `--index-url` overrides, NO `--extra-index-url`.
+
+FILE LAYOUT (exactly what runs):
+  /app/solution.py          ← YOUR ENTIRE SOLUTION GOES HERE (single file, self-contained)
+  /app/tests/__init__.py    ← empty
+  /app/tests/test_solution.py ← YOUR ENTIRE TEST SUITE GOES HERE (single file)
+  /app/conftest.py          ← auto-injected: `sys.path.insert(0, os.path.dirname(__file__))`
+                              so `from solution import foo` works.
+  /app/requirements.txt     ← optional pip deps (most cases: leave empty)
+
+🚨 MANDATORY SOLUTION SKELETON — single file, self-contained. DO NOT SPLIT ACROSS FILES.
+
+The grader loads ONLY /app/solution.py. It does NOT load models.py / schemas.py /
+repository.py / services.py / routers.py / db.py / auth.py / config.py / anything.
+If you `from models import X`, the test will error with `ModuleNotFoundError: No
+module named 'models'` and the step fails immediately. This is a GRADING CONSTRAINT,
+not a code-quality choice — yes, splitting into modules is idiomatic FastAPI, but
+for grading we need ONE file. Inline every class into solution.py.
+
+Your emitted `code` field for a FastAPI-style exercise should look like this shape:
+
+    # solution.py — everything inline, NO local imports
+    from __future__ import annotations
+    from enum import Enum
+    from datetime import datetime
+    from typing import Optional, List
+    from pydantic import BaseModel, Field, field_validator  # baked lib — OK
+    from sqlalchemy import select, String                    # baked lib — OK
+    from sqlalchemy.ext.asyncio import AsyncSession          # baked lib — OK
+    from sqlalchemy.orm import Mapped, mapped_column, DeclarativeBase
+    from fastapi import FastAPI, Depends, HTTPException, status
+    from httpx import AsyncClient  # baked lib — OK
+
+    # Enums — inline
+    class TaskStatus(str, Enum):
+        PENDING = "pending"
+        DONE = "done"
+
+    # Pydantic schemas — inline
+    class TaskCreate(BaseModel):
+        title: str
+        status: TaskStatus = TaskStatus.PENDING
+
+    class TaskRead(TaskCreate):
+        id: int
+
+    # SQLAlchemy model — inline
+    class Base(DeclarativeBase): pass
+    class TaskORM(Base):
+        __tablename__ = "tasks"
+        id: Mapped[int] = mapped_column(primary_key=True)
+        title: Mapped[str] = mapped_column(String(200))
+
+    # Custom exception — inline
+    class TaskNotFound(Exception): ...
+
+    # Repository — inline
+    class TaskRepository:
+        def __init__(self, session: AsyncSession): self.session = session
+        async def create(self, data: TaskCreate) -> TaskRead: ...
+        async def get_by_id(self, id: int) -> TaskRead: ...
+        # ...rest of the methods
+
+    # FastAPI app — inline (if the exercise asks for an endpoint)
+    app = FastAPI()
+    @app.post("/tasks", response_model=TaskRead)
+    async def create_task(...): ...
+
+    # NO `from models import ...`     ← NEVER
+    # NO `from schemas import ...`    ← NEVER
+    # NO `from repository import ...` ← NEVER
+    # NO `from services import ...`   ← NEVER
+
+Your emitted `validation.hidden_tests` imports from SOLUTION, nothing else:
+
+    # tests/test_solution.py
+    import pytest
+    from solution import TaskRepository, TaskCreate, TaskRead, TaskStatus, TaskNotFound
+    #                    ^^^^^^^^^^ all names MUST live in solution.py
+
+    @pytest.mark.asyncio
+    async def test_create(...): ...
+
+TEST COMMAND (exactly what the grader runs via /opt/harness-venv/bin/pytest):
+  PYTEST_DISABLE_PLUGIN_AUTOLOAD=1 /opt/harness-venv/bin/pytest tests/ -q --tb=short \
+    -p pytest_asyncio.plugin -p pytest_mock --asyncio-mode=auto --junitxml=/app/_junit.xml
+
+GRADER PARSES: JUnit XML attrs on <testsuite>: tests, failures, errors, skipped.
+  passed = tests - failures - errors - skipped
+  Course score = passed / total.
+
+CRITICAL:
+  - Hidden tests `from solution import <name>` — every name the tests import
+    MUST exist in solution.py (as function or class) or the test file won't
+    collect at all (pytest ImportError → 0/0 → treated as failure).
+  - For FastAPI endpoints: use `httpx.AsyncClient(app=app, base_url='http://test')`
+    pattern with `@pytest_asyncio.fixture` and `@pytest.mark.asyncio`. Don't
+    use `TestClient` (sync) — our pytest-asyncio config is async-only.
+  - No f-string debug syntax (`f"{x=}"`) — keep tests readable in 3.11.
+
+PYDANTIC 2.x MIGRATION (these have bit courses repeatedly):
+  - `BaseSettings` moved to a SEPARATE package. Use:
+      `from pydantic_settings import BaseSettings, SettingsConfigDict`
+    NOT `from pydantic import BaseSettings` (raises PydanticImportError).
+  - Config class replaced by `model_config = SettingsConfigDict(env_file='.env', ...)`.
+  - `.dict()` → `.model_dump()`; `.json()` → `.model_dump_json()`; `parse_obj` → `model_validate`.
+  - `@validator` → `@field_validator` (class-method style, different signature).
+  - `Config.env_prefix` → `SettingsConfigDict(env_prefix=...)`.
+  - DO NOT use `pydantic[dotenv]` extra — it doesn't exist in 2.x. python-dotenv
+    is a separate package we already have.
+
+SQLALCHEMY 2.x MIGRATION:
+  - Use `Mapped[T]` + `mapped_column(...)` for columns; NOT legacy `Column(...)`.
+  - `Session.query(...)` → `session.execute(select(...)).scalar_one()` etc.
+  - async_sessionmaker + AsyncSession — `await session.execute(...)` always.
+  - In tests, use an in-memory SQLite URL for speed:
+    `engine = create_async_engine("sqlite+aiosqlite:///:memory:")`.
+
+FASTAPI TEST PATTERN (copy-paste-ready):
+    import pytest_asyncio, pytest
+    from httpx import AsyncClient, ASGITransport
+    from solution import app
+
+    @pytest_asyncio.fixture
+    async def client():
+        async with AsyncClient(transport=ASGITransport(app=app), base_url="http://test") as c:
+            yield c
+
+    @pytest.mark.asyncio
+    async def test_foo(client):
+        r = await client.get("/foo")
+        assert r.status_code == 200""",
+
+    "py": "",  # aliased — filled below
+
+    "javascript": """RUNTIME ENVIRONMENT (JavaScript) — your solution + tests run under:
+  - Node 20 (slim)
+  - jest 29.7.0 (preinstalled in sll-node-runner)
+  - Available libs: zod 3.24.1, express 4.21.2, supertest 7.0.0, axios 1.7.9,
+    node-fetch 3.3.2, bcrypt 5.1.1, jsonwebtoken 9.0.2, pg 8.13.1, redis 4.7.0, rxjs 7.8.1
+  - NOT available: vitest, mocha, chai, puppeteer, playwright, @nestjs/*,
+    react (browser-only), any package not listed above
+  - Test runner invoked as: `jest --ci --json --outputFile=/app/_jest.json`
+  - DO NOT emit `import` statements for packages not in the list above.
+  - Use CommonJS require() OR ES module import — jest is configured for both.""",
+
+    "js": "",  # aliased
+
+    "typescript": """RUNTIME ENVIRONMENT (TypeScript) — your solution + tests run under:
+  - Node 20 (slim)
+  - TypeScript 5.7.2 (via ts-jest 29.2.5)
+  - jest 29.7.0
+  - Types: @types/node 22.10.2, @types/jest 29.5.14, @types/express 5.0.0,
+    @types/supertest 6.0.2, @types/jsonwebtoken 9.0.7, @types/pg 8.11.10
+  - Runtime libs: zod 3.24.1, express 4.21.2, supertest 7.0.0,
+    axios 1.7.9, bcrypt 5.1.1, jsonwebtoken 9.0.2, pg 8.13.1, redis 4.7.0, rxjs 7.8.1
+  - NOT available: vitest, mocha, chai, puppeteer, playwright, @nestjs/*,
+    tRPC, drizzle, prisma, typeorm — DO NOT import them.
+
+FILE LAYOUT (exactly what runs — FLAT layout, both files at /app root):
+  /app/solution.ts            ← YOUR ENTIRE SOLUTION (single file, self-contained)
+  /app/solution.test.ts       ← YOUR ENTIRE TEST SUITE (single file, SAME DIRECTORY as solution.ts)
+  /runner/jest.config.js      ← auto-used by grader (you CANNOT override)
+  /runner/tsconfig.json       ← auto-used by ts-jest (you CANNOT override)
+  /runner/node_modules        ← baked: jest, ts-jest, @types/jest, @types/node
+  /app/node_modules           ← LLM-emitted deps (isolated from /runner)
+
+🚨 IMPORT PATH — CRITICAL, read carefully:
+
+Tests live at `/app/solution.test.ts` — SAME DIRECTORY as solution.ts. Therefore
+the import statement in the test file MUST be:
+
+    import { fetchJson, NetworkError, ... } from "./solution";     // ✅ CORRECT
+
+NOT any of:
+
+    import { ... } from "../solution";    // ❌ WRONG — tests are NOT in /app/tests/, there is no parent dir to traverse up from
+    import { ... } from "../../solution"; // ❌ WRONG
+    import { ... } from "solution";       // ❌ WRONG — bare specifier treated as npm package
+
+The runner writes both files at /app/ root (FLAT), not /app/tests/*.ts.
+`from "../solution"` produces `TS2307: Cannot find module '../solution'`
+because there is no parent-directory solution.ts to resolve to.
+
+🚨 MANDATORY SOLUTION SKELETON — single file, self-contained.
+
+The grader loads ONLY /app/solution.ts. Tests import from './solution' (same dir).
+Do NOT split into `./models.ts`, `./repository.ts`, `./services.ts`, etc. —
+those imports will fail with "Cannot find module" and the step errors out.
+Inline EVERY type, class, function, and constant into solution.ts.
+
+Your emitted `code` field shape:
+
+    // solution.ts — everything inline, NO local relative imports beyond std libs
+    import { z } from "zod";                              // baked — OK
+    import express, { Request, Response } from "express"; // baked — OK
+    import jwt from "jsonwebtoken";                        // baked — OK
+
+    // Types — inline
+    export type TaskStatus = "pending" | "done";
+
+    // Zod schemas — inline
+    export const TaskCreate = z.object({ title: z.string(), status: z.enum(["pending", "done"]) });
+    export type TaskCreate = z.infer<typeof TaskCreate>;
+
+    // Classes — inline
+    export class TaskRepository { /* ... */ }
+    export class TaskNotFound extends Error {}
+
+    // Handlers / app — inline (if needed)
+    export function createApp(): express.Express { /* ... */ }
+
+    // NO `import { Foo } from "./models";`     ← NEVER
+    // NO `import { Foo } from "./repository";` ← NEVER
+    // NO `import { Foo } from "./schemas";`    ← NEVER
+
+🚨 EXPORT STYLE — NAMED EXPORTS ONLY. NO `export default`.
+
+Tests import `{ TaskRepository }` (named), not `import Repository from ...` (default).
+If you `export default class X`, the test's `import { X } from './solution'` fails
+with "Cannot find name 'X'". Every class / function / const / type the tests touch
+MUST use `export class Foo`, `export function foo`, `export const foo`, etc.
+Using `export default` is a guaranteed compile error.
+
+Your emitted `validation.hidden_tests` imports from './solution' (SAME DIR, flat layout):
+
+    // solution.test.ts — LIVES AT /app/solution.test.ts, NOT /app/tests/
+    import { TaskRepository, TaskCreate, TaskNotFound } from "./solution";
+    //         ^^^^^^^^^^^^^^ ^^^^^^^^^^  ^^^^^^^^^^^^ all NAMED, never default
+    //                                                  path is "./solution" — same dir
+
+    test("creates task", () => { /* ... */ });
+
+TEST COMMAND (exactly what the grader runs via /runner/node_modules/.bin/jest):
+  NODE_PATH=/app/node_modules:/runner/node_modules \
+  /runner/node_modules/.bin/jest --config=/runner/jest.config.js --rootDir=/app \
+    --ci --json --outputFile=/app/_jest.json
+
+GRADER PARSES: /app/_jest.json → numPassedTests, numFailedTests, numTotalTests.
+
+CRITICAL (these are the exact failure classes we see repeatedly):
+  1. Module-resolution: tests use `import { foo } from './solution'` — solution.ts
+     MUST `export function foo(...)` or `export { foo }` — NEVER `module.exports`
+     or `export default` (ts-jest CommonJS output collides with import pattern).
+  2. TS2440 "Import declaration conflicts with local declaration of 'X'":
+     the test file imports X but ALSO defines its own X (type or const). Fix:
+     only import from solution, don't redeclare.
+  3. Discriminated unions: if the test expects `{type: 'a' | 'b'}`, the
+     solution MUST use `as const` OR explicit literal types in the return
+     type annotation. Otherwise TS widens to `string` and assignment to the
+     literal-typed test expectation fails.
+  4. Async: jest 29.7 handles `async () => { ... expect(await fn()) }` natively.
+     No `--experimental-vm-modules`. No `mock` API — use `jest.fn()` only.
+  5. Test file must be runnable in CommonJS — NO `top-level await`, NO
+     `import.meta`, NO `.mjs` extensions.
+
+🛡️ MANDATORY — Result<T,E> / discriminated-union narrowing helpers
+(v8.6.1, post buddy-Opus consult #10, 2026-04-24)
+
+When your solution returns a discriminated union like
+`Result<T, E> = {ok: true, data: T} | {ok: false, error: E}` (or any
+similar tagged union), direct `.error` / `.data` access in tests fails
+with TS2339 because TypeScript can't narrow the union without a guard.
+The historical failure mode is the LLM writing:
+
+    const result = await fetchJson(url, schema);
+    expect(result.error.type).toBe('parse');     // TS2339 — no narrow
+
+instead of:
+
+    const result = await fetchJson(url, schema);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {                             // ← narrow
+      expect(result.error.type).toBe('parse');
+    }
+
+To architecturally neutralize this attractor, YOUR STARTER CODE
+(`code` field) MUST include these two helpers, and your hidden_tests
+MUST import + use them instead of writing narrowing by hand.
+
+COPY THIS HELPER IMPLEMENTATION VERBATIM (do not rewrite — the type
+predicate + fail-then-narrow pattern is the ONLY reliable way to
+narrow a generic Result<T,E> under ts-jest's non-strict tsconfig):
+
+    // ── in solution.ts starter (keep these IMPLEMENTED, not TODO) ──
+
+    // Type predicate — tells TS that `r is Ok<T>` when it returns true.
+    // Required because ts-jest runs with `strict: false`, which weakens
+    // discriminated-union narrowing on generic parameters.
+    export function isResultOk<T, E>(r: Result<T, E>): r is { ok: true; data: T } {
+      return r.ok;
+    }
+
+    export function expectOk<T, E>(
+      r: Result<T, E>,
+      check: (d: T) => void,
+    ): void {
+      expect(r.ok).toBe(true);
+      if (!isResultOk(r)) {
+        throw new Error(`expected ok Result, got err: ${JSON.stringify((r as any).error)}`);
+      }
+      // Inside this block TS knows r is {ok: true, data: T} via the predicate.
+      check(r.data);
+    }
+
+    export function expectErr<T, E>(
+      r: Result<T, E>,
+      check: (e: E) => void,
+    ): void {
+      expect(r.ok).toBe(false);
+      if (isResultOk(r)) {
+        throw new Error("expected err Result, got ok");
+      }
+      // After the predicate returned false, r is narrowed to the err branch.
+      // Safe cast is needed because TS predicate narrow is one-way (only narrows
+      // on `true` return, not `false`). Cast is grounded by the runtime check.
+      const errBranch = r as { ok: false; error: E };
+      check(errBranch.error);
+    }
+
+Then `hidden_tests` uses them like:
+
+    import { fetchJson, expectErr, expectOk, ParseError, ValidationError } from './solution';
+
+    test('parse error → ParseError', async () => {
+      const r = await fetchJson(url, schema);
+      expectErr(r, (err) => {
+        expect(err).toBeInstanceOf(ParseError);
+      });
+    });
+
+    test('happy path → parsed data', async () => {
+      const r = await fetchJson(url, UserSchema);
+      expectOk(r, (user) => {
+        expect(user.id).toBe(1);
+      });
+    });
+
+RULES (NON-NEGOTIABLE):
+1. `expectErr` / `expectOk` are part of the SOLUTION starter — implemented, not stubbed.
+2. The test file MUST import them from './solution' and use them for EVERY error/success assertion on a Result.
+3. Direct `result.error.X` / `result.data.X` in a test file is FORBIDDEN — will fail TS2339.
+4. ANY `as` cast on `.error` / `.data` to satisfy the compiler is a VIOLATION of this pattern.
+5. This applies to ALL discriminated-union return types, not just `Result<T,E>` specifically
+   (e.g. if your solution returns `{kind: 'ok', value} | {kind: 'err', error}`, emit
+   equivalent `expectKind*` helpers in starter and use them in tests).
+
+Why: the LLM (you) has strong training-data prior for unguarded `.error` access,
+and contrastive exemplars can't out-weight billions of tokens of prior. Encapsulating
+the narrow in a helper REMOVES the decision surface entirely. You write `expectErr(r, …)`,
+the helper does the narrow for you.""",
+
+    "ts": "",  # aliased
+
+    "go": """RUNTIME ENVIRONMENT (Go) — your solution + tests run under:
+  - Go 1.22 (alpine)
+  - stdlib only unless you emit a requirements file with go.mod + go.sum
+  - Test runner invoked as: `go test ./... -count=1 -json` (NDJSON events)
+  - Solution file: solution.go; test file: solution_test.go (SAME PACKAGE
+    — both `package main` or both a custom package; NOT `package solution_test`)
+  - **CRITICAL**: Go rejects unused imports + unused variables at compile time.
+    Every `import` MUST be referenced. Every declared `var` / `:=` MUST be used.
+  - **CRITICAL**: if tests use `fmt`, `errors`, `strings`, etc., the test file
+    must import them explicitly. Don't assume the solution's imports propagate.
+  - **CGO_ENABLED=0** — the runner image has CGO disabled for alpine-slim
+    compatibility. DO NOT use CGO-required packages:
+      ❌ `github.com/mattn/go-sqlite3`    (requires cgo)
+      ❌ `github.com/mattn/go-sqlite3/v3`  (requires cgo)
+      ❌ any package with `// #cgo` directives
+    USE PURE-GO ALTERNATIVES INSTEAD:
+      ✓ `modernc.org/sqlite`              (pure Go SQLite — drop-in for database/sql)
+      ✓ `github.com/glebarez/sqlite`       (wraps modernc/sqlite for gorm)
+      ✓ stdlib `crypto/*` packages         (not the cgo-backed `boring` variant)
+    If the learner's SCENARIO demands SQLite, emit:
+        import _ "modernc.org/sqlite"
+        db, err := sql.Open("sqlite", ":memory:")
+    (note the driver name is `sqlite`, NOT `sqlite3`).
+  - **GO VERSION PINNING** — the runner is Go 1.22.12. Some `golang.org/x/*`
+    modules recently bumped their min-Go version. If you emit go.mod with
+    these modules, PIN to an older version compatible with Go 1.22:
+      ❌ `golang.org/x/time v0.15.0`   (requires Go 1.25+)
+      ✓  `golang.org/x/time v0.7.0`    (compatible with Go 1.22)
+      ❌ `golang.org/x/sync v0.11.0`   (requires Go 1.25+)
+      ✓  `golang.org/x/sync v0.8.0`    (compatible with Go 1.22)
+      ❌ `golang.org/x/net  v0.30.0+`  (check min-Go)
+      ✓  `golang.org/x/net  v0.25.0`   (compatible with Go 1.22)
+    Go test runner invokes `go mod download` which fails with
+    "toolchain upgrade needed" when a dep requires a newer Go. The fix is
+    to PIN THE DEP VERSION, not to upgrade Go.""",
+
+    "golang": "",  # aliased
+
+    "rust": """RUNTIME ENVIRONMENT (Rust) — your solution + tests run under:
+  - Rust 1.75 (alpine, stable toolchain)
+  - Cargo 1.75 + stdlib
+  - Prewarmed crates (all available with NO additional Cargo.toml edits):
+    serde 1 (with derive feature), serde_json 1, anyhow 1, thiserror 1,
+    tokio 1 (macros + rt + time features)
+  - Solution file: src/lib.rs (library crate). Test file: tests/integration_test.rs.
+  - Test runner invoked as: `cargo test --no-fail-fast -- --test-threads=1`
+  - Cargo.toml is auto-generated by `cargo init --lib --name skillslab` if
+    missing. To add a crate, emit a Cargo.toml in your demo_data with:
+      [dependencies]
+      mycrate = "x.y"
+    but PREFER the prewarmed list for fast compiles (warm cache = 5-15s;
+    cold dep = 30-60s+).
+  - NOT available by default: diesel, sqlx, actix, rocket, tonic — emit a
+    Cargo.toml with the crate if needed, accepting slow compile.
+  - **CRITICAL**: `cargo test --format json` is nightly-only. We parse the
+    human summary. Ensure your tests produce a clean `test result: ok. N
+    passed; 0 failed;` line.""",
+
+    "rs": "",  # aliased
+
+    "sql": """RUNTIME ENVIRONMENT (SQL) — your solution runs under:
+  - SQLite (in-process, via aiosqlite)
+  - SQLite 3.40+ dialect
+  - Schema + seed rows come from step.demo_data.schema_setup + step.demo_data.seed_rows
+  - NOT available: Postgres/MySQL-specific features (WINDOW functions are OK,
+    but arrays, JSONB, LATERAL joins are not).""",
+
+    "yaml": """RUNTIME ENVIRONMENT (YAML) — your solution validates against:
+  - Optional JSON Schema in step.demo_data.yaml_schema
+  - Runtime: PyYAML safe_load + jsonschema validator""",
+
+    "dockerfile": """RUNTIME ENVIRONMENT (Dockerfile) — your solution is linted by:
+  - hadolint (if available) + a minimal Python parser for syntax.
+  - For deploy-attested capstones, use validation.gha_workflow_check (see CLAUDE.md §F24).""",
+
+    "shell": """RUNTIME ENVIRONMENT (shell / bash) — your solution is validated with:
+  - `bash -n` (syntax check; no execution)
+  - Expect standard coreutils (ls, grep, awk, sed, find, xargs).""",
+}
+
+# Fill aliases
+_RUNTIME_DEPS_BY_LANG["py"] = _RUNTIME_DEPS_BY_LANG["python"]
+_RUNTIME_DEPS_BY_LANG["js"] = _RUNTIME_DEPS_BY_LANG["javascript"]
+_RUNTIME_DEPS_BY_LANG["ts"] = _RUNTIME_DEPS_BY_LANG["typescript"]
+_RUNTIME_DEPS_BY_LANG["golang"] = _RUNTIME_DEPS_BY_LANG["go"]
+_RUNTIME_DEPS_BY_LANG["rs"] = _RUNTIME_DEPS_BY_LANG["rust"]
+
+
+# v8.6 (2026-04-24) — heuristic course-language detection. Root-cause of the
+# Python-in-TS-course bug: `course_context["language"]` was never populated,
+# so the LANGUAGE LOCK block + _runtime_deps_brief + GATE A all defaulted to
+# "python". This function detects from title + description (Creator input
+# always names the language in the title: "TypeScript v12:...", "Go Basics:...",
+# "Python Essentials:..."). Returns canonical language string or "" if nothing
+# clear. The canonical strings match _LANG_CONFIGS keys + LANGUAGE LOCK enum.
+_LANG_KEYWORDS = [
+    # Most-specific first (TypeScript contains "script" which javascript also has)
+    ("typescript", ["typescript", "ts+node", "ts course", "nodejs+ts", "tsx", "ts/node",
+                    "ts-jest", "ts 5", "typed.*javascript"]),
+    ("javascript", ["javascript", "js course", "js+node", "node.js only", "node\\.js",
+                    "vanilla js", "es2020", "es2022"]),
+    ("go",         ["golang", "go course", "go basics", "goroutine", "go 1.2",
+                    "go module", " go:", "gin framework"]),
+    ("rust",       ["rust ", "cargo", "rustc", "crates.io", "tokio", "rust course"]),
+    ("java",       ["java course", "java basics", "java 17", "java 21", "spring boot",
+                    "junit", "maven", "gradle", "kotlin/java"]),
+    ("python",     ["python", "pytest", "fastapi", "django", "flask", "pandas",
+                    "numpy", "asyncio", "pydantic", "sqlalchemy"]),
+]
+import re as _re_lang_det
+_LANG_REGEXES = [(lang, [_re_lang_det.compile(k, _re_lang_det.IGNORECASE) for k in kws])
+                 for lang, kws in _LANG_KEYWORDS]
+
+def _detect_course_language(title: str, description: str = "") -> str:
+    """Heuristic: infer the course's programming language from title+desc.
+
+    Returns canonical language string (matches _LANG_CONFIGS keys):
+    typescript | javascript | go | rust | java | python | ""
+
+    Returns "" when no clear signal — caller should NOT force-default to
+    python (that's what caused the bug we're fixing). Non-code courses
+    (leadership, sales, HR) legitimately return "" and should route to
+    non-code exercise types, not code_exercise.
+    """
+    if not title and not description:
+        return ""
+    text = (title + "\n" + (description or ""))
+    for lang, regexes in _LANG_REGEXES:
+        for rx in regexes:
+            if rx.search(text):
+                return lang
+    return ""
+
+
+# v8.6 (2026-04-24) — SHARED INVARIANT HELPER. Per user directive post-v14:
+# "don't duplicate code for step regen". Both the full course-gen retry loop
+# in `_creator_generate_impl` AND `per_step.regenerate_single_step` need the
+# same code_exercise invariant gate: Pydantic pre-gate → hidden_tests
+# presence → Docker solution/starter invariant → retry-feedback assembly
+# (head+tail stderr, stdout tail, harness_stripped, Phase D shape) → dump
+# to /tmp/retry_feedback/. Prior to this refactor per-step regen had NO
+# invariant at all — it shipped whatever the LLM returned.
+#
+# Returns (ok: bool, retry_reason: str). On ok=True, retry_reason is "".
+# On ok=False, retry_reason is the ready-to-inject retry prompt block.
+# Writes full retry feedback to /tmp/retry_feedback/<session_dir>/<step>_<ts>.txt.
+async def validate_code_exercise_invariant(
+    candidate: dict,
+    course_context: dict,
+    step_title: str,
+    session_id: str | None = None,
+    timeout_s: int = 90,
+) -> tuple[bool, str]:
+    """Shared invariant gate for code_exercise steps — callable from both
+    the full course-gen retry loop and per-step regen. Keeps pipelines in sync.
+    """
+    if not isinstance(candidate, dict):
+        return False, "candidate is not a dict"
+    # v8.6 (2026-04-24) DEFENSIVE COERCION — tool-use occasionally returns
+    # `validation` / `demo_data` as stringified JSON despite the top-level
+    # schema. _aggressive_coerce in _llm_tool_use_call catches most, but
+    # strings with leading prose or trailing noise slip through. At the gate
+    # entry, re-try json.loads on str inputs. If still not a dict, fail the
+    # gate with a specific reason so the LLM's retry prompt points at the
+    # actual issue (not "'str' object has no attribute 'get'").
+    def _coerce_dict(obj: Any, field_name: str) -> tuple[dict | None, str | None]:
+        if isinstance(obj, dict):
+            return obj, None
+        if obj in (None, "", 0):
+            return {}, None
+        if isinstance(obj, str):
+            try:
+                import json as _json_late
+                parsed = _json_late.loads(obj)
+                if isinstance(parsed, dict):
+                    return parsed, None
+            except Exception:
+                pass
+            return None, (
+                f"{field_name} was returned as a STRING instead of a JSON object. "
+                f"The tool_use schema requires {field_name} as a nested object. "
+                f"Do not stringify it. Got: {obj[:180]}..."
+            )
+        return None, f"{field_name} is type {type(obj).__name__}, expected object."
+    val, _err = _coerce_dict(candidate.get("validation"), "validation")
+    if _err:
+        # v8.6 (2026-04-24) — dump the whole candidate to see WHY tool-use
+        # returned non-dict validation. Most common hypothesis: the LLM
+        # emitted the fields at the TOP level (candidate.hidden_tests,
+        # candidate.solution_code) instead of inside `validation`.
+        try:
+            import json as _json_dbg
+            logging.warning(
+                "validate_code_exercise_invariant coerce_dict(validation) FAIL step=%r keys=%s "
+                "validation_type=%s validation_preview=%r",
+                step_title[:60],
+                list(candidate.keys())[:15],
+                type(candidate.get("validation")).__name__,
+                str(candidate.get("validation"))[:300],
+            )
+        except Exception:
+            pass
+        return False, _err
+    dd, _err = _coerce_dict(candidate.get("demo_data"), "demo_data")
+    if _err:
+        return False, _err
+
+    # Pydantic pre-gate (structural)
+    try:
+        from backend.schemas import CodeExerciseAssignmentModel as _CEM
+        from pydantic import ValidationError as _PVE
+        try:
+            _CEM.model_validate(candidate)
+        except _PVE as _pve:
+            _errs = _pve.errors()
+            _first = _errs[0] if _errs else {}
+            _field = ".".join(str(p) for p in _first.get("loc", []))
+            _msg = (_first.get("msg", str(_pve)) or "")[:200]
+            _input_snip = str(_first.get("input", ""))[:120]
+            reason = (
+                f"Pydantic pre-gate rejected: field `{_field}` — {_msg}. "
+                f"Received: `{_input_snip}`. Emit the correct TYPE for this field."
+            )
+            logging.warning("Pydantic pre-gate reject step=%r field=%s msg=%s", step_title[:60], _field, _msg)
+            return False, reason
+    except ImportError:
+        pass  # schema module absent — fall through
+
+    # Language resolution
+    lang = str(
+        dd.get("language") or val.get("language")
+        or (course_context or {}).get("language") or "python"
+    ).lower()
+
+    hidden_tests = val.get("hidden_tests")
+    solution_code = val.get("solution_code")
+    starter_code = candidate.get("code") or ""
+    requirements = val.get("requirements")
+
+    # Layer A presence
+    if lang in ("python", "py", "javascript", "js", "typescript", "ts", "go", "golang"):
+        if not hidden_tests:
+            return False, (
+                "validation.hidden_tests is missing or empty. Emit a real "
+                "pytest/jest/go-test source with >=4 tests that would reject "
+                "trivial-stub solutions (e.g. `return 0`, `return None`)."
+            )
+
+    # Docker invariant
+    try:
+        from backend.docker_runner import (
+            is_docker_available, _get_lang_config,
+            validate_solution_starter_invariant as _inv_fn,
+        )
+    except Exception as _imp_err:
+        logging.warning("docker_runner unavailable, skipping invariant: %s", _imp_err)
+        return True, ""  # soft-pass — no Docker = no gate
+    if not is_docker_available():
+        return True, ""  # soft-pass in local-dev
+    if not (hidden_tests and solution_code and lang in (
+        "python", "py", "javascript", "js", "typescript", "ts", "go", "golang",
+    )):
+        return True, ""  # not a Docker-gradable code_exercise
+
+    import asyncio as _asy
+    inv = await _asy.to_thread(
+        _inv_fn, starter_code, solution_code, hidden_tests, lang,
+        requirements=requirements, timeout_s=timeout_s,
+    )
+    if inv.get("ok"):
+        return True, ""
+
+    # Build retry feedback (raw passthrough — stderr head+tail, stdout tail,
+    # harness_stripped, Phase D shape). Same format as the full-course loop.
+    sol_result = inv.get("solution_result") or {}
+    sta_result = inv.get("starter_result") or {}
+    # v8.6.1 (2026-04-24) LANGUAGE-AGNOSTIC STARTER-PASSES DETECTION:
+    # When the invariant fails because the STARTER passed tests (not
+    # solution that failed), the raw solution stdout shows all tests
+    # PASSING + EXIT_CODE=0 — the LLM sees "success" and has no clue
+    # why this is rejected. Detect this class via inv.reason and
+    # SWAP the source: show the starter's output + a clear header.
+    _inv_reason = inv.get("reason") or ""
+    _starter_passed = "starter already passes" in _inv_reason.lower() or "starter passed" in _inv_reason.lower()
+    if _starter_passed:
+        # Swap: the starter is what failed the contract (it should have failed tests)
+        stdout_raw = sta_result.get("output") or ""
+        stderr_raw = sta_result.get("error") or ""
+    else:
+        stdout_raw = sol_result.get("output") or ""
+        stderr_raw = sol_result.get("error") or ""
+    stripped = sol_result.get("harness_stripped_entries") or []
+
+    # v8.6 (2026-04-24) DEDUPE — buddy-Opus consult. Collapse repeated
+    # compile errors (same TSXXXX with same message at different file:line:col
+    # sites) so the LLM sees unique signal, not repetition. See notes in
+    # `_is_complete` version of this block for rationale.
+    import re as _re_dedupe_sh
+    def _dedupe_errors(raw: str) -> tuple[str, int]:
+        if not raw or len(raw) < 600:
+            return raw, 0
+        _err_pat = _re_dedupe_sh.compile(
+            r"(error\s+TS\d+:[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z|\s*error\s+TS))"
+            r"|(FAILED\s+[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z))"
+            r"|(AssertionError[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z))",
+            _re_dedupe_sh.IGNORECASE,
+        )
+        seen: dict[str, int] = {}
+        def _canon(m: str) -> str:
+            s = _re_dedupe_sh.sub(r"[^\s]+\.(ts|tsx|py|go|rs|java)[:\s]+\d+[:\s]+\d+", "FILE:L:C", m)
+            s = _re_dedupe_sh.sub(r"\s+", " ", s)
+            return s[:500]
+        result_parts: list[str] = []
+        removed = 0
+        last_end = 0
+        for m in _err_pat.finditer(raw):
+            chunk = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+            if not chunk:
+                continue
+            key = _canon(chunk)
+            if key in seen:
+                seen[key] += 1
+                removed += 1
+                result_parts.append(raw[last_end:m.start()])
+                last_end = m.end()
+            else:
+                seen[key] = 1
+        result_parts.append(raw[last_end:])
+        out = "".join(result_parts)
+        if removed > 0 and seen:
+            counts = ", ".join(f"{v}× at distinct sites" for k, v in seen.items() if v > 1)
+            if counts:
+                out += f"\n\n[DEDUPE NOTE: collapsed {removed} repeated error(s) — {counts}.]\n"
+        return out, removed
+
+    stderr_deduped, removed_count = _dedupe_errors(stderr_raw)
+
+    def _head_tail(s: str, head: int, tail: int) -> str:
+        if not s:
+            return ""
+        if len(s) <= head + tail + 50:
+            return s
+        return s[:head] + "\n\n[... truncated " + str(len(s) - head - tail) + " chars ...]\n\n" + s[-tail:]
+    stderr_block = _head_tail(stderr_deduped, 1500, 1500)
+    stdout_tail = stdout_raw[-2000:]
+
+    parts: list[str] = []
+    # v8.6 (2026-04-24) H2 FIX + CONTRASTIVE EXEMPLAR (v2, post-post-mortem).
+    # Buddy's exemplar approach was partially correct but incomplete:
+    # post-mortem on 7 capstone attempts showed Opus COPIED the variable
+    # name `r` from the exemplar but STRIPPED the `if (!r.success)` wrapper —
+    # i.e. surface imitation without structural imitation. The model
+    # abstracted the exemplar as "use var r, assert on .error" and treated
+    # the if-guard as decorative.
+    #
+    # v2 fix: contrastive exemplar. Show BOTH the WRONG pattern (TS2339) and
+    # the RIGHT pattern side-by-side with explicit annotation. When the model
+    # sees the wrong pattern labeled as compile-error, it cannot compress
+    # away the if-guard — the guard IS the difference.
+    #
+    # Also: rename `r.success` → `r.ok` in the exemplar (buddy H3). Some
+    # training data associates `{success: boolean}` with direct-access
+    # libraries (fp-ts, neverthrow older API); `{ok: boolean}` is more
+    # commonly paired with explicit narrowing.
+    if lang in ("typescript", "ts"):
+        parts.append(
+            "## Correct-pattern exemplar (mimic EXACTLY — including the if-guards)\n\n"
+            "SIBLING EXAMPLE — not the solution to your step. Demonstrates\n"
+            "CRITICAL narrowing on a discriminated union. The `if` guards\n"
+            "are NOT decorative — they are what makes the code compile.\n"
+            "Without them, TypeScript rejects `.error` / `.data` access\n"
+            "with TS2339.\n\n"
+            "```typescript\n"
+            "// Contract\n"
+            "type Ok<T>   = { ok: true;  data: T };\n"
+            "type Err<E>  = { ok: false; error: E };\n"
+            "type Result<T, E> = Ok<T> | Err<E>;\n"
+            "\n"
+            "declare function divideInt(a: number, b: number): Result<number, Error>;\n"
+            "\n"
+            "\n"
+            "// ❌❌❌ WRONG — THIS IS WHAT THE COMPILER REJECTS ❌❌❌\n"
+            "test('(broken — do NOT copy this pattern)', () => {\n"
+            "  const r = divideInt(1, 0);\n"
+            "  expect(r.error).toBeInstanceOf(Error);\n"
+            "  //     ~~~~~ TS2339: Property 'error' does not exist on type\n"
+            "  //             'Result<number, Error>'.\n"
+            "  //           Property 'error' does not exist on type 'Ok<number>'.\n"
+            "});\n"
+            "\n"
+            "\n"
+            "// ✓✓✓ RIGHT — narrow FIRST, then access. This compiles. ✓✓✓\n"
+            "test('happy path — narrow ok=true before .data', () => {\n"
+            "  const r = divideInt(10, 2);\n"
+            "  expect(r.ok).toBe(true);\n"
+            "  if (r.ok) {                      // ← LOAD-BEARING. NOT OPTIONAL.\n"
+            "    expect(r.data).toBe(5);        //   .data only visible inside this block\n"
+            "  }\n"
+            "});\n"
+            "\n"
+            "test('error path — narrow ok=false before .error', () => {\n"
+            "  const r = divideInt(1, 0);\n"
+            "  expect(r.ok).toBe(false);\n"
+            "  if (!r.ok) {                     // ← LOAD-BEARING. NOT OPTIONAL.\n"
+            "    expect(r.error).toBeInstanceOf(Error);   //   .error only here\n"
+            "    expect(r.error.message).toContain('zero');\n"
+            "  }\n"
+            "});\n"
+            "```\n\n"
+            "### RULES (non-negotiable)\n"
+            "1. EVERY assertion on `.error` or `.data` MUST be inside an `if (r.ok)` /\n"
+            "   `if (!r.ok)` block (or `if (r.success)` / `if (!r.success)` — whichever\n"
+            "   discriminant your scaffold specifies). Omitting the guard = TS2339.\n"
+            "2. The discriminant check (`expect(r.ok).toBe(false)` or similar) goes\n"
+            "   BEFORE the narrow block, OUTSIDE any if-guard.\n"
+            "3. NO `rejects.toThrow(X)` — this API RETURNS a Result, it does not throw.\n"
+            "4. When using the `if` guard, TypeScript AUTOMATICALLY narrows `r` to the\n"
+            "   matching branch — no `as` cast needed.\n"
+        )
+    parts.extend([
+        "## Errors from last retry (tool output; fix these sites):",
+        "",
+    ])
+    # v8.6.1 (2026-04-24) — when the failure is "starter passes" (not
+    # a compile/test error on solution), the test output below shows
+    # all PASS. Without this header the LLM is confused ("looks fine to
+    # me"). Make the failure class explicit.
+    if _starter_passed:
+        parts.append("### ⚠ STARTER passed the tests — invariant VIOLATED")
+        parts.append("")
+        parts.append(
+            "Your STARTER code passes the hidden_tests. That breaks the "
+            "contract: the starter is what the learner receives, so it "
+            "MUST FAIL the tests (otherwise there's nothing to learn). "
+            "The SOLUTION must pass; the STARTER must FAIL. Replace the "
+            "function-under-test's body in STARTER with a stub that won't "
+            "pass (e.g. `panic(\"TODO\")` in Go, `raise NotImplementedError` "
+            "in Python, `throw new Error('TODO')` in TS/JS, `todo!()` in Rust, "
+            "or a wrong-sentinel return). Keep solution unchanged."
+        )
+        parts.append("")
+        parts.append("### starter stdout (tail) — this shows the starter PASSING, which is WRONG")
+    elif stderr_block.strip():
+        _hdr = "### stderr"
+        if removed_count > 0:
+            _hdr += f" (deduped; {removed_count} repeated error(s) collapsed)"
+        parts.append(_hdr)
+        parts.append(f"```\n{stderr_block}\n```")
+        parts.append("")
+    if stdout_tail.strip():
+        if not _starter_passed:
+            parts.append("### stdout (tail)")
+        parts.append(f"```\n{stdout_tail}\n```")
+        parts.append("")
+    if stripped:
+        parts.append("### harness stripped from your validation.requirements (do not re-emit)")
+        for e in stripped[:10]:
+            parts.append(f"- {e}")
+        parts.append("")
+
+    # Phase D enrichment
+    try:
+        lcfg = _get_lang_config(lang)
+        if (lcfg is not None
+                and lcfg.type_grounding_error_codes
+                and lcfg.solution_shape_extractor is not None):
+            combined = stderr_raw + "\n" + stdout_raw
+            if any(c in combined for c in lcfg.type_grounding_error_codes):
+                shape = lcfg.solution_shape_extractor(solution_code)
+                if shape:
+                    parts.append("### solution's inferred shape (from compiler)")
+                    parts.append(f"```\n{shape}\n```")
+                    parts.append("")
+    except Exception as _tg_err:
+        logging.warning("Shape extractor errored (soft-pass): %s", _tg_err)
+
+    parts.append("Fix these sites. Emit a corrected full solution + tests.")
+    reason = "\n".join(parts)
+
+    # LOG EVERYTHING dump
+    try:
+        import re as _re_rf, pathlib as _pl_rf, time as _time_rf
+        _sess = (session_id or "nosession")[:20]
+        _slug = _re_rf.sub(r"[^\w\-]+", "_", step_title or "step")[:60]
+        _dir = _pl_rf.Path("/tmp/retry_feedback") / _sess
+        _dir.mkdir(parents=True, exist_ok=True)
+        _ts = int(_time_rf.time() * 1000) % 10_000_000
+        _path = _dir / f"{_slug}_{_ts}.txt"
+        _path.write_text(reason, encoding="utf-8", errors="replace")
+        _path_str = str(_path)
+    except Exception as _rf_err:
+        _path_str = f"(dump failed: {_rf_err})"
+    logging.warning(
+        "LangGraph invariant FAIL on step=%r "
+        "(retry feedback: %d chars, dump: %s)\n"
+        "--- retry feedback head (first 600 chars) ---\n"
+        "%s\n--- /head ---",
+        step_title[:60], len(reason), _path_str, reason[:600],
+    )
+    # Match course-gen cap of 12000 chars so both paths feed the same size
+    return False, reason[-12000:]
+
+
+def _claude_code_reference_facts() -> str:
+    """Return a prompt block of VERIFIED Claude Code facts.
+
+    v8.6.1 (2026-04-24) — LLM has incomplete/stale training data about
+    Claude Code's actual API. Domain-expert review agent found 5 factual
+    errors in the first AI-Augmented Engineering course:
+
+      - `claude auth` invented (real: `claude /login` or ANTHROPIC_API_KEY env)
+      - Hooks use `CLAUDE_TOOL_INPUT` env var (real: stdin JSON)
+      - Hooks exit 1 to block (real: exit 2)
+      - `mcpServers` in settings.json (real: `~/.claude.json` or project `.mcp.json`)
+      - Subagent tools as `read_file`/`edit_file` (real: `Read`/`Edit` capitalized)
+
+    Fix: inject these facts verbatim into the Creator prompt whenever the
+    course touches Claude Code (BYO-key, claude /login, MCP, subagents,
+    hooks). The LLM must quote these — not invent from training-data memory.
+
+    Inject via `_course_has_claude_code_scope(title, description)` check.
+    """
+    return """
+CLAUDE CODE REFERENCE FACTS (v2026-04 — QUOTE VERBATIM, do not paraphrase):
+
+=== Authentication ===
+- Interactive:   `claude /login`            (OAuth flow; opens browser)
+- Headless / CI: set env var `ANTHROPIC_API_KEY=<your-key>`
+- There is NO `claude auth`, `claude login` (no slash), `claude signin`,
+  or `claude configure` subcommand. If you need to reference the auth
+  flow, use one of the TWO forms above verbatim.
+
+=== Built-in tool names (use capitalized when listing in subagent YAML) ===
+Read, Write, Edit, MultiEdit, Bash, Grep, Glob, WebFetch, WebSearch, Task,
+NotebookEdit, TodoWrite. Do NOT use `read_file`, `edit_file`, `bash` (lowercase).
+The capitalized names are what appear in the subagent's `tools:` field and
+in `settings.json` `permissions.allow`.
+
+=== Hook contract (PreToolUse / PostToolUse / Stop) ===
+- Hooks are shell scripts / commands registered in settings.json.
+- **Input**: JSON on STDIN. NOT via environment variables. (`CLAUDE_TOOL_INPUT`
+  is NOT a real env var.) Read stdin with `input=$(cat)`, parse with `jq`.
+- **Exit codes**:
+    0 = ALLOW (tool call proceeds)
+    2 = BLOCK (tool call is prevented; stderr is shown to the model)
+    other = error (treated as allow with warning)
+  DO NOT use `exit 1` to block — it is treated as an error, not a block.
+- Example PreToolUse hook body:
+    input=$(cat)
+    cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
+    if echo "$cmd" | grep -qE '(rm -rf|--force|DROP TABLE)'; then
+      echo "BLOCKED: destructive command pattern" >&2
+      exit 2
+    fi
+    exit 0
+
+=== Config file layout — where things ACTUALLY live ===
+- ~/.claude/settings.json   → `permissions.allow`, `permissions.deny`,
+                              `hooks.PreToolUse`, `hooks.PostToolUse`, `hooks.Stop`
+- ~/.claude.json            → `mcpServers` (USER-GLOBAL scope)
+- <project>/.mcp.json       → `mcpServers` (PROJECT-scoped, checked into git)
+- <project>/.claude/agents/*.md → CUSTOM subagents; auto-discovered; no
+                                   registration needed in any JSON file.
+
+DO NOT put `mcpServers` in `settings.json` — wrong file.
+DO NOT put a top-level `agents` key in `settings.json` — fictional structure;
+subagents are file-system auto-discovered from `.claude/agents/*.md`.
+
+=== MCP server wiring ===
+- Add (preferred):  `claude mcp add <name> <path-or-command> [--transport stdio|http]`
+- Example for a course's pre-built MCP:
+    `claude mcp add team-tickets /abs/path/to/team-tickets-mcp/server.py --transport stdio`
+- This writes the entry into `~/.claude.json` under `mcpServers.<name>`.
+- Verify:           `claude /mcp`   (slash command inside Claude Code)
+                    lists registered MCPs + their status
+- Remove:           `claude mcp remove <name>`
+- Per-project alternative: hand-write `<project>/.mcp.json`:
+    {
+      "mcpServers": {
+        "team-tickets": {
+          "command": "python",
+          "args": ["/abs/path/to/team-tickets-mcp/server.py"],
+          "transport": "stdio"
+        }
+      }
+    }
+  Project `.mcp.json` is checked into git; users auto-get it when they clone.
+
+=== Custom subagent YAML frontmatter shape ===
+File: .claude/agents/<slug>.md
+---
+name: test-fixer
+description: Runs pytest, proposes minimal fix, verifies, stops at 5 iterations.
+tools: [Read, Edit, Bash]        # capitalized; subset of built-in tools
+---
+<system prompt body as markdown>
+
+Learner's subagent is auto-discovered — NO registration needed in settings.json.
+
+=== Slash commands (for reference when authoring course content) ===
+- /login, /logout, /clear, /help, /mcp, /agents, /model
+- These are entered at the `>` prompt INSIDE Claude Code, not at the shell.
+"""
+
+
+def _course_has_claude_code_scope(title: str = "", description: str = "", source_material: str = "") -> bool:
+    """Returns True if the course clearly touches Claude Code tooling —
+    BYO-key flows, Claude Code commands, MCP, custom subagents, hooks,
+    or settings.json scoping. Drives injection of the reference-facts block.
+    """
+    text = f"{title}\n{description}\n{source_material}".lower()
+    markers = (
+        "claude code",
+        "claude /login",
+        "claude /mcp",
+        "mcp server",
+        "custom subagent",
+        "pre-tool-use",
+        "pretooluse",
+        "posttooluse",
+        ".claude/agents",
+        "settings.json",
+        "byo key",
+        "byo-key",
+        "anthropic_api_key",
+    )
+    return any(m in text for m in markers)
+
+
+def _runtime_deps_brief(language: str) -> str:
+    """Return a runtime-environment brief for the given language, or empty
+    string if we don't have a brief for it. Injected into code_exercise
+    Creator prompts so the LLM generates code targeting our EXACT pinned
+    library + runtime versions.
+
+    v8.6.1 (2026-04-24) DOCKERFILE-SOURCED VERSIONS: the brief starts with
+    an auto-generated "AUTOMATIC RUNTIME MANIFEST" section derived from
+    parsing the Dockerfiles at import time (see `backend/runtime_versions`).
+    This eliminates the manual-drift class of bug where the Dockerfile
+    bumps a pin but the hand-curated brief still tells the LLM the old
+    version. When the Dockerfile changes, the brief changes automatically
+    on next server boot.
+
+    The hand-curated portion below the auto-manifest still exists — it
+    holds language-specific guidance that can't be auto-extracted (file
+    layout, test commands, CGO warnings, etc.). Any version mentioned in
+    the hand-curated portion will be SHADOWED by the auto-manifest on
+    discrepancy (the auto one is truth).
+
+    When adding a new language: add an entry to _RUNTIME_DEPS_BY_LANG + a
+    matching _LANG_CONFIGS entry in docker_runner.py AND wire up parsing
+    in runtime_versions.py. The base version + libs should auto-populate.
+    """
+    if not language:
+        return ""
+    lang_lo = language.lower().strip()
+    base_brief = _RUNTIME_DEPS_BY_LANG.get(lang_lo, "")
+    # Build the auto-manifest header from the parsed Dockerfiles.
+    try:
+        from backend import runtime_versions as _rv
+        base_ver = _rv.get_base_version(lang_lo)
+        libs = _rv.get_pinned_libs(lang_lo)
+        if base_ver or libs:
+            header_lines: list[str] = []
+            header_lines.append(
+                "AUTOMATIC RUNTIME MANIFEST (parsed from Dockerfile — authoritative):"
+            )
+            if base_ver:
+                header_lines.append(f"  - Base runtime version: {base_ver}")
+            if libs:
+                header_lines.append(
+                    f"  - {len(libs)} libraries baked in the runner image "
+                    "(pre-installed — DO NOT re-pin in `validation.requirements`):"
+                )
+                # Group multi-line for readability
+                items = [f"{k}=={v}" for k, v in sorted(libs.items())]
+                LINE_BUDGET = 72
+                cur = "      "
+                for it in items:
+                    if len(cur) + len(it) + 2 > LINE_BUDGET:
+                        header_lines.append(cur.rstrip(", "))
+                        cur = "      " + it + ", "
+                    else:
+                        cur += it + ", "
+                if cur.strip():
+                    header_lines.append(cur.rstrip(", "))
+            header_lines.append(
+                "  - If a version here conflicts with the hand-curated section "
+                "below, THIS manifest wins (it's parsed from the actual image)."
+            )
+            header_lines.append("")
+            header = "\n".join(header_lines)
+            return header + base_brief
+    except Exception as _e:
+        # Runtime-versions parse failed — soft-pass. The hand-curated
+        # brief still works (just without the auto-injected header).
+        logging.warning("runtime_versions parse failed (soft-pass): %s", _e)
+    return base_brief
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# BUDDY-OPUS REVIEW (2026-04-23 v8.3) — spawn a cold Opus for a second opinion
+# ═══════════════════════════════════════════════════════════════════════════
+#
+# Policy in CLAUDE.md §BUDDY-OPUS REVIEW. When the on-task LLM / operator is
+# stuck on a bug after 1-2 fix attempts, compose a compact brief and send it
+# to Opus for a "cold peer review." Opus has no context from the session —
+# so its hypotheses come from pure reasoning about the facts, not from the
+# rut we got stuck in.
+
+_BUDDY_OPUS_SYSTEM_PROMPT = """\
+You are a senior staff engineer acting as an on-call peer reviewer. An
+on-task agent has gotten stuck on a bug and is sending you a brief. Your
+job:
+
+1. Treat the brief as complete — do NOT ask for more info. Work with
+   what's there.
+2. Produce 2-4 ROOT-CAUSE HYPOTHESES, ranked by likelihood. For each:
+   - One sentence saying why this hypothesis fits the evidence.
+   - One concrete check the on-task agent can run to confirm/refute.
+3. Give ONE concrete "if I were you, try this first" recommendation.
+4. Flag any FALSE ASSUMPTIONS the on-task agent seems to be making.
+5. Keep the total response under 500 words. Bullets over prose.
+
+Tone: direct, concrete, no hedging. Skip pleasantries. The on-task agent
+is using Sonnet — they're capable; they just need a fresh pair of eyes.
+"""
+
+
+def ask_opus_buddy(brief_md: str, *, max_tokens: int = 2000) -> str:
+    """Send a stuck-bug brief to Opus for a second opinion.
+
+    Returns Opus's response as plain text. Uses _OPUS_MODEL ('claude-opus-4-7'
+    by default). Cost: ~$0.05-0.15 per call depending on brief + response size.
+
+    This is a raw text call, NOT _llm_json_call — the buddy isn't producing
+    structured output, just engineering-peer feedback.
+
+    Called from Python code that hit a hard stuck-point. Example:
+
+        brief = '''
+        **Problem**: _llm_generate_step_content returns None when called outside
+        the Creator pipeline (from a one-off resume-generation script).
+        ...
+        '''
+        feedback = ask_opus_buddy(brief)
+        print(feedback)
+        # Then actually implement based on what Opus suggested.
+    """
+    if not _llm_enabled():
+        return "[buddy-opus: LLM disabled (budget exhausted or mocked) — skipping.]"
+    try:
+        import anthropic as _anth
+        client = _anth.Anthropic()
+        msg = client.messages.create(
+            model=_OPUS_MODEL,
+            max_tokens=max_tokens,
+            system=_BUDDY_OPUS_SYSTEM_PROMPT,
+            messages=[{"role": "user", "content": brief_md}],
+        )
+        # Record cost for budget tracking (same path _llm_json_call uses).
+        try:
+            usage = msg.usage
+            cost = (
+                (usage.input_tokens / 1_000_000) * 15.0
+                + (usage.output_tokens / 1_000_000) * 75.0
+            )  # Opus 4.7 pricing
+            _record_cost(cost)
+        except Exception:
+            pass
+        parts = []
+        for block in msg.content:
+            if hasattr(block, "text"):
+                parts.append(block.text)
+        return "".join(parts).strip()
+    except Exception as e:
+        logger.exception("buddy-opus call failed")
+        return f"[buddy-opus: call failed: {e}]"
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# Phase 2 (2026-04-23 v8.5): LLM-rubric content-quality scorer for system_build
+# ══════════════════════════════════════════════════════════════════════════
+# Replaces 4 hardcoded phrase/set-based content-quality gates that grew
+# organically as the LLM paraphrased around each new block-list (5+ rounds of
+# additions to BIZ_STRATEGY_BAN alone).
+#
+# Philosophy: one LLM call per system_build evaluation beats N regex phrase
+# lists that require manual maintenance every time the LLM invents new
+# MBA-flavored vocabulary. Cost: ~$0.005 per call.
+#
+# Opus review (2026-04-23) flagged 5 landmines — mitigations baked in:
+#   L1 fail-open: circuit-break after 3 consecutive rubric LLM failures.
+#       Fall back to BIZ_STRATEGY_BAN + ENG_SIGNALS (kept below as the
+#       append-only ratchet). Single LLM outage does NOT block every gen.
+#   L2 calibration: threshold set at 60/100 per axis; watch log signal in
+#       production and tighten/loosen post-hoc. Corpus calibration deferred.
+#   L3 anchor examples: retry feedback ships a positive-anchor sentence
+#       alongside the failing-axis reason, not just "you scored low."
+#   L4 audit trail: each rubric call's scores + content-hash are logged at
+#       WARNING level so a grep can recover "did any capstone ever drift?"
+#   L5 prompt version: _RUBRIC_VERSION pinned here. Bump on prompt edits so
+#       historical scores are re-interpretable; treat edits like schema
+#       migrations.
+# ══════════════════════════════════════════════════════════════════════════
+
+_RUBRIC_VERSION = "cq-v1-2026-04-23"
+_RUBRIC_CONSECUTIVE_FAILURES = [0]  # list-as-ref (mutable module-global)
+_RUBRIC_BREAKER_THRESHOLD = 3       # trip fallback after N consecutive LLM errors
+_RUBRIC_AXIS_MIN_SCORE = 60          # reject if ANY axis < this
+
+_RUBRIC_SYSTEM_PROMPT = """You are a senior engineering hiring manager reviewing a CAPSTONE exercise for a technical course. The learner is about to ship a production service (FastAPI/Django/Express/Go microservice/etc.).
+
+Your job: score the capstone on 4 axes (0-100 each). Reject MBA-memo / strategy-deck / PM-presentation drift; accept only REAL engineering work that results in running code.
+
+AXES (independent, 0-100 each):
+
+1. `engineering_specificity` — Does it ask for code that runs, endpoints that serve, containers that build, tests that pass? Or decks/memos/presentations/alignment plans?
+   - 90: "Build a FastAPI service, dockerize it, deploy to Fly.io, verify GET /health returns 200 under 50 rps load via locust"
+   - 50: "Build a solution to the auth problem and document your design choices"
+   - 10: "Draft a stakeholder alignment plan; present to the CTO; iterate on leadership feedback"
+
+2. `concrete_actions` — Are phases/checklist items specific (exact commands, files, metrics) or generic verbs (plan, review, align, synthesize)?
+   - 90: Phases: "1. Scaffold Pydantic schemas + alembic migration  2. Wire JWT auth middleware + passlib bcrypt  3. Deploy to Fly.io + smoke-test /health"
+   - 50: Phases: "1. Design the data model  2. Build the API  3. Test and deploy"
+   - 10: Phases: "1. Plan the deliverable  2. Build / produce  3. Present to stakeholders"
+
+3. `domain_vocabulary` — Are technical terms used (Pydantic, JWT, asyncpg, Alembic, kubectl, terraform, httpx, OAuth2, connection pool) or generic business words (stakeholders, alignment, strategy, roadmap, synthesis, value, outcomes)?
+   - 90: "Use SQLAlchemy 2.0 async session + asyncpg; add alembic migration; verify with httpx.AsyncClient"
+   - 50: "Use a database and ORM; add migrations; test with HTTP client"
+   - 10: "Drive stakeholder alignment on the data strategy; socialize the roadmap"
+
+4. `scenario_realism` — Does a real senior engineer do this on-the-job, or does it read like an MBA case study / business school project?
+   - 90: "Your team's /checkout endpoint p99 latency spiked 3x last week; add a connection pool and verify with locust"
+   - 50: "Build a task tracker API for a hypothetical company"
+   - 10: "Lead a strategic review of the company's authentication platform and present recommendations to the C-suite"
+
+INSTRUCTIONS:
+- Return strict JSON only. No markdown fences, no prose before/after.
+- `reason`: one sentence naming the lowest-scoring axis and WHY.
+- `anchor_example`: one sentence showing what a 90+ version of the LOWEST-SCORING axis would look like for THIS capstone's domain.
+- Be strict. If any axis is < 60, the overall verdict is FAIL.
+
+Schema:
+{
+  "scores": {
+    "engineering_specificity": 0-100,
+    "concrete_actions": 0-100,
+    "domain_vocabulary": 0-100,
+    "scenario_realism": 0-100
+  },
+  "reason": "one-sentence explanation",
+  "anchor_example": "one-sentence positive-anchor for the lowest axis"
+}
+"""
+
+
+def _score_capstone_quality(
+    content: str,
+    phases: list | None,
+    checklist: list | None,
+    code: str,
+    course_context: dict,
+    *,
+    step_title: str = "",
+) -> dict:
+    """Rubric-score a system_build capstone. See module-level docs.
+
+    Returns:
+      {
+        ok: bool,
+        scores: {engineering_specificity, concrete_actions, domain_vocabulary, scenario_realism},
+        reason: str,
+        anchor: str,             # positive-anchor example (for retry feedback)
+        rubric_version: str,
+        fallback_used: bool,     # True if rubric LLM failed and we fell back
+      }
+    """
+    # Circuit breaker — fall open with a trivial "ok" after N consecutive failures
+    # so a single LLM outage doesn't block the whole gen session.
+    if _RUBRIC_CONSECUTIVE_FAILURES[0] >= _RUBRIC_BREAKER_THRESHOLD:
+        return {
+            "ok": True, "scores": {}, "reason": "rubric circuit-breaker open",
+            "anchor": "", "rubric_version": _RUBRIC_VERSION, "fallback_used": True,
+        }
+    if not _llm_enabled():
+        return {
+            "ok": True, "scores": {}, "reason": "LLM disabled / budget exhausted",
+            "anchor": "", "rubric_version": _RUBRIC_VERSION, "fallback_used": True,
+        }
+
+    # Build a compact payload for the rubric LLM — truncate content to 1500
+    # chars and phases/checklist to first N items. Keeps input token cost low
+    # while giving the judge enough signal.
+    phase_lines = []
+    for p in (phases or [])[:6]:
+        if isinstance(p, dict):
+            t = (p.get("title") or "").strip()
+            if t:
+                phase_lines.append(f"- {t}")
+    checklist_lines = []
+    for c in (checklist or [])[:8]:
+        if isinstance(c, dict):
+            lbl = (c.get("label") or "").strip()
+            if lbl:
+                checklist_lines.append(f"- {lbl}")
+
+    user_payload = (
+        f"COURSE: {(course_context.get('title') or '').strip()}\n"
+        f"LANGUAGE: {(course_context.get('language') or 'python').strip()}\n"
+        f"STEP TITLE: {step_title.strip()}\n\n"
+        f"CONTENT (first 1500 chars):\n{(content or '')[:1500]}\n\n"
+        f"PHASES:\n" + ("\n".join(phase_lines) if phase_lines else "(none)") + "\n\n"
+        f"CHECKLIST:\n" + ("\n".join(checklist_lines) if checklist_lines else "(none)") + "\n\n"
+        f"CODE SCAFFOLD (first 600 chars):\n{(code or '')[:600]}\n\n"
+        f"Return the JSON scores + reason + anchor_example now."
+    )
+
+    try:
+        resp = _llm_json_call(
+            system=_RUBRIC_SYSTEM_PROMPT,
+            user=user_payload,
+            max_tokens=500,
+            model="claude-sonnet-4-20250514",
+        )
+        if resp is None:
+            # _llm_json_call returns None on parse failure or transient errors
+            _RUBRIC_CONSECUTIVE_FAILURES[0] += 1
+            logging.warning(
+                "Rubric LLM returned None (consecutive-fails=%d/%d)",
+                _RUBRIC_CONSECUTIVE_FAILURES[0], _RUBRIC_BREAKER_THRESHOLD,
+            )
+            return {
+                "ok": True, "scores": {}, "reason": "rubric-llm-none",
+                "anchor": "", "rubric_version": _RUBRIC_VERSION, "fallback_used": True,
+            }
+        # Reset consecutive-failures on success (rubric CALL succeeded, even if content fails)
+        _RUBRIC_CONSECUTIVE_FAILURES[0] = 0
+        scores_raw = resp.get("scores") or {}
+        scores = {
+            "engineering_specificity": int(scores_raw.get("engineering_specificity", 0) or 0),
+            "concrete_actions": int(scores_raw.get("concrete_actions", 0) or 0),
+            "domain_vocabulary": int(scores_raw.get("domain_vocabulary", 0) or 0),
+            "scenario_realism": int(scores_raw.get("scenario_realism", 0) or 0),
+        }
+        reason = str(resp.get("reason", "") or "")[:300]
+        anchor = str(resp.get("anchor_example", "") or "")[:300]
+        failing = [k for k, v in scores.items() if v < _RUBRIC_AXIS_MIN_SCORE]
+        if failing:
+            logging.warning(
+                "Rubric REJECT step=%r axes=%s scores=%s reason=%s",
+                step_title[:60], failing, scores, reason[:140],
+            )
+            return {
+                "ok": False, "scores": scores, "reason": reason,
+                "anchor": anchor, "rubric_version": _RUBRIC_VERSION, "fallback_used": False,
+            }
+        logging.info(
+            "Rubric PASS step=%r scores=%s",
+            step_title[:60], scores,
+        )
+        return {
+            "ok": True, "scores": scores, "reason": reason,
+            "anchor": anchor, "rubric_version": _RUBRIC_VERSION, "fallback_used": False,
+        }
+    except Exception as e:
+        _RUBRIC_CONSECUTIVE_FAILURES[0] += 1
+        logging.warning(
+            "Rubric LLM exception (%s) consecutive-fails=%d/%d: %s",
+            e.__class__.__name__, _RUBRIC_CONSECUTIVE_FAILURES[0],
+            _RUBRIC_BREAKER_THRESHOLD, str(e)[:200],
+        )
+        return {
+            "ok": True, "scores": {}, "reason": f"rubric-errored-{e.__class__.__name__}",
+            "anchor": "", "rubric_version": _RUBRIC_VERSION, "fallback_used": True,
+        }
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v8.5 Phase H TWO-STAGE SCAFFOLD-THEN-FILL (2026-04-23, Opus 8th consult)
+# ══════════════════════════════════════════════════════════════════════════
+# Observed failure class (2 TS runs, 14 instrumentation rows): tests_passed=0/0
+# on EVERY stuck step. Tests never compiled because the LLM's solution exports
+# don't match the imports/symbols in the hidden_tests it wrote in the same
+# response. Interface contract drift INSIDE one LLM call.
+#
+# Fix: split the generation into TWO stages with Opus designing the contract
+# and Sonnet filling implementations. The scaffold is IMMUTABLE across retries —
+# Sonnet's retries can change bodies but not names/signatures/test count.
+#
+# Per Opus #8 four caveats:
+#   1. Scaffold is immutable per-step — do NOT regenerate on retries.
+#   2. Instrument `failure_stage`: scaffold_infeasible | sonnet_cant_fill |
+#      contract_mismatch_despite_scaffold. Third value = scaffold format leaky.
+#   3. Don't thrash Stage-2 against infeasible scaffold: on 2 consecutive
+#      Stage-2 failures, retry Stage 1 with "simplify signatures."
+#   4. Don't over-engineer — no scaffold-validator-LLM unless data demands it.
+# ══════════════════════════════════════════════════════════════════════════
+
+
+def _generate_scaffold_with_opus(
+    step_title: str,
+    step_description: str,
+    language: str,
+    course_title: str = "",
+    module_title: str = "",
+    simplify: bool = False,
+) -> dict | None:
+    """Stage 1: Opus designs the interface contract.
+
+    Returns a scaffold JSON with locked exports + test names + prose assertions.
+    When `simplify=True` (after 2 consecutive Stage-2 failures), Opus is told
+    to avoid advanced generics/mapped types and emit a simpler contract.
+
+    Soft-fail (returns None) on any error. Stage 2 then falls back to
+    single-stage generation.
+    """
+    if not _llm_enabled():
+        return None
+    lang = (language or "python").lower()
+    # Only languages where we've observed contract drift. Extend as needed.
+    if lang not in ("python", "py", "javascript", "js", "typescript", "ts"):
+        return None
+
+    lang_hints = {
+        "typescript": (
+            "- Use TS type syntax in exports: `export function foo<T>(x: T): T`\n"
+            "- Prefer discriminated unions over overloaded functions\n"
+            "- Test names use jest-style: `test('ok wraps data', () => ...)`"
+        ),
+        "ts": "same as typescript",
+        "python": (
+            "- Use Python type syntax in exports: `def foo(x: int) -> str: ...`\n"
+            "- For classes, state the full class signature + public method names\n"
+            "- Test names use pytest-style: `def test_ok_wraps_data(): ...`"
+        ),
+        "py": "same as python",
+        "javascript": (
+            "- Use JS function signatures: `export function foo(x) { /* returns Y */ }`\n"
+            "- State shape in comments since JS has no types\n"
+            "- Test names use jest-style: `test('ok wraps data', () => ...)`"
+        ),
+        "js": "same as javascript",
+    }
+    lang_hint = lang_hints.get(lang, "")
+    # Alias "ts" → typescript hint text etc.
+    if lang_hint == "same as typescript":
+        lang_hint = lang_hints["typescript"]
+    if lang_hint == "same as python":
+        lang_hint = lang_hints["python"]
+    if lang_hint == "same as javascript":
+        lang_hint = lang_hints["javascript"]
+
+    simplify_hint = ""
+    if simplify:
+        simplify_hint = (
+            "\n**SIMPLIFY MODE**: prior attempts failed with an infeasible scaffold. "
+            "Emit a simpler contract: avoid conditional types, mapped types, "
+            "template literal types, deep variance. Prefer concrete unions and "
+            "standard function signatures that a competent implementer can fill in.\n"
+        )
+
+    system = (
+        "You are an INTERFACE ARCHITECT designing the scaffold for a coding "
+        "exercise. Your output is a JSON artifact handed to a cheaper model "
+        "(Sonnet) to fill in implementations. Your job: lock the interface "
+        "contract so the implementer CANNOT drift between solution exports "
+        "and test imports. Both files derive from your scaffold."
+    )
+    user = (
+        f"Course: {course_title}\n"
+        f"Module: {module_title}\n"
+        f"Step title: {step_title}\n"
+        f"Step description: {step_description}\n"
+        f"Language: {lang}\n"
+        f"{simplify_hint}\n"
+        f"Language hints:\n{lang_hint}\n\n"
+        "Produce a scaffold JSON with this EXACT shape (no extra fields):\n"
+        "{\n"
+        '  "exports": [<array of verbatim signature strings — one per exported symbol>],\n'
+        '  "test_names": [<array of short test names, 5-8 entries>],\n'
+        '  "test_assertions_prose": [<parallel array: one-line prose assertion per test, in English — NOT code>],\n'
+        '  "type_invariants": [<2-4 one-line prose statements about what the tests verify>]\n'
+        "}\n\n"
+        "Rules:\n"
+        "1. `exports`: types/interfaces the tests can easily check. Include EVERY "
+        "name the tests will import.\n"
+        "2. `test_names`: cover happy-path, edge cases, type narrowing, error "
+        "branches. 5-8 entries.\n"
+        "3. `test_assertions_prose`: concrete English assertions like "
+        "'ok(42).data === 42 when successful'. Not code. Not 'it works'.\n"
+        "4. `type_invariants`: what contracts the tests verify, not how.\n\n"
+        "Return JSON only, no prose around it."
+    )
+    try:
+        return _llm_json_call(
+            system=system, user=user,
+            max_tokens=2000,
+            model=_OPUS_MODEL,
+            temperature=1.0,
+        )
+    except Exception as e:
+        logging.warning("scaffold generation failed (soft-pass): %s", e)
+        return None
+
+
+def _render_scaffold_as_prompt_block(scaffold: dict | None) -> str:
+    """Format scaffold as a prompt-ready LOCKED CONTRACT block for Stage 2."""
+    if not scaffold:
+        return ""
+    exports = scaffold.get("exports") or []
+    test_names = scaffold.get("test_names") or []
+    assertions = scaffold.get("test_assertions_prose") or []
+    invariants = scaffold.get("type_invariants") or []
+
+    parts: list[str] = [
+        "",
+        "## LOCKED SCAFFOLD (do not deviate — this is the interface contract)",
+        "",
+        "### Exports (your solution MUST export these symbols with these exact signatures):",
+    ]
+    for e in exports:
+        parts.append(f"  - `{e}`")
+    parts.append("")
+    parts.append("### Tests (your hidden_tests MUST have EXACTLY ONE test per entry, matching the name/intent):")
+    for i, name in enumerate(test_names):
+        assertion = assertions[i] if i < len(assertions) else ""
+        parts.append(f"  {i+1}. `{name}` — {assertion}")
+    parts.append("")
+    if invariants:
+        parts.append("### Type invariants the tests verify:")
+        for inv in invariants:
+            parts.append(f"  - {inv}")
+        parts.append("")
+    parts.append("CONSTRAINT: change function/method BODIES only. Signature names, "
+                 "arg names, type params, return types are LOCKED. Each `test_names` "
+                 "entry maps to EXACTLY ONE `test(...)` call (jest) or `def test_*` "
+                 "(pytest) — do not merge, split, or skip any.")
+    return "\n".join(parts)
+
+
+# ══════════════════════════════════════════════════════════════════════════
+# v8.5 Phase G RETRY INSTRUMENTATION (2026-04-23, Opus 7th consult)
+# Three columns per retry, written as JSONL to /tmp/retry_instrumentation.jsonl.
+# Lets us distinguish ATTRACTOR (same err_hash) vs SPEC AMBIGUITY (varying
+# category + oscillating tests_passed) vs UNDIAGNOSTIC SURFACE (same-approach
+# cosmetic changes + no convergence). Opus #7: "Do this BEFORE adding AST
+# paths or line numbers. Those are solutions looking for a problem until
+# you know the problem."
+# ══════════════════════════════════════════════════════════════════════════
+
+def _classify_retry_diff(prior_code: str, current_code: str) -> str:
+    """Haiku: classify CURRENT's change from PRIOR.
+
+    Returns one of: first_attempt | same_cosmetic | same_details |
+    structurally_different | unknown.
+    """
+    if not prior_code or not current_code:
+        return "first_attempt"
+    if not _llm_enabled():
+        return "unknown"
+    try:
+        # Small diff-aware prompt; Haiku is fast + cheap (~$0.0005/call).
+        resp = _ANTHROPIC_CLIENT.messages.create(
+            model="claude-haiku-4-5",
+            max_tokens=10,
+            temperature=0.0,
+            messages=[{
+                "role": "user",
+                "content": (
+                    "Classify the change from PRIOR to CURRENT as ONE of:\n"
+                    "A = same approach, cosmetic changes only (renames/formatting)\n"
+                    "B = same approach, different implementation details (different "
+                    "algorithm choices or data shapes within the same overall strategy)\n"
+                    "C = structurally different approach (different function signatures, "
+                    "different type decomposition, different control flow)\n\n"
+                    f"=== PRIOR:\n{prior_code[:1200]}\n\n"
+                    f"=== CURRENT:\n{current_code[:1200]}\n\n"
+                    "Respond with ONLY one letter: A, B, or C."
+                ),
+            }],
+        )
+        # Record cost for budget tracking
+        if hasattr(resp, "usage"):
+            try:
+                _record_llm_cost(resp.usage.input_tokens, resp.usage.output_tokens, "claude-haiku-4-5")
+            except Exception:
+                pass
+        if not resp.content:
+            return "unknown"
+        txt = getattr(resp.content[0], "text", "").strip().upper()
+        if txt.startswith("A"): return "same_cosmetic"
+        if txt.startswith("B"): return "same_details"
+        if txt.startswith("C"): return "structurally_different"
+        return "unknown"
+    except Exception as e:
+        logging.warning("retry-diff classifier failed: %s", e)
+        return "unknown"
+
+
+def _log_retry_attempt(
+    course_title: str,
+    module_title: str,
+    step_title: str,
+    attempt: int,
+    prior_code: str,
+    current_code: str,
+    err_hash: str,
+    tests_passed: int,
+    tests_total: int,
+    path: str = "/tmp/retry_instrumentation.jsonl",
+) -> None:
+    """Append a per-retry instrumentation row to JSONL. Non-fatal on errors."""
+    try:
+        category = _classify_retry_diff(prior_code, current_code)
+        row = {
+            "ts": time.time(),
+            "course": course_title[:80],
+            "module": module_title[:80],
+            "step": step_title[:100],
+            "attempt": attempt,
+            "category": category,
+            "err_hash": err_hash,
+            "tests_passed": tests_passed,
+            "tests_total": tests_total,
+        }
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(row) + "\n")
+        logging.info(
+            "RETRY_INSTRUMENT %s attempt=%d cat=%s err=%s tests=%d/%d",
+            step_title[:50], attempt, category, err_hash, tests_passed, tests_total,
+        )
+    except Exception as e:
+        logging.warning("retry instrumentation write failed (non-fatal): %s", e)
+
+
 def _llm_generate_step_content(
     course_context: dict,
     module_title: str,
@@ -4799,6 +7622,23 @@ def _llm_generate_step_content(
 
     # Pull source material (may be None/empty for from-scratch courses)
     source_material = (course_context.get("source_material") or "").strip()
+
+    # v8.6.2 (2026-04-24) — zero-code detection for browser-only / non-coder courses.
+    # Orthogonal to is_non_engineering: a course can be course_type=technical AND
+    # zero_code at the same time (e.g. "AI-Powered Workday" which teaches prompt
+    # workflows in claude.ai — technically about AI tooling, but deliverable is
+    # markdown + no git / no CLI / no deploy).
+    # When zero_code is true, specific branches below switch to "paste a doc +
+    # LLM rubric" flow instead of GHA / endpoint_check / terminal_exercise.
+    try:
+        is_zero_code = _is_zero_code_course(
+            title=course_context.get("title", "") or "",
+            description=course_context.get("description", "") or "",
+            source_material=source_material,
+            tags=course_context.get("tags") or [],
+        )
+    except Exception:
+        is_zero_code = False
     # Named entity lock: if source is substantial, extract canonical entities upfront
     canonical_entities = course_context.get("canonical_entities") or []
     grounded_mode = len(source_material) >= 300
@@ -4993,7 +7833,7 @@ Generate ONLY JSON (no fences):
   "code": "<REAL starter code, 20-60 lines, production-flavored. Include imports/scaffolding, one or two working helpers, and 2-4 explicit TODO markers where the learner fills in. Use realistic domain data (not 'Hello world').\\n\\n### STARTER MUST NOT PASS THE HIDDEN TESTS (LangGraph invariant — enforced by AST parser + Docker)\\n- The function the tests `from solution import <name>` MUST have a BROKEN body. Every tested function's FIRST real statement must be ONE of:\\n  (a) `raise NotImplementedError('TODO')` (preferred — signals intent clearly)\\n  (b) `pass`\\n  (c) a single `return None` / `return []` / `return 0` sentinel\\n- Docstrings are allowed before the broken statement; additional statements after are NOT (the AST check inspects the first real statement).\\n- The AST pre-filter rejects IN ZERO-LATENCY when the tested function body has multiple real statements → wasted LLM work.\\n\\n### L2 FEW-SHOT (2026-04-22) — follow these verbatim patterns:\\n\\nEXAMPLE 1 — Sliding window (GOOD starter):\\n```\\nfrom typing import List\\ndef max_sum_k(nums: List[int], k: int) -> int:\\n    '''Find the maximum sum of k consecutive elements.'''\\n    raise NotImplementedError('TODO: sliding window with running sum')\\n```\\nEXAMPLE 1 — Sliding window (GOOD solution_code):\\n```\\nfrom typing import List\\ndef max_sum_k(nums: List[int], k: int) -> int:\\n    if not nums or k <= 0 or k > len(nums): return 0\\n    cur = sum(nums[:k]); best = cur\\n    for i in range(k, len(nums)):\\n        cur += nums[i] - nums[i-k]; best = max(best, cur)\\n    return best\\n```\\n\\nEXAMPLE 2 — Two pointers (GOOD starter, sentinel return):\\n```\\nfrom typing import List\\ndef remove_duplicates(nums: List[int]) -> int:\\n    '''In-place dedup of a sorted list. Returns new length k.'''\\n    return 0  # TODO: two-pointer write/scan\\n```\\nEXAMPLE 2 — (GOOD solution_code):\\n```\\nfrom typing import List\\ndef remove_duplicates(nums: List[int]) -> int:\\n    if not nums: return 0\\n    k = 1\\n    for i in range(1, len(nums)):\\n        if nums[i] != nums[k-1]:\\n            nums[k] = nums[i]; k += 1\\n    return k\\n```\\n\\nEXAMPLE 3 — WHAT NOT TO DO (starter was REJECTED 5 times by the invariant gate):\\n```\\n# BAD — the function is fully implemented. LangGraph rejects.\\ndef remove_duplicates(nums):\\n    if not nums: return 0\\n    k = 1\\n    for i in range(1, len(nums)):\\n        if nums[i] != nums[k-1]:\\n            nums[k] = nums[i]; k += 1\\n    return k  # \u2190 this is a solution, not a starter\\n```\\nThe BAD starter has multi-statement body + no NotImplementedError/sentinel. The AST check rejects immediately.>",
   "expected_output": "<The expected stdout / query results / parsed shape when the code runs correctly.>",
   "demo_data": {
-    "language": "python",
+    "language": "<PINNED to the course's language — see LANGUAGE LOCK block below. e.g. 'typescript' for a TS course, 'go' for a Go course, 'python' for a Python course. NEVER default to Python unless the course IS Python.>",
     "schema_setup": "<SQL DDL only when language=sql — runs before learner code. Otherwise OMIT this field.>",
     "seed_rows": "<Only when language=sql — array of {\\"table\\": name, \\"rows\\": [{col: val}, ...]} for seeding. Otherwise OMIT.>",
     "starter_files": "<F26: ONLY when the learner's code references external filesystem state (os.walk / Path.glob / open). Array of {\\"path\\": str, \\"contents\\": str} — 2-20 files, each < 5KB. Sandbox materializes into tempdir and binds `repo_path = <dir>` into globals. OMIT when the exercise is pure-algorithm.>",
@@ -5002,7 +7842,7 @@ Generate ONLY JSON (no fences):
   },
   "validation": {
     "hint": "<One-sentence hint for stuck learners>",
-    "hidden_tests": "<Python/JS/Go test source the grader runs inside Docker against the learner's submission. **CAP AT 4-6 TEST FUNCTIONS** (L6 fix 2026-04-22 — more tests slow Docker + make the solution/starter invariant harder to satisfy). Real assertions against real behavior (not `assert 1==1`). MUST `from solution import <name>` so the tests can find the learner's function. Include: 1 happy-path test, 1 edge case (empty/zero), 1 boundary (single element or large), 1-2 adversarial (wrong return would fail). Cheese-proof: no amount of string-stuffing satisfies a real assertion.>",
+    "hidden_tests": "<Python/JS/Go test source the grader runs inside Docker against the learner's submission. This field determines whether learners ACTUALLY LEARN the skill or just pass with lucky trivial stubs. Weak tests = the course fails at its job. TREAT THIS FIELD AS THE MOST IMPORTANT OUTPUT IN THIS STEP.\\n\\n### MANDATORY TEST COUNT: minimum 4, target 5-6, max 8. Less than 4 is REJECTED.\\n\\n### ANTI-STUB COVERAGE — every code_exercise MUST have tests that defeat ALL of these trivial stubs:\\n  - `return 0` / `return None` / `return []` / `return {}` / `return ''` / `return False`\\n  - `return 1` / `return -1`\\n  - `return args[0]` (echo first arg) / `return len(args[0])` (echo length)\\n  - `return sum(args[0])` / `return max(args[0])` / `return min(args[0])`\\n  - `return sorted(args[0])` (if output is not sorted input) / `return list(reversed(args[0]))`\\nBefore finalizing tests, mentally run EACH of those 10 stubs through your test set. For each stub, at least ONE test MUST fail. If you find a stub that passes all tests, YOUR TESTS ARE TOO WEAK — add adversarial inputs until every stub fails at least one test.\\n\\n### REQUIRED TEST CATEGORIES (at least one test per category, 4 categories = 4 tests minimum):\\n  1. **Happy path** — canonical valid input, a realistic use of the function. Expected output is non-trivial (not 0, not None, not empty).\\n  2. **Edge case — empty or zero** — empty list/string/dict, k=0, or whatever the degenerate input is for this function. Test should have a SPECIFIC expected output for the empty case (not just \\\"doesn't crash\\\").\\n  3. **Boundary case** — single element, k=len(input), the largest valid k, or the wraparound case. Reveals off-by-one bugs. Input and expected output must be DISTINCT from the happy-path case.\\n  4. **Adversarial / correctness** — an input DESIGNED so that `return 0`, `return input[0]`, or `return sum(input)/len(input)` gives a WRONG answer. Pick inputs where the correct output is non-obvious. Example: for max-subarray-sum with k=2, use `[1, -1, 1, -1, 5, 5, -1]` → expected `10` (positions 4-5), and `return sum(input)/len(input)` gives `~1.3` — clearly wrong.\\n\\n### OPTIONAL BUT STRONGLY RECOMMENDED:\\n  5. **Larger input test** — 10+ elements with a non-obvious expected output (compute it from the solution, not guess). Catches implementations that only work on toy inputs.\\n  6. **Type / shape test** — confirms return type matches spec (len(returned) == expected_len; isinstance(returned, list); etc.). Catches implementations that return wrong shape but happen to match the first 1-2 tests.\\n\\n### FORM:\\nReal pytest assertions against real behavior. NEVER `assert 1==1`, NEVER commented-out tests, NEVER `assert True` placeholders. MUST `from solution import <name>` so tests find the learner's function. Each test is a `def test_<short_name>():` with a single assert (or pytest.approx for floats).\\n\\n### GOOD EXAMPLE — max_avg_subarray (6 tests, defeats all trivial stubs):\\n```\\nfrom solution import max_avg_subarray\\n\\ndef test_happy_path():\\n    assert max_avg_subarray([1, 12, -5, -6, 50, 3], 4) == 12.75\\n\\ndef test_empty_returns_zero():\\n    assert max_avg_subarray([], 3) == 0  # explicit zero, not None\\n\\ndef test_k_equals_len():\\n    assert max_avg_subarray([1, 2, 3, 4], 4) == 2.5\\n\\ndef test_defeats_overall_average_stub():\\n    # return sum(nums)/len(nums) would give 0.0 here, but real answer is 4.0\\n    assert max_avg_subarray([-3, -2, 4, 4, -3], 2) == 4.0\\n\\ndef test_defeats_first_window_stub():\\n    # return sum(nums[:k])/k would give 3.0, but real answer is 5.0 (last window)\\n    assert max_avg_subarray([1, 2, 3, 4, 5, 6], 2) == 5.5\\n\\ndef test_single_element_k_one():\\n    assert max_avg_subarray([42], 1) == 42.0\\n```\\nThis test set DEFEATS: `return 0` (fails test_happy_path), `return 1` (fails test_happy_path), `return sum(nums)/len(nums)` (fails test_defeats_overall_average_stub), `return sum(nums[:k])/k` (fails test_defeats_first_window_stub).\\n\\n### BAD EXAMPLE — don't emit this:\\n```\\nfrom solution import max_avg_subarray\\ndef test_one():\\n    assert max_avg_subarray([1, 2, 3, 4], 2) == 3.5\\n```\\nSingle test. `return 3.5` passes it. The learner passes with `return 3.5`. COURSE FAILS TO TEACH. This is the failure mode we're preventing.>",
     "solution_code": "<Complete working solution. Pre-publish validation runs this against hidden_tests in Docker and asserts all tests pass. Also runs starter code against the same tests and asserts at least one fails. If either invariant breaks, the exercise is regenerated (LangGraph solution/starter invariant, 2026-04-22).>",
     "requirements": "<Optional. For Python: `requirements.txt` content (one pip dep per line). For JS/TS: `package.json` content. For Go: `go.mod` content. The Docker runner installs these before running tests. Use when the exercise needs real libraries (sqlalchemy, fastapi, httpx, bcrypt, pytest-asyncio, confluent-kafka, opentelemetry-api, strawberry-graphql, etc.) — do NOT mock them anymore.>",
     "must_contain": ["<LEGACY signal — substring checks on the learner's source. Kept for courses where real test execution isn't wired yet; but hidden_tests is PREFERRED because must_contain is cheese-able. Emit both while we transition.>"]
@@ -5029,8 +7869,8 @@ CAPSTONE SCAFFOLD PRIMITIVES (F26, shipped 2026-04-21 — MANDATORY when code re
   }}
 - With `starter_files` present, expected_output + must_contain can assert findings derived from the real files (file counts, import edges, identifier presence) — the learner can actually produce those now.
 
-LANGUAGE-AWARE SANDBOX (D.2 Phase 1+2 shipped 2026-04-21):
-- MANDATORY: emit `demo_data.language` — one of: "python" (default), "sql", "yaml", "dockerfile", "shell". Frontend + grader dispatch by this field.
+LANGUAGE-AWARE SANDBOX (D.2 shipped 2026-04-21; v8.6 fix 2026-04-24 after TS v12 bug):
+- MANDATORY: emit `demo_data.language` — the value is PINNED to the course's language (see the LANGUAGE LOCK block injected below this prompt). DO NOT guess or default — just echo the pinned value. Supported values: "python" | "javascript" | "typescript" | "ts" | "go" | "java" | "rust" | "sql" | "yaml" | "dockerfile" | "shell". Frontend + grader dispatch by this field to a per-language Docker runner.
 - `"python"` — sandboxed_exec, Python 3.11+, mocked libs (anthropic, weaviate, langchain, pinecone, langfuse).
 - `"sql"` — in-memory SQLite. MUST include `demo_data.schema_setup` (DDL: CREATE TABLE / CREATE INDEX / etc, multi-statement) AND `demo_data.seed_rows` ([{"table": name, "rows": [{col: val}]}]) so the learner's query has data to hit. The learner's code is a SELECT/CTE; the output is the last SELECT's rows. Use realistic domain tables (customers / orders / events / claims — not foo/bar). `must_contain` asserts SQL constructs in the learner's query ("SUM(", "JOIN", "GROUP BY").
 - `"yaml"` — YAML parse + optional JSON-schema validation. `demo_data.schema` (JSON Schema) may assert required keys/types/paths. `must_contain` asserts substrings in the YAML text ("apiVersion: apps/v1", "kind: Deployment"). Use for k8s manifests, GitHub Actions, Ansible, docker-compose, Helm values. NOT for Dockerfiles — use "dockerfile" for those.
@@ -5061,7 +7901,35 @@ BANNED TASK PATTERNS (user report 2026-04-21, single-pane editor cannot support 
 3. "READ THE EXISTING CODEBASE": Any task that assumes the learner can browse/inspect a repo beyond the provided `code` field. No GitHub-URL references as prerequisites.
 If the step REQUIRES cross-language comparison (rare — only for language-fluency teaching), embed the "before" code directly in `content` inside a styled `<pre><code>` block and be explicit: "Translate the Java snippet above into Python in the editor below." The primary language of the `code` field is the one the learner writes."""
     elif step_type == "fill_in_blank":
-        if is_non_engineering:
+        if is_zero_code:
+            # v8.6.2 (2026-04-24) — ZERO-CODE / NON-CODER fill_in_blank.
+            # Expert review 2026-04-24 flagged 3 fill_in_blank steps in
+            # AI-Powered Workday using Python syntax (`task_name = ""`, dict
+            # literals, f-strings, print()) — directly violates the course's
+            # zero-code promise. Non-coder PMs see Python and bail on day one.
+            #
+            # Rule for zero-code fill_in_blank: LABEL-COLON-BLANK shape, NEVER
+            # code syntax. `#` / `//` comments forbidden. `=` assignment
+            # forbidden. `print()` / f-strings / dict literals / list literals
+            # forbidden. Shape is strictly:
+            #    Section / subsection headers as lines with : at the end
+            #    Each blank is "<Human-readable label>: ____"
+            # No variable-assignment cosmetics. No code dressing.
+            prompt += """{
+  "content": "<HTML setup (120-220 words) for a NON-CODER audience (PM / ops / CS / legal / marketer / people-ops). The content explains WHY filling in these fields matters for the learner's workflow. NO code vocabulary. NO 'variable', 'assign', 'dict', 'list', 'f-string', 'print statement'. Frame as 'filling a worksheet' / 'completing a brief' / 'capturing your notes'.>",
+  "code": "<A PLAIN-TEXT FORM. Each line is either:\\n  (a) A section header ending with a colon and NO blank, e.g. 'BEFORE BASELINE:' or 'Task 1:', OR\\n  (b) A labeled blank in the exact shape 'Human-readable label: ____' (four underscores) — e.g. 'Task name: ____', 'Current time cost (minutes): ____', 'Target audience: ____'.\\nSTRICTLY FORBIDDEN in zero-code fill_in_blank: variable assignment syntax (`foo = \\\"\\\"`), dict literals (`{ \\\"key\\\": \\\"value\\\" }`), list literals, f-strings (`f\\\"...\\\"`), print() calls, `#` or `//` comments, quoted string values, code fences. Treat the template like a paper form a learner fills in — that is all it is. 5-8 blanks total.>",
+  "validation": {
+    "blanks": [
+      {"index": 0, "hint": "<1-line what they should write — e.g. 'Your highest-frequency recurring task'>", "answer": "<example value for reference only — grader does NOT exact-match, it checks the LLM rubric below>", "alternatives": []},
+      {"index": 1, "hint": "<hint>", "answer": "<example>", "alternatives": []}
+    ],
+    "rubric": "<LLM-rubric string (120-250 words) — what a passing set of answers looks like. Name 3-5 specific criteria a zero-code worksheet must satisfy. Example: 'Each task name is specific (NOT 'write report' — SPECIFIC like 'Weekly ops status for Marcus Chen + VPs every Friday 4pm'). Current time costs are realistic (stopwatch measurement, not estimate). Target audiences are named people + roles, not 'stakeholders'. Any compliance/numbers-touching task carries a HUMAN-VERIFY note.' The grader LLM evaluates the concatenated 'Label: learner_answer' pairs against this rubric.>",
+    "passing_threshold": 0.6
+  }
+}
+
+HARD RULE: if ANY line in `code` contains `=`, `print`, `def `, `{`, `}`, `[`, `]` outside of a blank's `____`, the step will be rejected. Use plain form shape only. The validation.rubric field is NON-OPTIONAL — without it, the grader exact-matches and punishes sensible PM paraphrases with 0%."""
+        elif is_non_engineering:
             prompt += """{
   "content": "<HTML explaining the topic. Since subject is non-engineering, this fill-in-blank uses a STRUCTURED TEMPLATE (e.g. a research proposal template, interview script, report outline) where learners fill in key fields — NOT Python code. Example: 'Research Question: ____, Method: ____, Sample Size: ____'. 5-8 blanks.>",
   "code": "<The template as a multi-line string with exactly N ____ placeholders, using # comments to frame sections. NOT Python code — treat it as a plain text template.>",
@@ -5241,7 +8109,40 @@ LINE-NUMBER ACCURACY RULES (Priya + Riley learner reviews 2026-04-20 + Alex/Morg
   "validation": {"correct_answer": 1}
 }"""
     elif step_type == "system_build":
-        if is_non_engineering:
+        if is_zero_code:
+            # v8.6.2 (2026-04-24) — ZERO-CODE / BROWSER-ONLY capstone. Non-coder
+            # audience (PMs, ops, CSMs, legal, finance, marketers) learning to use
+            # claude.ai in the browser. The deliverable is a MARKDOWN DOC the
+            # learner pastes + LLM-rubric grading. NO gha_workflow_check, NO
+            # endpoint_check, NO Dockerfile, NO git / GitHub / CLI — violates the
+            # zero-code promise and locks non-coders out. Non-tech beginner review
+            # 2026-04-24 flagged `validation.gha_workflow_check` on AI-Powered
+            # Workday capstone as primary ship-blocker.
+            prompt += """{
+  "content": "<Mission briefing HTML (250-400 words) for a ZERO-CODE / BROWSER-ONLY capstone. The learner is a non-coder professional (PM / ops / CSM / legal / marketer / recruiter) who uses claude.ai IN THE BROWSER. They do NOT have a terminal, they do NOT run Docker, they do NOT push to GitHub, they do NOT deploy. DELIVERABLE shape: a markdown DOCUMENT (prompt library / workflow map / audit checklist / template pack) they paste into a textarea. The rubric grades the MARKDOWN on: specificity (could a colleague use it unchanged?), measurement realism (time-saved claims grounded, not vanity), adaptation guide (teaches a teammate how to adapt, not just use), hallucination-risk call-outs where needed. NO 'push to GitHub', NO 'run GitHub Actions', NO 'set up a repo', NO 'paste the workflow URL'. The only action the learner takes outside the browser is: write the doc, paste it, submit. NO git / CLI / deploy instructions anywhere in content or checklist.>",
+  "demo_data": {
+    "phases": [
+      {"id": "structure", "title": "<Phase 1 — e.g. 'Pick 3 tasks and outline each template (15 min)'>"},
+      {"id": "draft", "title": "<Phase 2 — e.g. 'Draft template spec + 1 example input/output (45 min)'>"},
+      {"id": "review", "title": "<Phase 3 — e.g. 'Self-test on a real task + measure time (20 min)'>"},
+      {"id": "share", "title": "<Phase 4 — e.g. 'Write meta-guide + paste to review (10 min)'>"}
+    ],
+    "checklist": [
+      {"id": "c1", "label": "<Imperative action in the BROWSER, not CLI. GOOD: 'Write 3 prompt-template sections, each with goal + audience + format + 1 example input + 1 example output', 'Measure BEFORE-time for one of the tasks manually (stopwatch)', 'Flag where the template needs a human-verify step'. BANNED verbs: git, commit, push, fork, repo, GitHub, PR, deploy, Docker, actions, workflow, CLI, terminal, API key.>"},
+      {"id": "c2", "label": "<Another browser-only deliverable>"},
+      {"id": "c3", "label": "<Another>"},
+      {"id": "c4", "label": "<Another>"},
+      {"id": "c5", "label": "<Another>"},
+      {"id": "c6", "label": "<Another>"}
+    ],
+    "paste_prompt": "<One-sentence instruction for the learner on WHAT to paste into the submit textarea. E.g. 'Paste your complete Team Prompt Library markdown doc below. It must include 3 templates + a meta-adaptation guide.'>"
+  },
+  "validation": {
+    "rubric": "<The LLM-rubric text the grader uses. 120-300 words. Must enumerate 4-6 criteria tied to the course's learning outcome. Each criterion names SPECIFICALLY what 'good' looks like. E.g.: 'Specificity — each template is specific enough that a colleague unfamiliar with the task could use it without asking follow-up questions (NOT vague like WRITE A STATUS UPDATE — specific like WRITE A WEEKLY OPS STATUS FOR CEO+VPS, 400 WORDS MAX, BULLETED WINS/RISKS/ASKS). Measurement realism — time deltas cited are grounded (learner actually timed a real task) not vanity metrics (RESEARCH SHOWS 10X FASTER). Adaptation — the meta-guide teaches a teammate HOW to adapt a template to their role, not just WHICH template to use. Hallucination callouts — any template whose output touches numbers/names/compliance includes a verify-before-ship note.' Grader returns score 0-1 against threshold 0.7.>",
+    "passing_threshold": 0.7
+  }
+}"""
+        elif is_non_engineering:
             # System build doesn't fit — return a structured capstone report instead
             prompt += """{
   "content": "<Mission briefing HTML for a NON-ENGINEERING capstone. Since this is a non-engineering course, this 'capstone' should be a COMPREHENSIVE RESEARCH/DESIGN/BUSINESS DELIVERABLE, not a code deployment. Describe: (1) The real-world deliverable the learner produces (e.g., complete UX research report, product strategy doc, design system audit), (2) Acceptance criteria, (3) How they'd present it to stakeholders, (4) How to measure success. Include phases as discrete deliverables, not software deployment stages. 300-500 words.>",
@@ -5282,16 +8183,34 @@ LINE-NUMBER ACCURACY RULES (Priya + Riley learner reviews 2026-04-20 + Alex/Morg
     ]
   },
   "validation": {
+    "gha_workflow_check": {
+      "repo_template": "<Public GitHub repo template the learner forks, e.g. 'skills-lab-demos/fastapi-capstone'. Creator picks the repo; it must have a .github/workflows/lab-grade.yml that runs tests + asserts success. The learner forks, pushes, watches Actions run, then pastes the run URL.>",
+      "workflow_file": "lab-grade.yml",
+      "expected_conclusion": "success",
+      "grading_job": "<optional — if set, the specific job name inside the workflow that must succeed (e.g. 'grade'). Omit to require run-level success.>",
+      "instructions_md": "1. Fork the repo above. 2. Clone locally + implement. 3. Push to any branch. 4. GitHub Actions runs lab-grade.yml. 5. Paste the run URL (https://github.com/<your>/<fork>/actions/runs/<id>) and click 'Check my CI'."
+    },
     "endpoint_check": {
-      "url": "<optional default URL template — the LEARNER submits theirs at submit time and it overrides this>",
-      "method": "GET",
-      "status": 200,
-      "contains": ["<substring the response body MUST contain, e.g. 'healthy'>", "<another expected substring>"],
-      "json_contains": {"<dotted.path.in.json>": "<expected value>"},
+      "url": "<ALTERNATIVE to gha_workflow_check: the learner deploys the service themselves + pastes a live URL. Use this ONLY when the capstone is a long-running service (not a batch build). Creator supplies a template URL like 'https://<learner-deploy>.railway.app/healthz' — the learner replaces it via the deploy-URL paste box. Don't emit both gha_workflow_check and endpoint_check; pick one.>",
+      "method": "GET", "status": 200,
+      "contains": ["<substring the response body MUST contain>"],
+      "json_contains": {"<dotted.path>": "<expected>"},
       "timeout_s": 10
     }
   }
 }
+
+CAPSTONE ATTESTATION CHOICE (P1-1 fix, 2026-04-22):
+- PREFER `gha_workflow_check` for any capstone whose deliverable is a build,
+  test suite, Dockerfile, Helm chart, Terraform config, or any artifact that
+  can be verified by CI running inside GitHub Actions. This is the no-deploy
+  path: learner pushes code, GHA tests + reports, grader polls the conclusion.
+- USE `endpoint_check` only when the capstone requires a live running service
+  the learner actually deploys (Railway / Fly.io / Vercel) AND the probe
+  itself is the meaningful verification. For a 2-hour capstone, `endpoint_check`
+  forces the learner to set up a hyperscaler account — too much friction.
+- Pick ONE. If the Creator emits BOTH, gha_workflow_check wins at scoring time
+  (it's more robust + cheaper + doesn't expose learner-side infra).
 
 MANDATORY AUTOMATED VALIDATION (Sophia + Tomás learner reviews 2026-04-20; endpoint_check HTTP probe shipped 2026-04-21):
 - Do NOT emit `validation: {"manual_review": true}` as the sole validator for a technical course's system_build capstone. That ships an ungraded capstone — a learner can paste lorem ipsum and "pass".
@@ -5317,6 +8236,36 @@ ENGINEERING-CAPSTONE GENRE LOCK (non-negotiable):
   * Any "Organizational Readiness" / "Business Case Document"
 - If the course title has words like "Product", "Operations", "Strategy" — the capstone is STILL a coding deliverable. Those words describe the DOMAIN; the capstone is the CODE that ships.
 - Scenario consistency: use the SHARED SCENARIO (see === SHARED ... SCENARIO === block above) — company name, feature, stack — verbatim. Do not invent alternative names here."""
+    elif step_type == "terminal_exercise":
+        # BYO-execution: learner runs commands in their OWN terminal, pastes output.
+        # We grade via LLM-rubric on the paste. Used for courses where the skill
+        # lives on the learner's workstation (Claude Code, kubectl, git, etc.).
+        # SECURITY RULE (CLAUDE.md §HARD RULE): we NEVER collect or see API keys.
+        prompt += """{
+  "content": "<HTML briefing, 150-300 words. Explain WHAT this exercise teaches + WHY it matters for real-world use of this tool. NO terminal commands in the briefing — those go in `demo_data.instructions`. Use styled cards (background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px;). Include a 'what you'll see' preview — one or two sentences on what success looks like. If Module 1 Step 1, include a compelling hook (the single coolest thing this tool does) so the learner feels urgency to install + try.>",
+  "demo_data": {
+    "instructions": "<HTML block with the EXACT commands the learner must run on their own machine. Use <pre><code>$ command here</code></pre> for every command. ALWAYS include: (1) what the command does, (2) what output they should expect, (3) common error + fix below each command. Example structure:\\n<h3>Step 1: Install</h3>\\n<pre><code>$ curl -fsSL https://claude.ai/install.sh | bash</code></pre>\\n<p>Expected: 'Claude Code installed. Run claude --version to verify.'</p>\\n<details><summary>Got EACCES error?</summary>Try <code>sudo -E curl ...</code></details>\\n<h3>Step 2: Verify</h3>\\n<pre><code>$ claude --version</code></pre>. PLATFORM-AWARE: if install varies by OS, use tab-like sections: <h4>macOS</h4>...<h4>Linux</h4>...<h4>Windows/WSL</h4>... Each with its own command block.>",
+    "byo_key_notice": true,
+    "asciinema_url": "<OPTIONAL: path to a pre-recorded .cast file demo for this step. Omit unless a recording exists.>"
+  },
+  "validation": {
+    "hint": "<One-line hint for stuck learners. E.g. 'If brew isn't installed, try the curl | bash path instead.'>",
+    "rubric": "<Grader rubric, 60-150 words. PLAIN ENGLISH describing what a CORRECT pasted output contains. Example for a `claude --version` step: 'The paste should show a version string like `claude-code 0.x.y`. Accept any version >=0.5. Partial credit (0.5) if the paste shows Claude Code successfully installed but no version command run. 0 if paste shows a different tool or an error.' The backend sends this rubric + paste to Claude, which returns 0-1 score. Be specific enough that an LLM can grade deterministically.>",
+    "must_contain": ["<LIST of substrings that MUST appear in the paste for it to count — the cheap first-pass check. For `claude --version`: [\\"claude\\"]. For `echo hi`: [\\"hi\\"]. Empty list = skip must_contain check. 1-3 items typical.>"]
+  }
+}
+
+### TERMINAL_EXERCISE AUTHORING RULES (MANDATORY)
+
+1. **Commands ALWAYS in `demo_data.instructions`, never in content briefing.** Briefing = WHY, instructions = HOW.
+2. **Every command needs**: the command, expected output (1-line), top-1 error + fix. Wrapped in a collapsible <details> for the error.
+3. **Platform-aware** for installs: show macOS / Linux / Windows+WSL variants side-by-side with <h4> sections.
+4. **NEVER** ask for API keys in the instructions. The `byo_key_notice: true` flag renders our fixed informational panel. Key handling is ENTIRELY on the learner's machine (`claude /login` or env var). No exceptions.
+5. **Rubric writes like a grader's cheat-sheet**. Must be prescriptive enough that an LLM grading the paste can say "this meets the bar" or "this doesn't." Include what 1.0 / 0.5 / 0 look like.
+6. **must_contain is the cheap gate** — 1-3 substrings that prove the learner actually ran something, not pasted arbitrary text. Keep it forgiving (substring only, not regex).
+7. **Briefing content must excite + orient**. For Module 1, answer "what's the wow moment?" within the first sentence. For later modules, assume they've completed prior steps and jump into the new concept.
+8. **hint** is a single sentence. A stuck beginner should unblock within 10 seconds of reading it.
+9. **NEVER invent CLI commands, flags, or tool subcommands.** v8.6.1 (2026-04-24) fix for `claude auth` hallucination: the Creator previously invented `claude auth` in an M0 hint — Claude Code has NO such subcommand. Real commands are `claude /login` (interactive) or `ANTHROPIC_API_KEY` env-var (headless). For every CLI invocation in `instructions` / `hint` / `rubric`, either (a) quote it from the runtime-deps brief / source_material verbatim, (b) use a command you KNOW exists in the tool's public docs, or (c) replace with generic phrasing ("configure your credentials per the tool's `/login` flow"). If unsure whether a flag or subcommand exists, OMIT the specific syntax and describe the intent. Invented CLI syntax is the single most common trust-breaker on a learner's first CLI touch."""
     elif step_type == "adaptive_roleplay":
         prompt += """{
   "content": "<HTML setup (30-80 words) — framing for the roleplay. Kept short because the live chat does the teaching.>",
@@ -5450,7 +8399,21 @@ IMPORTANT for incident_console:
         "code_exercise", "code_review", "system_build", "incident_console",
         "concept", None, "",  # intro concept widgets + any step with no exercise_type
     }
-    _max_tokens = 6000 if step_type in _token_heavy else 3500
+    # v8.6 (2026-04-24) — bumped code_exercise/capstone ceiling from 6000 → 10000.
+    # Post-v14 capstone regens kept hitting `Expecting value` JSON parse errors
+    # at char 12500-13200 — the LLM was getting cut off mid-solution_code (rich
+    # TS capstones emit: content HTML ~2k + starter ~2k + solution ~4k +
+    # hidden_tests ~3k + requirements ~0.5k + must_contain ~0.3k ≈ 12k chars
+    # ≈ 3000 tokens). Plus JSON escaping + indentation overhead, total output
+    # ~4500-5500 tokens. 6000 cap was on the edge → truncation → bad JSON.
+    # 10000 gives headroom and is 5% of Sonnet 4's 200k context.
+    # v8.6.1 (2026-04-24) — bumped 10000 → 16000 for code_exercise because TS
+    # capstone steps with long Zod schemas + discriminated union tests hit
+    # the limit. Observed: validation field alone 9064 chars, total response
+    # truncated mid-string → LLM falls back to stringifying validation, which
+    # then fails JSON parse at char 8944. Bumping headroom eliminates the
+    # stringification class. Sonnet 4 supports 64k output; 16k is 25% of max.
+    _max_tokens = 16000 if step_type in _token_heavy else 3500
     # Gap B (2026-04-22): append retry_hint + use Opus on final retries.
     if retry_hint:
         prompt += f"\n\n=== RETRY GUIDANCE (PREVIOUS ATTEMPT REJECTED) ===\n{retry_hint}\n"
@@ -5466,7 +8429,122 @@ IMPORTANT for incident_console:
                 logging.info("L5 pattern hit: step=%r matched pattern=%s", step_title, pat.id)
         except Exception as _ie:
             logging.warning("L5 pattern lookup failed (non-fatal): %s", _ie)
+
+    # 2026-04-23 v8.2 — RUNTIME-DEPS BRIEF (user directive: "did we specify
+    # the library versions to sonnet while generating ts project?"). When
+    # the LLM writes code_exercise solutions + tests, it must target the
+    # EXACT versions pinned in our Docker runner images. Without this the
+    # LLM wrote TypeScript that triggered ts-jest transform errors + TS
+    # compile-error roulette across 5 retries. Now every code_exercise in a
+    # supported language sees its runtime's pinned version list.
+    # Policy: CLAUDE.md §RUNTIME-DEPS BRIEF.
+    if step_type == "code_exercise":
+        try:
+            # Language comes from course_context (the LLM hasn't emitted
+            # demo_data yet — it's what we're PROMPTING it to emit). Default
+            # Python. Bug fix 2026-04-23: previously this referenced a
+            # non-existent `demo_data` variable → NameError → brief never
+            # injected → TS + FastAPI regens wrote code blind to runtime
+            # versions (hit BaseSettings-moved / TS2440 / etc.).
+            _lang = "python"
+            if isinstance(course_context, dict):
+                _lang = str(
+                    course_context.get("language")
+                    or course_context.get("course_language")
+                    or "python"
+                ).lower()
+            _brief = _runtime_deps_brief(_lang)
+            if _brief:
+                prompt += "\n\n" + _brief + "\n"
+            # v8.6.1 (2026-04-24) — inject Claude Code reference facts when
+            # the course clearly touches Claude Code (BYO-key flows, MCP,
+            # custom subagents, hooks). Domain-expert caught 5 factual
+            # errors (invented `claude auth`, wrong hook contract, wrong
+            # settings.json shape, lowercased tool names) on the first
+            # AIE course — LLM's training data of Claude Code is stale.
+            # The facts block grounds the LLM in verbatim-correct syntax.
+            try:
+                _cc_title = ""
+                _cc_desc = ""
+                _cc_src = ""
+                if isinstance(course_context, dict):
+                    _cc_title = str(course_context.get("course_title") or course_context.get("title") or "")
+                    _cc_desc = str(course_context.get("description") or "")
+                    _cc_src = str(course_context.get("source_material") or "")
+                _cc_title = _cc_title or (step_title or "")
+                if _course_has_claude_code_scope(_cc_title, _cc_desc, _cc_src):
+                    prompt += "\n\n" + _claude_code_reference_facts() + "\n"
+            except Exception as _cc_err:
+                logging.warning("Claude Code facts injection failed (non-fatal): %s", _cc_err)
+            # v8.6 (2026-04-24) LANGUAGE LOCK — domain-expert review of TS v12
+            # caught 7/10 code_exercise steps shipping as Python despite a TS
+            # course. Root cause: the static code_exercise prompt listed Python
+            # as default and never mentioned TS/JS/Go/Java/Rust by name, so
+            # the LLM defaulted to the menu's first item. Fix: inject a DYNAMIC
+            # block right after the runtime-deps brief, asserting the EXACT
+            # language the course was pinned to. The LLM has no choice but to
+            # emit `demo_data.language = <course_lang>` — no more "I'll default
+            # to Python" drift. This block ships verbatim for every code_exercise
+            # retry too, so simplify + retry paths can't drift either.
+            if step_type == "code_exercise" and _lang:
+                prompt += (
+                    "\n## LANGUAGE LOCK — NON-NEGOTIABLE\n"
+                    f"This course is pinned to: **{_lang}**.\n"
+                    f"- `demo_data.language` MUST equal `\"{_lang}\"` (exact string).\n"
+                    f"- `code` (starter) MUST be {_lang} source — {_lang} syntax, "
+                    f"{_lang} idioms, {_lang} imports. NOT Python unless {_lang} IS python.\n"
+                    f"- `validation.solution_code` MUST be {_lang} source.\n"
+                    f"- `validation.hidden_tests` MUST be {_lang}'s test framework — "
+                    f"pytest for python; jest for typescript/ts/javascript/js; `go test` "
+                    f"for go; cargo test for rust; JUnit for java.\n"
+                    f"- If you emit anything other than {_lang} here, the grader will "
+                    f"route to the wrong Docker image, tests will NOT validate the "
+                    f"learner's actual language, and the course ships broken (this "
+                    f"exact bug sank TS v12 — 7/10 code steps shipped Python by default).\n"
+                    f"- If the step's natural framing in {_lang} differs from the "
+                    f"Python example scaffolds above, translate the PATTERN into "
+                    f"{_lang} — do NOT copy Python code. Example: Python `raise NotImplementedError` "
+                    f"→ TS `throw new Error('TODO')`; Go `panic(\"TODO\")`; Rust `todo!()`; "
+                    f"Java `throw new UnsupportedOperationException(\"TODO\")`.\n"
+                )
+        except Exception as _re:
+            logging.warning("runtime_deps_brief injection failed (non-fatal): %s", _re)
+    # v8.5 Phase H (2026-04-24, Opus #8): inject LOCKED SCAFFOLD into prompt
+    # when one is provided via course_context["scaffold"]. The scaffold was
+    # generated ONCE per step by Opus (see _generate_scaffold_with_opus) and
+    # is passed through the retry loop unchanged. Sonnet (Stage 2) fills
+    # bodies; the interface contract stays pinned so tests and solution can't
+    # drift apart. (Param is `step_type`, not `exercise_type` — fixed 2026-04-24.)
+    if step_type == "code_exercise" and isinstance(course_context, dict):
+        _scaffold = course_context.get("scaffold")
+        if _scaffold:
+            _scaffold_block = _render_scaffold_as_prompt_block(_scaffold)
+            if _scaffold_block:
+                prompt += "\n" + _scaffold_block + "\n"
     _model = model_override or _STEP_CONTENT_MODEL
+    # v8.6 (2026-04-24) — tool-use ENFORCED for code_exercise. Per buddy-Opus
+    # consult: "Coerce aggressively, log the miss, don't fallback. Falling
+    # back to freeform re-introduces the parse-failure class you just
+    # eliminated." So: tool-use return None → RETURN None (caller counts
+    # as llm_error, retries). NO freeform-JSON fallback for code_exercise.
+    if step_type == "code_exercise":
+        result = _llm_tool_use_call(
+            CREATOR_SYSTEM_PROMPT, prompt, _CODE_EXERCISE_TOOL_SCHEMA,
+            max_tokens=_max_tokens, model=_model,
+        )
+        if result is None:
+            logging.warning(
+                "tool_use returned None for code_exercise step=%r — NO fallback to freeform JSON "
+                "(caller will count as llm_error and retry with tool-use again)",
+                (step_title or "")[:60],
+            )
+            return None
+        # v8.6.1 (2026-04-24) — FLAT → NESTED reshape. See _CODE_EXERCISE_TOOL_SCHEMA
+        # comment. Pipeline downstream expects the nested {validation:{…},
+        # demo_data:{…}} form; the tool_use schema is FLAT to avoid the LLM's
+        # validation-as-stringified-json attractor. Reshape here so the rest
+        # of the pipeline is unaware of the flat schema.
+        return _reshape_flat_code_exercise(result)
     result = _llm_json_call(CREATOR_SYSTEM_PROMPT, prompt, max_tokens=_max_tokens, model=_model)
     return result
 
@@ -5572,7 +8650,12 @@ def _generate_refined_outline(
                 ))
             elif is_capstone and s == steps_per_module - 1:
                 # Last step of capstone is a bigger exercise
-                ex_type = "code_exercise" if course_type == "technical" else "scenario_branch"
+                # 2026-04-22 v8: CLI-tool courses get a terminal_exercise capstone
+                # (running commands end-to-end), not code_exercise.
+                if course_type == "technical":
+                    ex_type = "terminal_exercise" if _is_cli_tool_subject(title, session.get("description", "")) else "code_exercise"
+                else:
+                    ex_type = "scenario_branch"
                 steps.append(CreatorStepOutline(
                     title="Capstone Exercise",
                     exercise_type=ex_type,
@@ -6012,9 +9095,53 @@ Return exactly one token: Beginner OR Intermediate OR Advanced."""
     return None
 
 
-@app.post("/api/creator/start", response_model=CreatorStartResponse)
+@app.post("/api/creator/start")
 async def creator_start(req: CreatorStartRequest):
+    """Enqueue initial-outline generation on celery. Returns immediately
+    with a session_id + task_id. Client polls
+    GET /api/creator/session/{session_id}/status to get the questions +
+    initial outline once the task completes.
+
+    2026-04-22 v7.6: moved off FastAPI event loop onto celery worker for
+    consistency with /refine + /generate (all 3 now async). The LLM call
+    inside (~15-20s) used to run via asyncio.to_thread; celery gives us
+    process-level isolation, same polling API for every wizard step.
+    """
+    CREATOR_CONTENT_LIMIT = 50_000
+    desc_text = (req.description or "").strip()
+    source_text = (req.source_material or "").strip()
+    combined_len = len(desc_text) + len(source_text)
+    if combined_len > CREATOR_CONTENT_LIMIT:
+        raise HTTPException(
+            status_code=413,
+            detail=(
+                f"Combined content is {combined_len:,} chars — over the "
+                f"{CREATOR_CONTENT_LIMIT:,}-char limit."
+            ),
+        )
+
     session_id = str(uuid.uuid4())
+    from backend.celery_app import celery_app as _celery
+    async_result = _celery.send_task(
+        "skills_lab.start_course",
+        args=[session_id, req.model_dump()],
+    )
+    _generate_jobs[session_id] = {
+        "task_id": async_result.id,
+        "task_kind": "start",
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "course_id": None,
+        "error": None,
+    }
+    return {"session_id": session_id, "task_id": async_result.id, "status": "pending"}
+
+
+async def _creator_start_impl(req: CreatorStartRequest, session_id: str):
+    """Pure impl of creator/start — called by the celery task, not the HTTP
+    endpoint. Populates _creator_sessions[session_id] on the worker process
+    and returns the response dict.
+    """
 
     # HARD CONTENT LIMIT (user directive 2026-04-20): combined free text +
     # source_material must not exceed 18,000 chars. This guarantees the
@@ -6102,8 +9229,38 @@ async def creator_start(req: CreatorStartRequest):
     )
 
 
-@app.post("/api/creator/refine", response_model=CreatorRefineResponse)
+@app.post("/api/creator/refine")
 async def creator_refine(req: CreatorRefineRequest):
+    """Enqueue refine on celery. Returns immediately with task_id. Client
+    polls /api/creator/session/{session_id}/status for the refined outline.
+    """
+    session = _creator_sessions.get(req.session_id)
+    if not session:
+        raise HTTPException(404, "Creator session not found")
+
+    from backend.celery_app import celery_app as _celery
+    session_snapshot = _json_safe_session(session)
+    async_result = _celery.send_task(
+        "skills_lab.refine_course",
+        args=[req.session_id, session_snapshot, req.model_dump()],
+    )
+    _generate_jobs[req.session_id] = {
+        "task_id": async_result.id,
+        "task_kind": "refine",
+        "status": "pending",
+        "created_at": datetime.now().isoformat(),
+        "course_id": None,
+        "error": None,
+    }
+    return {
+        "session_id": req.session_id,
+        "task_id": async_result.id,
+        "status": "pending",
+    }
+
+
+async def _creator_refine_impl(req: CreatorRefineRequest):
+    """Pure impl of creator/refine — called by celery task, not HTTP endpoint."""
     session = _creator_sessions.get(req.session_id)
     if not session:
         raise HTTPException(404, "Creator session not found")
@@ -6188,10 +9345,159 @@ async def creator_refine(req: CreatorRefineRequest):
     )
 
 
-@app.post("/api/creator/generate", response_model=CreatorGenerateResponse)
-async def creator_generate(
+# ═══════════════════════════════════════════════════════════════════════════
+# BACKGROUND JOB QUEUE for /api/creator/generate (2026-04-22 v7.3, Option A)
+# ═══════════════════════════════════════════════════════════════════════════
+# Before this: /api/creator/generate did all the work inline (minutes of LLM
+# calls + Docker invariant runs), holding the HTTP connection open the whole
+# time. Root cause of the "Remote end closed connection without response"
+# failures: 10+ minute HTTP responses are fragile — client timeouts, proxy
+# drops, uvicorn restarts, all killed the request mid-flight. Server often
+# completed generation AND persisted to DB, but the caller never learned the
+# course_id because the response was never delivered.
+#
+# Fix: split into two endpoints.
+#   POST /api/creator/generate       → kicks off background task, returns
+#                                      {session_id, status: "pending"} in <1s
+#   GET  /api/creator/session/{id}/status → polled every 2-5s by client;
+#                                      returns {status, course_id?, error?}
+# Immune to HTTP-disconnect; doesn't leak async tasks when clients vanish.
+
+# session_id → {"task_id", "status", "course_id", "error", "created_at"}
+# We keep a light shadow of the celery job here so /status stays fast even if
+# the worker is temporarily unreachable.
+_generate_jobs: dict[str, dict] = {}
+
+
+@app.post("/api/creator/generate")
+async def creator_generate(req: CreatorGenerateRequest):
+    """Enqueue a generation job on celery. Returns immediately (<100ms).
+
+    The worker process runs the job; FastAPI's event loop is free to serve
+    other requests. Client polls GET /api/creator/session/{id}/status to
+    learn when the course_id is ready.
+    """
+    session = _creator_sessions.get(req.session_id)
+    if not session:
+        raise HTTPException(404, "Creator session not found")
+
+    total_steps = sum(len(m.steps) for m in req.outline.modules)
+    if len(req.outline.modules) < 2:
+        raise HTTPException(400, "Course must have at least 2 modules.")
+    if total_steps < 6:
+        raise HTTPException(400, "Course must have at least 6 steps total.")
+
+    # v7.5 (2026-04-22) — celery worker isolation. The generate task runs
+    # in a SEPARATE PROCESS (backend/celery_app.py), so no amount of
+    # CPU-bound work inside _creator_generate_impl can stall this event
+    # loop. /budget, /status, every endpoint stays responsive.
+    from backend.celery_app import celery_app as _celery
+    # Snapshot the session dict + serialize the req so the worker doesn't
+    # need access to our in-memory state. `datetime` fields aren't JSON-
+    # serializable — strip or ISO them.
+    session_snapshot = _json_safe_session(session)
+    req_dump = req.model_dump()
+    async_result = _celery.send_task(
+        "skills_lab.generate_course",
+        args=[req.session_id, session_snapshot, req_dump],
+    )
+
+    _generate_jobs[req.session_id] = {
+        "task_id": async_result.id,
+        "status": "pending",
+        "course_id": None,
+        "error": None,
+        "created_at": datetime.now().isoformat(),
+    }
+    return {
+        "session_id": req.session_id,
+        "task_id": async_result.id,
+        "status": "pending",
+    }
+
+
+def _json_safe_session(session: dict) -> dict:
+    """Strip non-JSON-serializable fields (datetime, etc.) from a session
+    snapshot so celery can send it through the filesystem broker."""
+    out = {}
+    for k, v in session.items():
+        if isinstance(v, datetime):
+            out[k] = v.isoformat()
+        elif isinstance(v, (str, int, float, bool, type(None), list, dict)):
+            out[k] = v
+        # Drop anything else (shouldn't be anything, but safe)
+    return out
+
+
+@app.get("/api/creator/session/{session_id}/status")
+async def creator_session_status(session_id: str):
+    """Return generation progress + course_id once complete.
+
+    Reads from the local job shadow + celery result backend. Never blocks
+    on the worker.
+    """
+    job = _generate_jobs.get(session_id)
+    if not job:
+        raise HTTPException(404, "No generation job for this session id")
+
+    # Pull the latest celery state (async — doesn't block the event loop).
+    from backend.celery_app import celery_app as _celery
+    task_id = job.get("task_id")
+    if not task_id:
+        return job
+
+    try:
+        result = _celery.AsyncResult(task_id)
+        celery_state = result.state  # PENDING / STARTED / SUCCESS / FAILURE / RETRY
+    except Exception as e:
+        logging.warning("celery state lookup failed for task=%s: %s", task_id, e)
+        celery_state = "UNKNOWN"
+
+    # Map celery states to our shape
+    state_map = {
+        "PENDING": "pending",
+        "RECEIVED": "pending",
+        "STARTED": "running",
+        "SUCCESS": "done",
+        "FAILURE": "failed",
+        "RETRY": "running",
+        "REVOKED": "failed",
+    }
+    new_status = state_map.get(celery_state, "pending")
+    job["status"] = new_status
+    job["celery_state"] = celery_state
+
+    if celery_state == "SUCCESS":
+        try:
+            payload = result.get(timeout=2)
+            if isinstance(payload, dict):
+                # generate_course returns {course_id, session_id}
+                # start_course / refine_course return {response, session}
+                if "course_id" in payload:
+                    job["course_id"] = payload.get("course_id")
+                if "session" in payload and isinstance(payload["session"], dict):
+                    # Sync worker-side session back into FastAPI's dict so
+                    # subsequent /refine or /generate calls see it.
+                    _creator_sessions[session_id] = payload["session"]
+                if "response" in payload:
+                    # Surface the task's response payload so client polls
+                    # get the full outline / questions / refined-outline data.
+                    job["response"] = payload["response"]
+        except Exception as e:
+            logging.warning("failed to read task result for %s: %s", task_id, e)
+    elif celery_state == "FAILURE":
+        try:
+            err = str(result.result) if result.result else "unknown error"
+            job["error"] = err[:500]
+        except Exception:
+            job["error"] = "task failed (could not read error)"
+
+    return job
+
+
+async def _creator_generate_impl(
     req: CreatorGenerateRequest,
-    db: AsyncSession = Depends(get_db),
+    db: AsyncSession,
 ):
     session = _creator_sessions.get(req.session_id)
     if not session:
@@ -6220,31 +9526,39 @@ async def creator_generate(
     # Engineering capstones: system_build / code_exercise / code_review / incident_console / simulator_loop
     # Non-engineering capstones: scenario_branch / adaptive_roleplay / code_review / ordering / categorization
     # Both types accept the new immersive pedagogies (adaptive_roleplay, incident_console, simulator_loop).
-    ENG_CAPSTONES = {"system_build", "code_exercise", "code_review", "incident_console", "simulator_loop", "voice_mock_interview", "workday_simulator"}
-    CASE_CAPSTONES = {"system_build", "code_exercise", "code_review", "scenario_branch", "adaptive_roleplay", "incident_console", "simulator_loop", "voice_mock_interview", "workday_simulator"}
+    # 2026-04-22 v8: CLI-tool courses (Claude Code, kubectl, gh CLI) use
+    # `terminal_exercise` as their primary hands-on type — the capstone
+    # should remain terminal_exercise, NOT be remapped to code_exercise.
+    # Without this exception the remap fires then the Creator retries the
+    # capstone as a code_exercise whose starter keeps being rejected
+    # ("looks complete") → 5 retries → RuntimeError → worker wedge.
+    ENG_CAPSTONES = {"system_build", "code_exercise", "code_review", "incident_console", "simulator_loop", "voice_mock_interview", "workday_simulator", "terminal_exercise"}
+    CASE_CAPSTONES = {"system_build", "code_exercise", "code_review", "scenario_branch", "adaptive_roleplay", "incident_console", "simulator_loop", "voice_mock_interview", "workday_simulator", "terminal_exercise"}
     # Yuki-v1 review fix (2026-04-20): when course_type=technical is EXPLICITLY set,
     # honor that for capstone enforcement regardless of is_non_engineering keyword
     # triggers in the description. Otherwise descriptions with "CFO/stakeholder/Slack"
     # flip the course to CASE_CAPSTONES and let adaptive_roleplay pass as a "capstone"
     # that doesn't verify the actual technical skill (a learner could bluff and win).
     # The explicit `course_type=technical` is a creator choice that overrides heuristic.
+    _is_cli_tool = _is_cli_tool_subject(session.get("title", ""), session.get("description", ""))
     if session["course_type"] == "technical":
         last_step = req.outline.modules[-1].steps[-1] if req.outline.modules[-1].steps else None
         if not last_step or last_step.exercise_type not in ENG_CAPSTONES:
             # Post-process: if the learner picked technical but outline picked a
-            # non-ENG capstone, AUTO-REMAP last-step type to code_exercise. This is
-            # cheaper than rejecting + asking them to refine, and the content was
-            # generated with a specific deliverable in mind that we can reuse.
+            # non-ENG capstone, AUTO-REMAP last-step type. Default is code_exercise
+            # for standard engineering courses; CLI-tool courses use terminal_exercise
+            # (we never force a CLI-tool capstone into a write-your-own-code mold).
             if last_step:
+                remap_target = "terminal_exercise" if _is_cli_tool else "code_exercise"
                 logging.warning(
-                    "Technical course capstone was %s (not in ENG_CAPSTONES); auto-remapping to code_exercise.",
-                    last_step.exercise_type,
+                    "Technical course capstone was %s (not in ENG_CAPSTONES); auto-remapping to %s.",
+                    last_step.exercise_type, remap_target,
                 )
-                last_step.exercise_type = "code_exercise"
+                last_step.exercise_type = remap_target
             else:
                 raise HTTPException(400,
                     "Engineering courses must end with a hands-on technical capstone "
-                    "(system_build, code_exercise, code_review, incident_console, simulator_loop, or voice_mock_interview). Please refine the outline.")
+                    "(system_build, code_exercise, code_review, incident_console, simulator_loop, voice_mock_interview, or terminal_exercise). Please refine the outline.")
     elif session["course_type"] == "case_study" and not is_non_engineering:
         last_step = req.outline.modules[-1].steps[-1] if req.outline.modules[-1].steps else None
         if not last_step or last_step.exercise_type not in CASE_CAPSTONES:
@@ -6298,17 +9612,52 @@ async def creator_generate(
             _progress_increment_step(_sid_for_progress, mod_title, step_outline.title)
             _progress_mark_step(_sid_for_progress, mod_title, step_outline.title, "complete", note="mock")
             return None
+        # v8.5 Phase H (2026-04-24, Opus #8): for code_exercise, generate the
+        # interface scaffold with Opus BEFORE calling Sonnet. Scaffold goes
+        # into course_context so Stage 2 sees it as a locked constraint.
+        # For non-code steps, scaffold is skipped (Opus #8 rule: don't scaffold
+        # concept/mcq/ordering — they have different structure).
+        _ctx_for_gen = dict(course_context) if isinstance(course_context, dict) else {}
+        if step_outline.exercise_type == "code_exercise":
+            try:
+                _scaffold_initial = await asyncio.to_thread(
+                    _generate_scaffold_with_opus,
+                    step_outline.title,
+                    step_outline.description or "",
+                    (_ctx_for_gen.get("language") or "").lower(),
+                    _ctx_for_gen.get("title", ""),
+                    mod_title,
+                    False,  # simplify
+                )
+                if _scaffold_initial:
+                    _ctx_for_gen["scaffold"] = _scaffold_initial
+                    logging.info(
+                        "SCAFFOLD(initial) %r: %d exports, %d tests",
+                        step_outline.title[:60],
+                        len(_scaffold_initial.get("exports") or []),
+                        len(_scaffold_initial.get("test_names") or []),
+                    )
+            except Exception as _sc:
+                logging.warning("initial-scaffold failed (soft-pass): %s", _sc)
         result = None
         err_note = ""
         try:
             result = await asyncio.to_thread(
                 _llm_generate_step_content,
-                course_context,
+                _ctx_for_gen,
                 mod_title,
                 step_outline.title,
                 step_outline.exercise_type,
                 step_outline.description,
             )
+            # v8.5 Phase H (2026-04-24): stash the initial scaffold onto the
+            # result dict so the retry loop can retrieve and RE-USE it (NOT
+            # regenerate — Opus #8 caveat 1 immutability). Without this, the
+            # retry loop's own scaffold gen fires with different Opus
+            # randomness, producing a DIFFERENT scaffold that Sonnet's
+            # in-flight retries see — worse than no scaffold at all.
+            if isinstance(result, dict) and _ctx_for_gen.get("scaffold"):
+                result["_internal_scaffold"] = _ctx_for_gen["scaffold"]
         except Exception as e:
             err_note = f"{type(e).__name__}: {e}"[:120]
             logger.exception("step gen failed for %s/%s", mod_title, step_outline.title)
@@ -6349,6 +9698,22 @@ async def creator_generate(
     )
     _progress_update(req.session_id, phase="steps")
 
+    # v8.6 (2026-04-24) ROOT-CAUSE FIX — course-language detection + threading.
+    # Pre-fix: course_context["language"] was NEVER set anywhere. Every reader
+    # (LANGUAGE LOCK block, _runtime_deps_brief, GATE A, wall-time budget
+    # selector) did `get("language") or "python"` → fell to "python" always.
+    # This caused v12 + v13 to ship 7-8 Python code_exercise steps in TS
+    # courses. GATE A silently never ran because its gate condition
+    # (_course_lang_pinned) was always "".
+    #
+    # Fix: detect language from title+description heuristically (the Creator
+    # always names it in the title: "TypeScript v12:...", "Go Basics:...").
+    # Pin onto course_context so EVERY downstream reader sees the real value.
+    # When detection returns "" (non-code courses like sales / HR): leave the
+    # key unset; downstream paths fall through to non-code exercise types.
+    _detected_course_lang = _detect_course_language(
+        title or "", session.get("description", "") or "",
+    )
     course_context = {
         "title": title,
         "course_type": course_type,
@@ -6361,6 +9726,20 @@ async def creator_generate(
         "canonical_entities": canonical_entities,
         "capstone_scenario": capstone_scenario,  # may be None if LLM unavail
     }
+    if _detected_course_lang:
+        course_context["language"] = _detected_course_lang
+        logging.info(
+            "COURSE LANGUAGE detected + pinned: %r for course=%r",
+            _detected_course_lang, (title or "")[:80],
+        )
+    else:
+        logging.warning(
+            "COURSE LANGUAGE not detected from title+description — "
+            "code_exercise steps will NOT be language-locked (GATE A will "
+            "skip). If this course has code exercises, add a language hint "
+            "to the title (e.g. 'TypeScript v12:...'). Title=%r",
+            (title or "")[:100],
+        )
     # Identify which module is the capstone (always last) so the step-content
     # generator can inject the shared scenario only into those steps.
     capstone_module_idx = len(req.outline.modules) - 1 if req.outline.modules else -1
@@ -6377,6 +9756,15 @@ async def creator_generate(
     # "share context with generator if there are dependencies between modules."
     import asyncio as _asyncio_gen
     from backend.per_step import build_prior_context_from_memory
+
+    # v8.6 (2026-04-24) DEAD-LETTER accumulator per buddy-Opus consult #9.
+    # When a step's retry loop exhausts, we USED to `raise RuntimeError` which
+    # rolled back the whole course (TS v11 lost 8 passing steps on S9's failure).
+    # New behavior: mark the step with quality_flag=needs_author_review, persist
+    # a warning banner + retry trace, append to this list, CONTINUE generating
+    # subsequent steps. Creator gets a clean 8/9-type partial-success response
+    # with a list of steps to regen narrowly.
+    _needs_review_steps: list[dict] = []
 
     # Fire capstone-pitch early so it runs in parallel with step generation
     pitch_task = _asyncio_gen.to_thread(
@@ -6510,6 +9898,71 @@ async def creator_generate(
             llm_content_raw = next(content_iter, None)
             llm_content = llm_content_raw if isinstance(llm_content_raw, dict) else None
 
+            # Shared store for the LAST invariant/compile failure reason, so
+            # the retry loop can feed the exact compile error back into the
+            # next LLM prompt. Without this, the LLM retry kept introducing a
+            # DIFFERENT unused import each attempt (v8 Module-5 Go capstone
+            # failure, 2026-04-22). List wrapper for closure mutability.
+            _last_invariant_reason = [""]
+            # v8.5 Phase G INSTRUMENTATION (2026-04-23, Opus #7):
+            # Per-retry test-pass-count stashed here by _is_complete so the
+            # retry loop can log it as the 3rd Opus-requested column.
+            # Format: [passed_count, collected_count, err_hash_prefix]
+            _last_test_counts = [0, 0, ""]
+            # v8.5 Phase H SCAFFOLD-FIRST (2026-04-24, Opus #8):
+            # For code_exercise steps, Opus designs the interface contract
+            # ONCE, before Sonnet is ever called. Scaffold is IMMUTABLE across
+            # retries. If 2 consecutive Stage-2 attempts fail, regenerate
+            # scaffold with simplify=True (Opus #8 caveat 3).
+            #
+            # FIX (2026-04-24): retrieve the scaffold that was generated in
+            # the INITIAL parallel-gen phase (via _gen_step_content stashed
+            # it onto llm_content_raw["_internal_scaffold"]). Do NOT generate
+            # a fresh one here — doing so yields a DIFFERENT scaffold than
+            # the one Sonnet's in-flight attempts saw, which is worse than
+            # no scaffold. TS v9 S2 "Model a GitHub User" died precisely
+            # because of this: initial scaffold had 2 exports + 8 tests,
+            # retry-loop scaffold had 3 exports + 7 tests → Sonnet got
+            # contradictory contracts across retries.
+            _scaffold = None
+            _consecutive_stage2_fails = 0
+            if ex_type == "code_exercise":
+                # Retrieve the initial scaffold from the first attempt's result.
+                if isinstance(llm_content, dict):
+                    _scaffold = llm_content.get("_internal_scaffold")
+                # Fallback: if for some reason the initial pass didn't attach
+                # one (e.g. _llm_enabled flipped), generate once here.
+                if _scaffold is None and _llm_enabled():
+                    try:
+                        _lang_for_scaffold = ""
+                        if isinstance(course_context, dict):
+                            _lang_for_scaffold = str(course_context.get("language") or "").lower()
+                        _scaffold = _generate_scaffold_with_opus(
+                            step_title=step_outline.title,
+                            step_description=step_outline.description or "",
+                            language=_lang_for_scaffold,
+                            course_title=title,
+                            module_title=mod.title,
+                            simplify=False,
+                        )
+                        if _scaffold:
+                            logging.info(
+                                "SCAFFOLD gen(fallback) for %r: %d exports, %d tests",
+                                step_outline.title[:60],
+                                len(_scaffold.get("exports") or []),
+                                len(_scaffold.get("test_names") or []),
+                            )
+                    except Exception as _se:
+                        logging.warning("Fallback scaffold gen failed: %s", _se)
+                        _scaffold = None
+                if _scaffold:
+                    logging.info(
+                        "SCAFFOLD reused for %r: %d exports, %d tests",
+                        step_outline.title[:60],
+                        len(_scaffold.get("exports") or []),
+                        len(_scaffold.get("test_names") or []),
+                    )
+
             # Check if LLM content is COMPLETE for this exercise type.
             # An incomplete response (missing validation/demo_data) gets augmented or regenerated below.
             def _is_complete(content_obj: dict, ex_type: str) -> bool:
@@ -6529,6 +9982,13 @@ async def creator_generate(
                     if not ok:
                         logging.warning("ontology gate reject step=%r ex_type=%s: %s",
                                         getattr(step_outline, "title", "?"), ex_type, reason)
+                        # 2026-04-23 v8: capture reason into _last_invariant_reason so
+                        # the NEXT retry prompt sees the specific failure (user
+                        # directive: "share logs as part of input to the next agent").
+                        # Previously only Go compile errors populated this slot; now
+                        # ontology-gate failures do too. Retry prompt below reads
+                        # from _last_invariant_reason[0].
+                        _last_invariant_reason[0] = f"Ontology gate rejected: {reason}"[-800:]
                         return False
                 except Exception as _onto_err:
                     # Gate bug must NOT hard-fail generation; log + continue.
@@ -6586,80 +10046,74 @@ async def creator_generate(
                     # code (e.g. 3 TODO lines and nothing else) is rejected.
                     if len(non_comment_lines) < 5:
                         return False
-                    # E.2 (2026-04-21): reject cross-language migration & multi-file tasks.
-                    # The editor is single-pane; describing "port this Java to Python"
-                    # in prose without embedding the actual Java leaves the learner
-                    # with nothing to translate from. User report on
-                    # skills.sclr.ac/#created-373e38f8e51c/117/3.
-                    content_text_lower = (content_obj.get("content", "") or "").lower()
-                    import re as _re_xlang
-                    # Phrase-level cross-language triggers.
-                    _XLANG_PHRASES = [
-                        "port this java", "port the java", "port the following java",
-                        "port this c#", "port this go", "port this ruby", "port this php",
-                        "port this typescript", "port this javascript", "port this rust",
-                        "migrate this java", "migrate this c#", "migrate the java",
-                        "migrate the following c#", "migrate the following go",
-                        "translate this java", "translate the java", "translate the following java",
-                        "translate the c#", "translate from java to python",
-                        "translate from c# to python", "translate from go to python",
-                        "rewrite this java", "rewrite the java", "rewrite the following java",
-                        "rewrite this c#", "rewrite this go", "rewrite this ruby",
-                        "rewrite the java utility", "rewrite the c# utility",
-                        "convert from java to python", "convert from c# to python",
-                        "convert the java", "convert the c#", "convert the following go",
-                        "here is the original java", "here is the original c#",
-                        "the original java code", "the original c# code", "the original go code",
-                        "the java version uses", "the c# version uses",
-                    ]
-                    if any(p in content_text_lower for p in _XLANG_PHRASES):
-                        return False
-                    # Multi-file phrasing.
-                    _MULTIFILE_PHRASES = [
-                        "refactor these ", "edit these files", "update these files",
-                        "across these files", "in each of the following files",
-                        "modify each of the files", "open each of the files",
-                        "browse the repo", "browse the repository", "inspect the repository",
-                        "read the existing codebase", "navigate the repo", "navigate the codebase",
-                    ]
-                    if any(p in content_text_lower for p in _MULTIFILE_PHRASES):
-                        return False
-                    # F26 (2026-04-21): if the learner's `code` references
-                    # external filesystem state (os.walk / Path.glob / open),
-                    # the Creator MUST emit demo_data.starter_files or
-                    # starter_repo. Otherwise os.walk(repo_path) walks nothing
-                    # and the exercise is unsolvable. Gate at generation time.
-                    _fs_ref_re = _re_xlang.compile(
-                        r"\bos\.walk\(|\bos\.listdir\(|\bos\.scandir\(|"
-                        r"\bPath\([^)]*\)\.(?:glob|rglob|iterdir|walk)\b|"
-                        r"\bglob\.(?:glob|iglob)\(|"
-                        r"\bopen\(\s*(?:repo_path|[\"']\.?/?(?:src|app|lib|tests?)/)"
-                    )
-                    if _fs_ref_re.search(code_str):
-                        has_scaffold = bool(dd.get("starter_files")) or bool(dd.get("starter_repo"))
-                        if not has_scaffold:
+                    # 2026-04-23 v8.5 (Phase 1 architectural refactor — user directive
+                    # + buddy-Opus peer review):
+                    # DELETED three brittle pattern-matching gates that were trying to
+                    # detect "unsolvable exercise" via prose/code substring:
+                    #   • _XLANG_PHRASES (18 cross-language phrases — "port this Java")
+                    #   • _MULTIFILE_PHRASES (7 "refactor these files" phrases)
+                    #   • _fs_ref_re regex (os.walk / Path.glob without starter_files)
+                    # Ground truth is the Docker LangGraph invariant below. If the
+                    # exercise is genuinely unsolvable, solution_code fails in Docker.
+                    # If solution passes, exercise is solvable regardless of prose.
+                    # Deleting these eliminates a paraphrase-evasion arms race and
+                    # removes a class of false-positive rejects.
+                    #
+                    # v8.6 (2026-04-24) PYDANTIC PRE-GATE — buddy-Opus consult #9.
+                    # Type-safe structural check on the code_exercise JSON contract.
+                    # Runs in ~1ms, fails fast on type errors the LLM makes (e.g.
+                    # `hidden_tests=[...]` list, `language={...}` dict) before we
+                    # spend 5-10s on the Docker invariant below. Also catches
+                    # too-short hidden_tests / solution_code that would otherwise
+                    # fail in Docker with a less-actionable error. Soft-pass on
+                    # schema missing (Pydantic not importable in this build).
+                    try:
+                        from backend.schemas import CodeExerciseAssignmentModel as _CEM
+                        from pydantic import ValidationError as _PVE
+                        try:
+                            _CEM.model_validate(content_obj)
+                        except _PVE as _pve:
+                            _errs = _pve.errors()
+                            _first = _errs[0] if _errs else {}
+                            _field = ".".join(str(p) for p in _first.get("loc", []))
+                            _msg = (_first.get("msg", str(_pve)) or "")[:200]
+                            _input_snip = str(_first.get("input", ""))[:120]
+                            _last_invariant_reason[0] = (
+                                f"Pydantic pre-gate rejected: field `{_field}` — {_msg}. "
+                                f"Received: `{_input_snip}`. Emit the correct TYPE for this field."
+                            )
                             logging.warning(
-                                "F26 reject: code_exercise code references FS "
-                                "(os.walk / Path.glob / open) but emits neither "
-                                "demo_data.starter_files nor starter_repo — "
-                                "learner cannot solve this. step=%r",
-                                getattr(step_outline, "title", "?"),
+                                "Pydantic pre-gate reject step=%r field=%s msg=%s",
+                                getattr(step_outline, "title", "?"), _field, _msg,
                             )
                             return False
+                    except ImportError:
+                        # Schema module not present — soft-pass; Docker invariant still guards.
+                        pass
                     # ─────────────────────────────────────────────────────
-                    # LangGraph-style solution/starter invariant (2026-04-22):
-                    # if the Creator emitted hidden_tests + solution_code AND
-                    # Docker is available AND language has an image, we run
-                    # both starter (should FAIL) and solution (should PASS)
-                    # inside a real container. Any violation = regenerate.
-                    # This is THE cheese-proof gate. Soft-pass when Docker
-                    # isn't available (local dev without Docker daemon) so we
-                    # don't block generation.
+                    # LangGraph-style solution/starter invariant — THE ground-truth gate.
+                    # Soft-pass when Docker isn't available (local dev).
                     # ─────────────────────────────────────────────────────
                     hidden_tests = (val or {}).get("hidden_tests")
                     solution_code = (val or {}).get("solution_code")
                     requirements = (val or {}).get("requirements")
                     lang = (dd.get("language") or val.get("language") or "python").lower()
+                    # Layer A presence: hidden_tests must exist for runnable languages.
+                    # `must_contain` alone is cheese-able.
+                    if lang in ("python", "py", "javascript", "js",
+                                "typescript", "ts", "go", "golang"):
+                        if not hidden_tests:
+                            logging.warning(
+                                "Layer A presence FAIL on step=%r (lang=%s): "
+                                "hidden_tests missing.",
+                                getattr(step_outline, "title", "?"), lang,
+                            )
+                            _last_invariant_reason[0] = (
+                                "validation.hidden_tests is missing or empty. Emit a real "
+                                "pytest/jest/go-test source with >=4 tests that would reject "
+                                "trivial-stub solutions (e.g. `return 0`, `return None`)."
+                            )
+                            return False
                     if hidden_tests and solution_code and _docker_available() and lang in (
                         "python", "py", "javascript", "js", "typescript", "ts", "go", "golang"
                     ):
@@ -6673,16 +10127,262 @@ async def creator_generate(
                                 timeout_s=90,
                             )
                             if not inv.get("ok"):
+                                # ──────────────────────────────────────────
+                                # v8.5 Phase E final RAW PASSTHROUGH RETRY FEEDBACK
+                                # (2026-04-23, Opus 4th consultation — user directive):
+                                #   "Stop interposing a mediator (narrative / regex /
+                                #    fragment schema) between precise tool output and
+                                #    a capable reader. The LLM reads tool output fine."
+                                #
+                                # Contract: concat (stderr tail + stdout tail +
+                                # harness-stripped lines + optional Phase D block)
+                                # with ONE instruction: "Fix these sites."
+                                # Zero parsing. Zero regex. No narrative layer to
+                                # be wrong about.
+                                # ──────────────────────────────────────────
+                                _sol_result = inv.get("solution_result") or {}
+                                _stdout_raw = _sol_result.get("output") or ""
+                                _stderr_raw = _sol_result.get("error") or ""
+                                _stripped = _sol_result.get("harness_stripped_entries") or []
+
+                                # v8.6 (2026-04-24) DEDUPE — buddy-Opus consult on
+                                # capstone attractor: "Head+tail on stderr with 4-6
+                                # repeated TS2339s wastes budget on duplicates.
+                                # Deduplicate errors by (code, message) tuple, keep
+                                # first occurrence + count. 12000 chars of unique
+                                # signal >> 12000 of repeats."
+                                # Implementation: regex-extract TS/Python/Go/Rust
+                                # error patterns, keep the first occurrence of each
+                                # unique (code, message-body) tuple. Note the
+                                # occurrence count. Preserve original stderr order.
+                                import re as _re_dedupe
+                                def _dedupe_errors(raw: str) -> tuple[str, int]:
+                                    """Collapse repeated compile errors. Returns
+                                    (deduped_text, removed_count)."""
+                                    if not raw or len(raw) < 600:
+                                        return raw, 0
+                                    # Common error-line patterns (TS, pytest, go,
+                                    # rust, jest). Match non-greedy to next "error"
+                                    # or \n\n or "--- " block boundary.
+                                    _err_pat = _re_dedupe.compile(
+                                        r"(error\s+TS\d+:[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z|\s*error\s+TS))"
+                                        r"|(FAILED\s+[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z))"
+                                        r"|(AssertionError[^\n]+(?:\n[^\n]+)*?(?=\n\s*\n|\Z))",
+                                        _re_dedupe.IGNORECASE,
+                                    )
+                                    seen: dict[str, int] = {}
+                                    # Build a KEY from each match: strip source
+                                    # locations (file:line:col) and keep error code
+                                    # + message body. That way "error TS2339 at
+                                    # x.ts:91:20" and "error TS2339 at x.ts:132:20"
+                                    # collapse if the message is identical.
+                                    def _canon(m: str) -> str:
+                                        s = m
+                                        s = _re_dedupe.sub(r"[^\s]+\.(ts|tsx|py|go|rs|java)[:\s]+\d+[:\s]+\d+", "FILE:L:C", s)
+                                        s = _re_dedupe.sub(r"\s+", " ", s)
+                                        return s[:500]
+                                    result_parts: list[str] = []
+                                    removed = 0
+                                    last_end = 0
+                                    for m in _err_pat.finditer(raw):
+                                        chunk = (m.group(1) or m.group(2) or m.group(3) or "").strip()
+                                        if not chunk:
+                                            continue
+                                        key = _canon(chunk)
+                                        if key in seen:
+                                            seen[key] += 1
+                                            removed += 1
+                                            # Skip this match entirely
+                                            # Keep the raw text BEFORE the match in place
+                                            result_parts.append(raw[last_end:m.start()])
+                                            last_end = m.end()
+                                        else:
+                                            seen[key] = 1
+                                    # Append remaining tail
+                                    result_parts.append(raw[last_end:])
+                                    out = "".join(result_parts)
+                                    # Annotate with the count summary on the first
+                                    # occurrence — tells the LLM "this error
+                                    # happened N times, all at different lines".
+                                    if removed > 0 and seen:
+                                        counts = ", ".join(
+                                            f"{v}× at distinct sites" for k, v in seen.items() if v > 1
+                                        )
+                                        if counts:
+                                            out += f"\n\n[DEDUPE NOTE: collapsed {removed} repeated error(s) — {counts}. Fix all sites of each unique error.]\n"
+                                    return out, removed
+
+                                _stderr_deduped, _removed = _dedupe_errors(_stderr_raw)
+
+                                # Stderr rendering: head + tail, but on deduped
+                                # text. 800+800 head+tail still applies as a
+                                # final size cap even after dedup (some error
+                                # outputs have unique content that's just long).
+                                def _head_tail(s: str, head: int, tail: int) -> str:
+                                    if not s:
+                                        return ""
+                                    if len(s) <= head + tail + 50:
+                                        return s
+                                    return s[:head] + "\n\n[... truncated " + str(len(s) - head - tail) + " chars ...]\n\n" + s[-tail:]
+                                _stderr_block = _head_tail(_stderr_deduped, 1500, 1500)  # bump since dedupe freed budget
+                                _stdout_tail = _stdout_raw[-2000:]
+
+                                parts: list[str] = [
+                                    "## Errors from last retry (tool output; fix these sites):",
+                                    "",
+                                ]
+                                if _stderr_block.strip():
+                                    _hdr = "### stderr"
+                                    if _removed > 0:
+                                        _hdr += f" (deduped; {_removed} repeated error(s) collapsed)"
+                                    parts.append(_hdr)
+                                    parts.append(f"```\n{_stderr_block}\n```")
+                                    parts.append("")
+                                if _stdout_tail.strip():
+                                    parts.append("### stdout (tail)")
+                                    parts.append(f"```\n{_stdout_tail}\n```")
+                                    parts.append("")
+                                if _stripped:
+                                    parts.append("### harness stripped from your validation.requirements (do not re-emit)")
+                                    for e in _stripped[:10]:
+                                        parts.append(f"- {e}")
+                                    parts.append("")
+
+                                # Phase D enrichment: only a string-contains check.
+                                # If tool output mentions a language's type-grounding
+                                # error code, append the compiler-inferred shape. No
+                                # regex, no parsing — just grep + append.
+                                try:
+                                    from backend.docker_runner import _get_lang_config as _glc
+                                    _lcfg = _glc(lang)
+                                    if (_lcfg is not None
+                                            and _lcfg.type_grounding_error_codes
+                                            and _lcfg.solution_shape_extractor is not None):
+                                        _combined = _stderr_tail + "\n" + _stdout_tail
+                                        if any(c in _combined for c in _lcfg.type_grounding_error_codes):
+                                            _shape = _lcfg.solution_shape_extractor(solution_code)
+                                            if _shape:
+                                                parts.append(
+                                                    "### solution's inferred shape (from compiler)"
+                                                )
+                                                parts.append(f"```\n{_shape}\n```")
+                                                parts.append("")
+                                except Exception as _tg_err:
+                                    logging.warning(
+                                        "Shape extractor errored (soft-pass): %s", _tg_err,
+                                    )
+
+                                parts.append("Fix these sites. Emit a corrected full solution + tests.")
+                                reason = "\n".join(parts)
+                                # v8.6 (2026-04-24) — LOG EVERYTHING rule (CLAUDE.md
+                                # §OBSERVABILITY). "Running blind is intern work."
+                                # Pre-fix: we logged only `len(reason)` on each FAIL,
+                                # meaning attractor diagnosis required reconstructing
+                                # content from scratch. Post-fix: full retry feedback
+                                # dumped to `/tmp/retry_feedback/<course_id>/<step_slug>_<attempt>.txt`
+                                # + first 600 chars inlined in the warning log for
+                                # quick pattern-matching. Path printed so reviewers
+                                # can `cat` the full content without grep gymnastics.
+                                try:
+                                    import os as _os_rf, re as _re_rf, pathlib as _pl_rf, time as _time_rf
+                                    _rf_course = (getattr(req, "session_id", "") or "nosession")[:20]
+                                    _rf_step_slug = _re_rf.sub(r"[^\w\-]+", "_", getattr(step_outline, "title", "step"))[:60]
+                                    _rf_dir = _pl_rf.Path("/tmp/retry_feedback") / _rf_course
+                                    _rf_dir.mkdir(parents=True, exist_ok=True)
+                                    # ms-precision timestamp keeps per-retry dumps ordered + collision-free
+                                    _rf_ts = int(_time_rf.time() * 1000) % 10_000_000
+                                    _rf_path = _rf_dir / f"{_rf_step_slug}_{_rf_ts}.txt"
+                                    _rf_path.write_text(reason, encoding="utf-8", errors="replace")
+                                    _rf_path_str = str(_rf_path)
+                                except Exception as _rf_err:
+                                    _rf_path_str = f"(dump failed: {_rf_err})"
                                 logging.warning(
-                                    "LangGraph invariant FAIL on step=%r: %s",
+                                    "LangGraph invariant FAIL on step=%r "
+                                    "(retry feedback: %d chars, dump: %s)\n"
+                                    "--- retry feedback head (first 600 chars) ---\n"
+                                    "%s\n--- /head ---",
+                                    getattr(step_outline, "title", "?"), len(reason),
+                                    _rf_path_str, reason[:600],
+                                )
+                                # v8.6 (2026-04-24) — bumped 4000 → 12000 so
+                                # the LLM sees the full retry feedback incl.
+                                # stderr head + stdout tail + Phase D shape
+                                # + harness-stripped entries. Prior 4000-cap
+                                # was silently dropping 327+ head chars on
+                                # feedbacks > 4000 (TS v11/v12 had 3978 char
+                                # attractor that RIGHT AT the edge). Sonnet/
+                                # Opus context is 200k — 12000 is <0.01% of
+                                # that, trivial cost for full signal.
+                                _last_invariant_reason[0] = reason[-12000:]
+                                # v8.5 Phase G INSTRUMENTATION: stash test counts +
+                                # error hash for retry-loop logging.
+                                try:
+                                    import hashlib as _hl_g
+                                    _sol_tr_g = (inv.get("solution_result") or {}).get("test_results") or {}
+                                    _last_test_counts[0] = int(_sol_tr_g.get("passed", 0) or 0)
+                                    _last_test_counts[1] = int(
+                                        _sol_tr_g.get("collected", _sol_tr_g.get("total", 0)) or 0
+                                    )
+                                    _err_hash_src = (reason or "")[:2000]
+                                    _last_test_counts[2] = _hl_g.sha256(
+                                        _err_hash_src.encode("utf-8", "replace")
+                                    ).hexdigest()[:8]
+                                except Exception:
+                                    pass
+                                return False
+                            # v8.5: Layer A count now runs AFTER the invariant,
+                            # from the RUNNER's discovered test count (junit XML
+                            # `tests` attr / jest numTotalTests / go -json run
+                            # events). Zero regex. Handles async def, class-
+                            # based tests, @pytest.mark.parametrize expansions,
+                            # decorators that rename tests — the runner
+                            # discovers them all.
+                            _sol_tr = (inv.get("solution_result") or {}).get("test_results") or {}
+                            if _sol_tr.get("collection_error"):
+                                _coll_err = _sol_tr.get("collection_error_msg", "") or ""
+                                logging.warning(
+                                    "Layer A collection error on step=%r: %s",
                                     getattr(step_outline, "title", "?"),
-                                    inv.get("reason", ""),
+                                    _coll_err[:160],
+                                )
+                                _last_invariant_reason[0] = (
+                                    f"The test runner could not COLLECT any tests — likely a "
+                                    f"conftest/import error in hidden_tests. Fix the test "
+                                    f"file so it imports cleanly. Collector said: "
+                                    f"{_coll_err[:400]}"
+                                )
+                                return False
+                            _collected = int(_sol_tr.get("collected") or _sol_tr.get("total") or 0)
+                            if _collected < 4:
+                                logging.warning(
+                                    "Layer A count FAIL on step=%r: runner discovered %d "
+                                    "tests (minimum 4 required).",
+                                    getattr(step_outline, "title", "?"), _collected,
+                                )
+                                _last_invariant_reason[0] = (
+                                    f"Only {_collected} tests ran against the solution "
+                                    f"(minimum 4 required). Emit MORE hidden_tests covering "
+                                    f"happy-path, edge cases, boundary conditions, and "
+                                    f"adversarial cases (must reject trivial stubs like "
+                                    f"`return 0`, `return None`, `return []`). If you used "
+                                    f"@pytest.mark.parametrize / jest.each / table-tests, use "
+                                    f">=4 cases so at least 4 tests are collected."
                                 )
                                 return False
                             logging.info(
-                                "LangGraph invariant PASS on step=%r (solution_passes + starter_fails)",
-                                getattr(step_outline, "title", "?"),
+                                "LangGraph invariant PASS on step=%r "
+                                "(%d tests collected; solution passes, starter fails)",
+                                getattr(step_outline, "title", "?"), _collected,
                             )
+                            # Phase G: also stash counts on PASS so instrumentation
+                            # log captures the real tests_passed/total on successful
+                            # retries (not just 0/0 fallback).
+                            try:
+                                _last_test_counts[0] = int(_sol_tr.get("passed", 0) or 0)
+                                _last_test_counts[1] = int(_collected)
+                                _last_test_counts[2] = "PASS"
+                            except Exception:
+                                pass
                         except Exception as _iv_err:
                             logging.warning("LangGraph invariant errored (soft-pass): %s", _iv_err)
                     return True
@@ -6802,184 +10502,96 @@ async def creator_generate(
                 if ex_type == "mcq":
                     return bool(dd.get("options")) and len(dd.get("options", [])) >= 2
                 if ex_type == "system_build":
-                    # Require substantial mission briefing + phases/checklist with SPECIFIC labels
-                    # ALL items must avoid generic-template phrases (strict).
-                    GENERIC_PHASE_TITLES = {
-                        "plan the deliverable", "build / produce", "review & refine",
-                        "present / deploy", "build / execute", "plan", "build", "review", "ship",
-                        # Added 2026-04-19 after Priya v5 found "plan/execute/synthesize/present"
-                        # as phase titles — that's a PM capstone shape, not an eng capstone.
-                        "plan / execute", "plan and execute", "execute / deliver",
-                        "synthesize", "synthesize findings", "synthesize and document",
-                        "present", "present / brief", "present to stakeholders",
-                        "document", "align", "stakeholder alignment", "align stakeholders",
-                    }
-                    GENERIC_CHECKLIST_PHRASES = [
-                        "define success criteria for",
-                        "identify the primary stakeholder",
-                        "produce the core deliverable",
-                        "validate with at least one peer",
-                        "document decisions and trade-offs",
-                        "prepare the stakeholder presentation",
-                        "define success metrics and follow-up",
-                    ]
-                    # Content must not contain template-leakage phrases (my own fallback output
-                    # is what leaks when LLM returns thin content)
-                    GENERIC_CONTENT_PHRASES = [
-                        "the core idea behind",
-                        "reflection prompt: spend 60 seconds",
-                        "where in your current work would this",
-                        "what you'll learn here",
-                        "pitfalls to avoid when applying",
-                        "how it fits into the broader practice",
-                    ]
+                    # 2026-04-23 v8.5 Phase 2 (user + buddy-Opus reviewed):
+                    # DELETED four hardcoded phrase/set-based content-quality gates
+                    # (GENERIC_PHASE_TITLES, GENERIC_CHECKLIST_PHRASES,
+                    # GENERIC_CONTENT_PHRASES, CODE_VERBS/PM_VERBS counting).
+                    # They were subsumed by the LLM-rubric scorer below.
+                    # KEPT as rubric-fallback ratchet (Opus L5):
+                    # BIZ_STRATEGY_BAN + ENG_SIGNALS. These fire ONLY when the
+                    # rubric circuit-breaker is open (>=3 consecutive rubric LLM
+                    # failures) OR when _llm_enabled() is False. They catch the
+                    # drift modes we've post-hoc observed and permanently
+                    # hardened against — the old ban-list stays an append-only
+                    # ratchet so historical lessons don't regress.
                     content_lower = content_obj.get("content", "").lower()
-                    if any(p in content_lower for p in GENERIC_CONTENT_PHRASES):
-                        return False
-                    # ENGINEERING-CAPSTONE GENRE LOCK (Priya's learner review 2026-04-19)
-                    # The Developer course's capstone step 2 was a 15-page product-strategy
-                    # exec-deck task despite the course being called "Ship Real Code". The
-                    # LLM drifted to PM framing on words like "product/stakeholder/launch".
-                    # Hard reject any engineering system_build whose content reads like a
-                    # business-strategy memo — these phrases are the reliable tell.
                     is_eng_course = (course_context.get("course_type") == "technical"
                                      or not is_non_engineering)
+                    # ── PRIMARY gate: LLM-rubric content-quality score ──
                     if is_eng_course:
-                        # Extended list — Priya v4 re-review 2026-04-19 found the drift
-                        # migrated from "15-page AI strategy" (banned) to "Product Strategy
-                        # Document (PSD)... executive presentation deck... 20-minute executive
-                        # review... Product Council (CPO, CTO, Head of Engineering)". The LLM
-                        # adapted around the specific phrases; the BAN now covers the general
-                        # shape (any "strategy document", "executive deck", "council
-                        # presentation", or CPO/CTO/board-level review framing).
-                        BIZ_STRATEGY_BAN = [
-                            # Previously banned
-                            "strategy & implementation plan",
-                            "ai implementation roadmap",
-                            "c-suite presentation",
-                            "present to c-suite",
-                            "present to the board",
-                            "present to the c-suite",
-                            "budget approval",
-                            "$2m budget",
-                            "executive presentation prep",
-                            "18-month payback",
-                            "financial model",
-                            "15-page ai strategy",
-                            "market & competitive research",
-                            "roi analysis",
-                            "stakeholder alignment plan",
-                            "strategy document creation",
-                            # NEW (Priya v4 findings — drift shape)
-                            "product strategy document",
-                            "psd",  # Product Strategy Document acronym
-                            "executive presentation deck",
-                            "executive deck",
-                            "executive review",
-                            "executive briefing",
-                            "executive summary deck",
-                            "board presentation",
-                            "board briefing",
-                            "board deck",
-                            "cpo presentation",
-                            "cto presentation",
-                            "product council",
-                            "leadership council",
-                            "20-minute executive",
-                            "30-minute executive",
-                            "investment case",
-                            "business case document",
-                            "strategic roadmap",
-                            "ai strategy & implementation",
-                            "strategy & implementation",
-                            # Marketing collateral shapes
-                            "pitch deck",
-                            "sales enablement deck",
-                            "positioning memo",
-                            "narrative doc",
-                            # Added 2026-04-19 after Priya v5 found the LLM rebranded
-                            # "Product Strategy Document" → "AI Development Playbook"
-                            # and added "Agent Responsibility Matrix", "Engineering
-                            # Leadership Presentation with velocity metrics".
-                            "ai development playbook",
-                            "development playbook",
-                            "playbook document",
-                            "agent playbook",
-                            "strategy playbook",
-                            "engineering playbook",
-                            "agent strategy document",
-                            "agent responsibility matrix",
-                            "responsibility matrix",
-                            "velocity metrics presentation",
-                            "engineering leadership presentation",
-                            "engineering vp will evaluate",
-                            "vp will evaluate",
-                            "stakeholder presentation",
-                            "practical applicability and risk management",
-                            "success metrics and kpis",
-                            "organizational readiness",
-                        ]
-                        if any(p in content_lower for p in BIZ_STRATEGY_BAN):
+                        _rubric = _score_capstone_quality(
+                            content=content_obj.get("content", "") or "",
+                            phases=dd.get("phases") or [],
+                            checklist=dd.get("checklist") or [],
+                            code=content_obj.get("code", "") or "",
+                            course_context=course_context,
+                            step_title=(getattr(step_outline, "title", "") or ""),
+                        )
+                        if _rubric.get("fallback_used"):
+                            # ── FALLBACK gate: BIZ_STRATEGY_BAN + ENG_SIGNALS only
+                            # Fires when rubric LLM is unreachable / circuit-broken.
+                            # Append-only ratchet: each entry is a drift mode we've
+                            # observed and permanently hardened against.
+                            BIZ_STRATEGY_BAN_FALLBACK = [
+                                # Shape-level drift toward exec-deck / strategy-memo
+                                "executive presentation deck", "executive deck",
+                                "executive review", "executive briefing",
+                                "executive summary deck",
+                                "board presentation", "board deck", "board briefing",
+                                "cpo presentation", "cto presentation",
+                                "product council", "leadership council",
+                                "product strategy document", "strategic roadmap",
+                                "c-suite presentation", "present to c-suite",
+                                "present to the c-suite", "present to the board",
+                                "ai implementation roadmap", "ai development playbook",
+                                "development playbook", "engineering playbook",
+                                "agent responsibility matrix", "responsibility matrix",
+                                "velocity metrics presentation",
+                                "engineering leadership presentation",
+                                "stakeholder alignment plan", "stakeholder presentation",
+                                "15-page ai strategy", "strategy & implementation plan",
+                                "strategy document creation", "business case document",
+                                "investment case", "market & competitive research",
+                                "roi analysis", "18-month payback", "financial model",
+                                "budget approval", "success metrics and kpis",
+                                "organizational readiness",
+                                # Marketing collateral drift
+                                "pitch deck", "sales enablement deck",
+                                "positioning memo", "narrative doc",
+                            ]
+                            if any(p in content_lower for p in BIZ_STRATEGY_BAN_FALLBACK):
+                                return False
+                            # Minimum engineering-signal density
+                            combined = content_lower + " " + (content_obj.get("code","") or "").lower()
+                            for p in dd.get("phases", []):
+                                combined += " " + (p.get("title","") or "").lower()
+                            for c in dd.get("checklist", []):
+                                combined += " " + (c.get("label","") or "").lower()
+                            ENG_SIGNALS_FALLBACK = [
+                                "git ", "git\n", "`git", "commit ", "docker", "dockerfile",
+                                "npm ", "pip ", "pytest", "curl ", "run `", "./", "clone ",
+                                "endpoint", "api ", "/api", "deploy ", "kubectl", "vercel",
+                                "build ", "test ", "pr ", "pull request", "claude ", "cli",
+                            ]
+                            if sum(1 for s in ENG_SIGNALS_FALLBACK if s in combined) < 3:
+                                return False
+                        elif not _rubric.get("ok"):
+                            # Rubric judged the content BELOW threshold. Capture
+                            # axis + reason + anchor for retry feedback so the
+                            # LLM can fix the specific axis that failed.
+                            _reason = _rubric.get("reason", "") or "low rubric score"
+                            _anchor = _rubric.get("anchor", "") or ""
+                            _scores = _rubric.get("scores") or {}
+                            _last_invariant_reason[0] = (
+                                f"Capstone-quality rubric REJECTED this step. "
+                                f"Scores: {_scores}. Lowest-axis reason: {_reason}. "
+                                f"What a 90+ version would look like: {_anchor} "
+                                f"Rewrite the capstone so it asks the learner to "
+                                f"RUN code / BUILD containers / HIT endpoints / PASS tests, "
+                                f"not to draft strategy memos, align stakeholders, or "
+                                f"present decks."
+                            )[-800:]
                             return False
-                        # Must read like a coding task. Count DISTINCT signals — one
-                        # accidental mention of "commit" buried in marketing prose is
-                        # not enough to pass (Priya v4 review caught this shape — step 4
-                        # was a Product Strategy Document that happened to contain the
-                        # word "deploy" in the motivation section).
-                        combined = content_lower + " " + (content_obj.get("code","") or "").lower()
-                        for p in dd.get("phases", []):
-                            combined += " " + (p.get("title","") or "").lower()
-                        for c in dd.get("checklist", []):
-                            combined += " " + (c.get("label","") or "").lower()
-                        ENG_SIGNALS = [
-                            "git ", "git\n", "`git", "commit ", "docker", "dockerfile",
-                            "npm ", "pip ", "pytest", "curl ", "run `", "./", "clone ",
-                            "endpoint", "api ", "/api", "deploy ", "kubectl", "vercel",
-                            "build ", "test ", "pr ", "pull request", "claude ", "cli",
-                        ]
-                        distinct_signals = sum(1 for s in ENG_SIGNALS if s in combined)
-                        if distinct_signals < 3:
-                            return False
-                        # Further: the CHECKLIST must be overwhelmingly coding-verb lead.
-                        # A checklist of "Present to CTO / Align with CPO / Draft narrative"
-                        # is the tell even if content.body mentions `git` once in motivation.
-                        CODE_VERBS_FIRSTWORD = {
-                            "run", "build", "deploy", "test", "commit", "push", "open",
-                            "implement", "scaffold", "dockerize", "clone", "install",
-                            "write", "add", "refactor", "migrate", "merge", "rebase",
-                            "profile", "benchmark", "monitor", "fix", "curl", "call",
-                            "query", "integrate", "wire", "connect", "ship",
-                        }
-                        PM_VERBS_FIRSTWORD = {
-                            "present", "align", "draft", "pitch", "brief", "socialize",
-                            "announce", "communicate", "sell", "market", "position",
-                        }
-                        code_verb_count = 0
-                        pm_verb_count = 0
-                        for c in dd.get("checklist", []):
-                            label = (c.get("label","") or "").strip().lower()
-                            first = label.split(" ", 1)[0] if label else ""
-                            if first in CODE_VERBS_FIRSTWORD:
-                                code_verb_count += 1
-                            elif first in PM_VERBS_FIRSTWORD:
-                                pm_verb_count += 1
-                        # Engineering capstone: code verbs must dominate. If even one PM
-                        # verb leads a checklist item AND code verbs aren't clearly dominant,
-                        # reject — the step is drifting to presentation/strategy framing.
-                        if pm_verb_count > 0 and pm_verb_count >= code_verb_count:
-                            return False
-                        # Require at least 3 code-verb-led checklist items (can be more
-                        # checklist items; this just enforces a coding floor).
-                        if len(dd.get("checklist", [])) >= 5 and code_verb_count < 3:
-                            return False
-                    phases_all_specific = all(
-                        p.get("title", "").strip().lower() not in GENERIC_PHASE_TITLES
-                        for p in dd.get("phases", [])
-                    )
-                    checklist_all_specific = all(
-                        all(g not in c.get("label", "").lower() for g in GENERIC_CHECKLIST_PHRASES)
-                        for c in dd.get("checklist", [])
-                    )
                     # Technical courses' system_build capstone must have a REAL
                     # auto-grading contract. Sophia + Tomás learner reviews 2026-04-20
                     # both found capstones shipping with `validation: {manual_review: true}`
@@ -7003,12 +10615,12 @@ async def creator_generate(
                         # Reject manual_review when there's no other auto-check AND no real scaffold code
                         if val_obj.get("manual_review") and not has_auto_check and not real_code:
                             return False
+                    # Structural floor — rubric already covered content-quality.
+                    # Keep length + phases/checklist-presence structural check.
                     return (
                         content_len >= 500
                         and bool(dd.get("phases"))
                         and bool(dd.get("checklist"))
-                        and phases_all_specific
-                        and checklist_all_specific
                     )
                 if ex_type == "workday_simulator":
                     # Minimum viable: scenario text + at least 2 panes + slack_thread + root_cause/correct_actions
@@ -7126,14 +10738,255 @@ async def creator_generate(
             # since that's where the LangGraph gate fires).
             #
             # Total attempts per step when _is_complete keeps rejecting:
-            #   code_exercise: 5  (Sonnet×3 + Opus×2)
-            #   others:        2  (Sonnet×2)
-            _max_attempts = 5 if ex_type == "code_exercise" else 2
+            #   code_exercise:        5  (Sonnet×3 + Opus×2)
+            #   T4 immersive types:   4  (complex JSON payloads — adaptive_roleplay,
+            #                            voice_mock_interview, incident_console,
+            #                            simulator_loop, system_build). PM v2 regen
+            #                            (2026-04-23) showed retry=2 was too tight:
+            #                            M5.5 adaptive_roleplay + M7.4 voice_mock
+            #                            both exhausted at retry 2 and silently fell
+            #                            back to null demo_data. Bumping to 4 gives
+            #                            the LLM headroom for the ~3KB JSON shapes.
+            #   others:               2  (simple types: concept / mcq / categorization
+            #                            / ordering / scenario_branch / sjt — their
+            #                            payloads are small enough for 2 attempts).
+            _T4_IMMERSIVE = {"adaptive_roleplay", "voice_mock_interview",
+                             "incident_console", "simulator_loop", "system_build"}
+            # 2026-04-24 v8.6 — retry-order overhaul per user directive post-
+            # TS v12 domain-expert review. Prior policy was Sonnet×4 + Opus×1
+            # with simplify firing on 2 consec fails (any attempt). That let
+            # simplify beat Opus-at-full-difficulty to the punch — once
+            # simplified, the learning contract was weakened BEFORE we'd
+            # exhausted our strongest model at the creator's intended depth.
+            #
+            # New phase-based order:
+            #   Phase FULL (creator's intended difficulty):
+            #     attempts 2-3  → Sonnet ×2 (fan-out=2)
+            #     attempts 4-5  → Opus   ×2 (fan-out=1)
+            #   Phase SIMPLIFIED (last-resort rescue):
+            #     simplify fires at START of attempt 6
+            #     attempts 6-7  → Sonnet ×2 on simplified (fan-out=2)
+            #     attempt 8     → Opus   ×1 on simplified (fan-out=1)
+            #   Then: dead-letter (quality_flag=needs_author_review)
+            #
+            # Rationale: preserves creator's complexity intent as long as
+            # possible. Only weakens the scaffold after the strongest model
+            # has failed at full difficulty. Cost: ~2× a hard step (was 4
+            # Sonnet + 1 Opus = ~9 sonnet-equivalents; now 4 Sonnet + 3 Opus
+            # = ~19 sonnet-equivalents). Easy steps still pass at attempts
+            # 2-3 with zero Opus usage.
+            if ex_type == "code_exercise":
+                _max_attempts = 8
+            elif ex_type in _T4_IMMERSIVE:
+                _max_attempts = 4
+            else:
+                _max_attempts = 2
+            # P1-7 (2026-04-22 v7): wall-time budget per step. Even with
+            # 5 attempts, a single step can burn 5-7 minutes of Docker
+            # time on slow languages (Go cold-compile × 5 × invariant).
+            # Cap at 240s per step — past that, the retry loop exits
+            # and the step falls back to the fallback-content template.
+            # User directive: "We can't have course creators waiting
+            # for 30 mins for a basic course."
+            # 2026-04-23 v8.1: per-type wall-time budget. code_exercise in
+            # TypeScript (jest + ts-jest compile pipeline) takes ~50s/attempt
+            # → 240s budget exhausts at 3 attempts, leaving 2 of the 5-retry
+            # budget unused. T4 immersive types (adaptive_roleplay,
+            # voice_mock_interview) are LLM-only, no Docker, so their attempts
+            # are faster (~15s each) and the default budget is fine. Split:
+            #   - code_exercise in slow-compile langs (ts/java/rust): 450s
+            #   - code_exercise in fast-compile langs (py/js/go):     300s
+            #   - everything else:                                     240s
+            _course_lang = None
+            try:
+                _course_lang = (course_context.get("language")
+                                or (step_outline.demo_data or {}).get("language")
+                                or "").lower() if isinstance(course_context, dict) else ""
+            except Exception:
+                _course_lang = ""
+            # v8.5 Phase B wall-time cap bump (2026-04-23 post-v8.4 obs):
+            # With Phase B isolation each invariant call runs both solution
+            # and starter in Docker with fresh pip install; a FastAPI+asyncpg
+            # step needs ~80-120s per attempt (LLM call + 2 Docker runs +
+            # invariant). 300s only fits 2-3 attempts. Bumped to 600s so
+            # 5-6 attempts can complete, giving the retry loop room to
+            # actually converge on iterative LLM bugs (e.g. multi-file
+            # architecture confusion).
+            # v8.6 (2026-04-24) — bumped budgets for the new 8-attempt retry
+            # order (Sonnet×2 + Opus×2 full, then Sonnet×2 + Opus×1 simplified).
+            # Opus is ~2× slower per call than Sonnet; with 3 Opus attempts per
+            # hard step the total wall time grows. Empirical target for TS v12
+            # capstone-class steps: ~10 min ceiling (was 12.5 min under old
+            # policy; budget needs to cover the added Opus slots).
+            if ex_type == "code_exercise" and _course_lang in ("ts", "typescript", "java", "rust"):
+                _step_budget_s = int(os.getenv("CREATOR_STEP_BUDGET_S_SLOW", "1200"))
+            elif ex_type == "code_exercise":
+                _step_budget_s = int(os.getenv("CREATOR_STEP_BUDGET_S_FAST", "900"))
+            else:
+                _step_budget_s = int(os.getenv("CREATOR_STEP_BUDGET_S", "300"))
+            _step_t0 = time.time()
             attempt = 1
-            while not _is_complete(llm_content, ex_type) and _llm_enabled() and attempt < _max_attempts:
+            # P0 (2026-04-22 v7.3): _is_complete runs the LangGraph invariant
+            # which calls run_in_docker → subprocess.run (synchronous, blocks
+            # event loop for 5-60s per call). Moving to asyncio.to_thread so
+            # the event loop stays responsive and /status polls succeed.
+            import asyncio as _asyncio_loop_fix
+            while (not (await _asyncio_loop_fix.to_thread(_is_complete, llm_content, ex_type))
+                   and _llm_enabled()
+                   and attempt < _max_attempts
+                   and (time.time() - _step_t0) < _step_budget_s):
                 attempt += 1
                 # Build a specific hint for this retry
                 _hint_parts = []
+                # v8.5 Phase F DIFFERENTIAL RETRIES (2026-04-23, Opus 5th+6th
+                # consults). The LLM regenerates from the step spec + error
+                # message each retry, without seeing what it JUST emitted.
+                # Result: identical spec + identical error = identical output
+                # = deterministic attractor (TS v6 S1 died here with 6 retries
+                # all emitting byte-identical 1636-char error feedback).
+                # Fix: include the LLM's PRIOR emission verbatim in the retry
+                # prompt. The LLM can now diff "what I tried" vs "what I'm
+                # about to emit" and deliberately change it.
+                _prior_starter = (llm_content or {}).get("code") if isinstance(llm_content, dict) else None
+                _prior_val = (llm_content or {}).get("validation") if isinstance(llm_content, dict) else None
+                _prior_solution = (_prior_val or {}).get("solution_code") if isinstance(_prior_val, dict) else None
+                _prior_tests = (_prior_val or {}).get("hidden_tests") if isinstance(_prior_val, dict) else None
+                # v8.6 (2026-04-24) H1 FIX — buddy-Opus consult on capstone attractor:
+                # prior iteration fed FULL 2500+2500+2000 char prior attempt as
+                # "REJECTED" block. LLMs pattern-match on structure + volume, not
+                # labels. The broken code became the dominant signal in context;
+                # English "REJECTED" was a whisper against a shout. Model re-emitted
+                # the same wrong pattern across 10+ retries.
+                # Fix: elide the broken test bodies — keep ONLY the signature-level
+                # summary + a LIST of failing test-block identifiers with the single
+                # line that errored. No verbatim wrong code in context.
+                if _prior_solution or _prior_starter or _prior_tests:
+                    _diff_block = (
+                        f"## Your previous attempt (retry {attempt - 1}) — structural summary only\n\n"
+                        "The full text of your previous attempt is OMITTED on purpose. "
+                        "Seeing it verbatim makes models copy-paste the same wrong pattern. "
+                        "Work from the signatures below + the compiler errors, NOT from memory.\n\n"
+                    )
+                    # Starter signatures (first 30 lines) — enough to see the function shape
+                    if _prior_starter:
+                        _st_head = "\n".join(_prior_starter.splitlines()[:30])
+                        _diff_block += f"### Starter signatures (first 30 lines):\n```\n{_st_head}\n```\n\n"
+                    # Solution signatures ONLY (strip bodies) — show exports + types.
+                    # Heuristic: for TS/JS, keep `export` lines + type/interface declarations.
+                    # For Python, keep `def`/`class` signatures + `...`.
+                    if _prior_solution:
+                        _sol_lines = _prior_solution.splitlines()
+                        _sig_lines: list[str] = []
+                        for _ln in _sol_lines[:200]:
+                            _lns = _ln.strip()
+                            if (_lns.startswith(("export ", "import ", "type ", "interface ",
+                                                  "class ", "def ", "async def ",
+                                                  "function ", "const ", "let ", "var "))
+                                or _lns.startswith(("@", "#"))):
+                                _sig_lines.append(_ln)
+                        if _sig_lines:
+                            _diff_block += (
+                                f"### Solution signatures (bodies elided):\n```\n"
+                                + "\n".join(_sig_lines[:40]) + "\n```\n\n"
+                            )
+                    # Test block names — just list them. No bodies.
+                    if _prior_tests:
+                        import re as _re_tb
+                        _test_names: list[str] = []
+                        for m in _re_tb.finditer(
+                            r"(?:test|it)\s*\(\s*['\"]([^'\"]+)['\"]|def\s+(test_\w+)|func\s+(Test\w+)",
+                            _prior_tests,
+                        ):
+                            _test_names.append(next((g for g in m.groups() if g), ""))
+                        if _test_names:
+                            _diff_block += (
+                                "### Test block names from your previous hidden_tests:\n"
+                                + "\n".join(f"  - {n}" for n in _test_names[:15])
+                                + "\n\n"
+                            )
+                    _diff_block += (
+                        "That attempt failed the invariant. The EXACT compiler errors "
+                        "(deduplicated) + a CORRECT-PATTERN exemplar are below. "
+                        "Work from those, not from your prior attempt.\n"
+                    )
+                    _hint_parts.append(_diff_block)
+
+                # H2 FIX — positive exemplar. Sibling example showing the CORRECT
+                # pattern for the step's language. LLMs imitate concrete examples
+                # far more effectively than English rules ("MUST narrow" →
+                # ignored; a 15-line working example → copied). Placed BEFORE
+                # the error report per buddy-Opus "exemplar closest to generation".
+                _ctx_lang_exemplar = ""
+                if isinstance(course_context, dict):
+                    _ctx_lang_exemplar = str(course_context.get("language") or "").lower()
+                if ex_type == "code_exercise" and _ctx_lang_exemplar in ("typescript", "ts"):
+                    # v8.6 CONTRASTIVE EXEMPLAR v2 — post-v13 post-mortem:
+                    # Opus copied variable name `r` but stripped `if (!r.success)`
+                    # wrapper. Single-exemplar approach showed correct pattern
+                    # but model treated if-guard as decorative. Contrastive
+                    # pair (WRONG annotated + RIGHT annotated) makes the guard
+                    # visually load-bearing — it's literally THE difference
+                    # between the two blocks. Kept synchronized with shared
+                    # helper's exemplar (validate_code_exercise_invariant).
+                    _hint_parts.append(
+                        "## Correct-pattern exemplar (mimic EXACTLY — including the if-guards)\n\n"
+                        "SIBLING EXAMPLE — not the solution to your step. Demonstrates\n"
+                        "CRITICAL narrowing on a discriminated union. The `if` guards\n"
+                        "are NOT decorative — they are what makes the code compile.\n\n"
+                        "```typescript\n"
+                        "// Contract\n"
+                        "type Ok<T>   = { ok: true;  data: T };\n"
+                        "type Err<E>  = { ok: false; error: E };\n"
+                        "type Result<T, E> = Ok<T> | Err<E>;\n"
+                        "\n"
+                        "declare function divideInt(a: number, b: number): Result<number, Error>;\n"
+                        "\n"
+                        "\n"
+                        "// ❌❌❌ WRONG — THIS IS WHAT THE COMPILER REJECTS ❌❌❌\n"
+                        "test('(broken — do NOT copy this pattern)', () => {\n"
+                        "  const r = divideInt(1, 0);\n"
+                        "  expect(r.error).toBeInstanceOf(Error);\n"
+                        "  //     ~~~~~ TS2339: Property 'error' does not exist on type\n"
+                        "  //             'Result<number, Error>'.\n"
+                        "  //           Property 'error' does not exist on type 'Ok<number>'.\n"
+                        "});\n"
+                        "\n"
+                        "\n"
+                        "// ✓✓✓ RIGHT — narrow FIRST, then access. This compiles. ✓✓✓\n"
+                        "test('happy path — narrow ok=true before .data', () => {\n"
+                        "  const r = divideInt(10, 2);\n"
+                        "  expect(r.ok).toBe(true);\n"
+                        "  if (r.ok) {                      // ← LOAD-BEARING. NOT OPTIONAL.\n"
+                        "    expect(r.data).toBe(5);        //   .data only visible inside this block\n"
+                        "  }\n"
+                        "});\n"
+                        "\n"
+                        "test('error path — narrow ok=false before .error', () => {\n"
+                        "  const r = divideInt(1, 0);\n"
+                        "  expect(r.ok).toBe(false);\n"
+                        "  if (!r.ok) {                     // ← LOAD-BEARING. NOT OPTIONAL.\n"
+                        "    expect(r.error).toBeInstanceOf(Error);   //   .error only here\n"
+                        "    expect(r.error.message).toContain('zero');\n"
+                        "  }\n"
+                        "});\n"
+                        "```\n\n"
+                        "### RULES (non-negotiable)\n"
+                        "1. EVERY assertion on `.error` or `.data` MUST be inside an `if (r.ok)` /\n"
+                        "   `if (!r.ok)` block (or `if (r.success)` / `if (!r.success)` — whichever\n"
+                        "   discriminant your scaffold specifies). Omitting the guard = TS2339.\n"
+                        "2. The discriminant check (`expect(r.ok).toBe(false)` or similar) goes\n"
+                        "   BEFORE the narrow block, OUTSIDE any if-guard.\n"
+                        "3. NO `rejects.toThrow(X)` — this API RETURNS a Result, it does not throw.\n"
+                        "4. When using the `if` guard, TypeScript AUTOMATICALLY narrows `r` to the\n"
+                        "   matching branch — no `as` cast needed.\n"
+                    )
+
+                # Error feedback (raw tool output from last attempt)
+                if _last_invariant_reason[0]:
+                    _hint_parts.append(
+                        "## Error from the last attempt (fix these sites):\n\n"
+                        + _last_invariant_reason[0]
+                    )
                 if ex_type == "code_exercise":
                     _hint_parts.append(
                         "Previous attempt was REJECTED by the LangGraph invariant gate "
@@ -7156,34 +11009,117 @@ async def creator_generate(
                     )
                 if attempt >= 4:
                     _hint_parts.append(
-                        "CRITICAL: Retry attempt {0}/5. Previous {1} attempts all produced "
+                        "CRITICAL: Retry attempt {0}/8. Previous {1} attempts all produced "
                         "starters that passed their own tests. DO NOT emit any working logic "
                         "in the `code` field. The function body MUST be a single "
                         "`raise NotImplementedError(...)` line, nothing more.".format(attempt, attempt - 1)
                     )
-                # L4: no Opus upgrade — Sonnet all retries.
-                # L3 (2026-04-22): parallel first-attempt fan-out for code_exercise.
-                # On retries, fire 2 concurrent LLM calls with slightly different
-                # hints; take the first one that passes _is_complete. Roughly 2×
-                # LLM spend per retry, but wall-clock cuts by up to 2× and the
-                # two attempts explore different framings (one stricter hint,
-                # one pattern-oriented) — higher chance at least one satisfies
-                # the invariant. When only one attempt is desired (non-code_exercise
-                # retries), fan-out=1 preserves the prior behavior.
-                _fanout = 2 if ex_type == "code_exercise" else 1
+                # v8.6 (2026-04-24) — PHASE-BASED model selection per user
+                # directive post-TS-v12: "Sonnet first, then Opus — both
+                # couple of times. Then simplify and follow the same."
+                # Phase FULL: attempts 2,3 (Sonnet) + 4,5 (Opus).
+                # Phase SIMPLIFIED: attempts 6,7 (Sonnet) + 8 (Opus).
+                # Simplify trigger now fires at phase boundary (attempt 6),
+                # NOT on consec-fail count — preserves creator's intended
+                # complexity until the strongest model has tried.
+                # v8.6 (2026-04-24) RETRY-ORDER v2 per buddy-Opus consult on capstone attractor:
+                # "Kill simplify for this class. A Result<T,E> narrowing is table-stakes TS —
+                # Opus absolutely can write it. Simplify here destroys pedagogical value
+                # (the capstone IS the discriminated union). Keep simplify as a last-resort
+                # escape valve at attempt 8, not attempt 6. Give Opus 4-5 swings with
+                # escalating prompt structure first."
+                # Also: "Attempt 6 Sonnet-on-simplified is a double step-down. If you keep
+                # simplify at all, use Opus on the simplified version."
+                #
+                # New order (code_exercise):
+                #   Attempts 2-3: Sonnet ×2 at FULL difficulty, fan-out=2 (A/B divergence)
+                #   Attempts 4-7: Opus ×4 at FULL difficulty, fan-out=1 (escalating hints)
+                #   Attempt 8:   Opus ×1 on SIMPLIFIED scaffold (last-resort only)
+                #   Exhaust → dead-letter (quality_flag=needs_author_review)
+                if ex_type == "code_exercise":
+                    if attempt in (4, 5, 6, 7):
+                        # Phase FULL, Opus — 4 swings at creator's intended complexity
+                        _retry_model = _OPUS_MODEL if '_OPUS_MODEL' in globals() else _STEP_CONTENT_MODEL
+                        _fanout = 1  # Opus is ~5× Sonnet's cost
+                        _opus_try_n = attempt - 3  # 1..4
+                        _hint_parts.append(
+                            f"⚠️ Opus attempt {_opus_try_n}/4 at FULL difficulty (overall retry {attempt}/8).\n"
+                            f"Sonnet tried 2 times at full difficulty + {_opus_try_n - 1} prior Opus attempt(s) "
+                            f"couldn't converge. You (Opus) see the full retry trail + the "
+                            f"correct-pattern exemplar above. Solve at the creator's INTENDED "
+                            f"complexity — do NOT weaken contract, do NOT skip generics/narrowing. "
+                            f"Scaffold stays pinned. THINK: (a) does my starter actually FAIL "
+                            f"tests? (b) does my solution actually PASS? (c) am I writing tests "
+                            f"that NARROW the discriminated union before accessing .data / .error?"
+                        )
+                    elif attempt >= 8:
+                        # Phase SIMPLIFIED, Opus — last resort only, never Sonnet on simplified
+                        _retry_model = _OPUS_MODEL if '_OPUS_MODEL' in globals() else _STEP_CONTENT_MODEL
+                        _fanout = 1
+                        _hint_parts.append(
+                            f"⚠️ FINAL ATTEMPT ({attempt}/8) — Opus on SIMPLIFIED scaffold. "
+                            f"Full-difficulty Opus ×4 failed. The scaffold has been regenerated "
+                            f"with reduced complexity. Work within the simpler contract; emit "
+                            f"clean, runnable code. If this also fails, the step dead-letters "
+                            f"with quality_flag=needs_author_review."
+                        )
+                    else:
+                        # Phase FULL, Sonnet (attempts 2, 3)
+                        _retry_model = _STEP_CONTENT_MODEL
+                        _fanout = 2
+                else:
+                    _retry_model = _STEP_CONTENT_MODEL
+                    _fanout = 1
                 logging.warning(
                     "Step retry %d/%d for %s/%s/%s (fan-out=%d, model=%s)",
                     attempt, _max_attempts, title, mod.title, step_outline.title,
-                    _fanout, _STEP_CONTENT_MODEL,
+                    _fanout, _retry_model,
                 )
                 ctx_for_retry = dict(course_context) if isinstance(course_context, dict) else {}
                 ctx_for_retry["is_capstone_module"] = (m_pos - 1 == capstone_module_idx)
+                # v8.6 (2026-04-24) LATE-SIMPLIFY per buddy-Opus consult —
+                # the simplify trigger moved from attempt 6 → attempt 8. Pre-fix
+                # we ran Sonnet×2 full + Opus×2 full → simplified. Buddy's
+                # insight: "A Result<T,E> narrowing is table-stakes TS — Opus
+                # absolutely can write it. Simplify here destroys pedagogical
+                # value. Keep simplify as a last-resort escape valve at
+                # attempt 8, not attempt 6."
+                # New policy: simplify fires ONCE at attempt 8 (final), runs
+                # Opus on the simplified scaffold, then dead-letter. Creator's
+                # difficulty intent is preserved through 6 full-strength
+                # attempts (Sonnet×2 + Opus×4). Simplify is strictly defense
+                # against "this exercise is genuinely unsolvable as spec'd" —
+                # which is rare.
+                if _scaffold is not None:
+                    if ex_type == "code_exercise" and attempt == 8 and _llm_enabled() and not _scaffold.get("_simplified"):
+                        try:
+                            _lang_s = (ctx_for_retry.get("language") or "").lower() if isinstance(ctx_for_retry, dict) else ""
+                            _scaffold_simple = _generate_scaffold_with_opus(
+                                step_title=step_outline.title,
+                                step_description=step_outline.description or "",
+                                language=_lang_s,
+                                course_title=title,
+                                module_title=mod.title,
+                                simplify=True,
+                            )
+                            if _scaffold_simple:
+                                _scaffold_simple["_simplified"] = True
+                                _scaffold = _scaffold_simple
+                                logging.warning(
+                                    "SCAFFOLD simplified at PHASE BOUNDARY (attempt 8 — final) for %r "
+                                    "— full-difficulty Sonnet×2 + Opus×2 all failed",
+                                    step_outline.title[:60],
+                                )
+                        except Exception as _sr:
+                            logging.warning("Simplified-scaffold regen failed: %s", _sr)
+                    ctx_for_retry["scaffold"] = _scaffold
 
-                def _single_regen(hint_text: str):
+                def _single_regen(hint_text: str, _model: str = _retry_model):
                     try:
                         rc = _llm_generate_step_content(
                             ctx_for_retry, mod.title, step_outline.title, ex_type,
                             step_outline.description, retry_hint=hint_text,
+                            model_override=_model,
                         )
                         if ex_type == "code_review" and isinstance(rc, dict) and rc.get("demo_data"):
                             rc["demo_data"] = _normalize_code_review_bugs(rc["demo_data"])
@@ -7205,15 +11141,38 @@ async def creator_generate(
                     if _fanout == 1:
                         retry_content = _single_regen("\n".join(_hint_parts))
                     else:
-                        # Two flavors of hint: one strict-rules, one pattern-oriented
-                        hint_a = "\n".join(_hint_parts)
-                        hint_b = ("\n".join(_hint_parts) +
-                                  "\n\n**FAN-OUT variant B**: try a DIFFERENT framing this time. "
-                                  "Write the starter as the SHORTEST POSSIBLE function body: "
-                                  "just `raise NotImplementedError('TODO')`. Put all detail in "
-                                  "the docstring + solution_code. Tests unchanged.")
+                        # v8.5 Phase F (2026-04-23, Opus 5th consult):
+                        # fan-out=2 needs an EXPLICIT divergence axis or both
+                        # branches collapse into correlated samples. A = fix
+                        # specific sites (narrow, targeted); B = structurally
+                        # different approach (abandons the prior strategy).
+                        hint_a = "\n".join(_hint_parts) + (
+                            "\n\n**Fan-out variant A**: fix the SPECIFIC sites flagged "
+                            "in the error output. Keep the overall structure similar to "
+                            "your prior attempt; just change the lines the error points at."
+                        )
+                        hint_b = "\n".join(_hint_parts) + (
+                            "\n\n**Fan-out variant B**: your PRIOR approach is wrong. "
+                            "Start from a structurally DIFFERENT strategy — different "
+                            "function signatures, different type decomposition, different "
+                            "helper structure, different tests (different scenarios, "
+                            "different assertions). Do NOT emit the same solution skeleton "
+                            "as your prior attempt — that produced the attached error. "
+                            "Rethink, then emit a fresh take."
+                        )
                         import concurrent.futures as _cf
-                        with _cf.ThreadPoolExecutor(max_workers=2) as _pool:
+                        # v8.6 (2026-04-24) — LAYER 0 RESILIENCE FIX per
+                        # buddy-Opus post-TS-v11: replace `with ThreadPoolExecutor:`
+                        # context manager with explicit shutdown(wait=False,
+                        # cancel_futures=True). The context manager's __exit__
+                        # calls shutdown(wait=True) which BLOCKS until all
+                        # submitted futures complete — this was the 17-min hang
+                        # in TS v11 S9. Combined with the httpx.Timeout(read=180)
+                        # on the Anthropic client (set at client init), hung
+                        # fan-out branches now self-terminate within 180s, and
+                        # once we have a winner we don't wait on the loser.
+                        _pool = _cf.ThreadPoolExecutor(max_workers=2)
+                        try:
                             fut_a = _pool.submit(_single_regen, hint_a)
                             fut_b = _pool.submit(_single_regen, hint_b)
                             done, pending = _cf.wait(
@@ -7224,20 +11183,26 @@ async def creator_generate(
                             retry_content = None
                             winners = []
                             # Check if the first-completed passes _is_complete.
+                            # v7.3: _is_complete hits Docker — run in thread so
+                            # the event loop stays responsive during the fan-out.
                             for f in done:
                                 try:
                                     rc = f.result()
-                                    if rc and _is_complete(rc, ex_type):
+                                    if rc and (await _asyncio_loop_fix.to_thread(_is_complete, rc, ex_type)):
                                         retry_content = rc
                                         winners.append("first_completed")
                                         break
                                 except Exception: pass
-                            # If first-completed didn't pass, wait for the other.
+                            # If first-completed didn't pass, give the pending
+                            # branch a bounded window to finish (60s, not 180s —
+                            # httpx already caps the raw LLM call at 180s; an
+                            # extra 60s here covers Docker-validation overhead
+                            # inside _single_regen without doubling the budget).
                             if retry_content is None:
                                 for f in pending:
                                     try:
-                                        rc = f.result(timeout=180)
-                                        if rc and _is_complete(rc, ex_type):
+                                        rc = f.result(timeout=60)
+                                        if rc and (await _asyncio_loop_fix.to_thread(_is_complete, rc, ex_type)):
                                             retry_content = rc
                                             winners.append("second_completed")
                                             break
@@ -7251,7 +11216,43 @@ async def creator_generate(
                                     except Exception: pass
                             if winners:
                                 logging.info("L3 fan-out winner: %s", winners[0])
-                    if _is_complete(retry_content, ex_type):
+                        finally:
+                            # Non-blocking shutdown: don't wait for losers.
+                            # cancel_futures=True only cancels futures not yet
+                            # started (doesn't interrupt running LLM calls —
+                            # httpx timeout handles that). Any already-running
+                            # thread will terminate naturally when httpx raises
+                            # TimeoutException or the call returns.
+                            _pool.shutdown(wait=False, cancel_futures=True)
+                    _passed_this_attempt = await _asyncio_loop_fix.to_thread(_is_complete, retry_content, ex_type)
+                    # v8.5 Phase G INSTRUMENTATION (Opus #7): log per-retry
+                    # diagnostic row for attractor/ambiguity/undiagnostic
+                    # analysis. Runs regardless of pass/fail so a PASSING
+                    # retry also emits "tests_passed=N/total" for post-hoc
+                    # review.
+                    try:
+                        _curr_starter = (retry_content or {}).get("code", "") if isinstance(retry_content, dict) else ""
+                        _curr_val = (retry_content or {}).get("validation") if isinstance(retry_content, dict) else None
+                        _curr_solution = (_curr_val or {}).get("solution_code", "") if isinstance(_curr_val, dict) else ""
+                        await _asyncio_loop_fix.to_thread(
+                            _log_retry_attempt,
+                            title, mod.title, step_outline.title, attempt,
+                            _prior_solution or _prior_starter or "",
+                            _curr_solution or _curr_starter or "",
+                            _last_test_counts[2] if not _passed_this_attempt else "PASS",
+                            _last_test_counts[0] if not _passed_this_attempt else _last_test_counts[0],
+                            _last_test_counts[1] if not _passed_this_attempt else _last_test_counts[1],
+                        )
+                    except Exception as _ie:
+                        logging.warning("instrumentation call failed (non-fatal): %s", _ie)
+                    # Phase H counter: track Stage-2 failures to trigger
+                    # scaffold-simplify at threshold=2 (Opus #8 caveat 3).
+                    if _scaffold is not None:
+                        if _passed_this_attempt:
+                            _consecutive_stage2_fails = 0
+                        else:
+                            _consecutive_stage2_fails += 1
+                    if _passed_this_attempt:
                         llm_content = retry_content
                         break
                     else:
@@ -7260,7 +11261,20 @@ async def creator_generate(
                     logging.warning("Step retry %d failed for %s/%s: %s", attempt, mod.title, step_outline.title, e)
                     break
 
-            if _is_complete(llm_content, ex_type):
+            # P1-7 log: if we exited the loop due to wall-time cap, say so
+            # (distinct from hitting max_attempts) so slow-step analysis can
+            # pick these out. Helps tune budget per course type.
+            _step_elapsed = time.time() - _step_t0
+            _complete_final = await _asyncio_loop_fix.to_thread(_is_complete, llm_content, ex_type)
+            if _step_elapsed >= _step_budget_s and not _complete_final:
+                logging.warning(
+                    "Step wall-time cap HIT on %s/%s: %.1fs >= %ds "
+                    "(attempts=%d). Falling back to template content.",
+                    mod.title, step_outline.title,
+                    _step_elapsed, _step_budget_s, attempt,
+                )
+
+            if _complete_final:
                 content = llm_content.get("content") or f"<h2>{step_outline.title}</h2>\n<p>{step_outline.description}</p>"
                 # Post-gen dark-theme enforcement — rewrites light-pastel inline
                 # styles the LLM keeps emitting despite the prompt rules.
@@ -7393,51 +11407,118 @@ async def creator_generate(
             step_desc = step_outline.description or step_outline.title
 
             if ex_type == "code_exercise" and not code:
-                # Gate on course_type FIRST — a technical course's code_exercise MUST get the
-                # engineering fallback regardless of step-title keywords. Aarav v5 caught
-                # "design" in "End-to-End Design" step title flipping the Agentic Harness
-                # capstone to the section-template non-eng fallback. Word-boundary on title
-                # keywords was still too eager; course_type is the authoritative signal.
-                _course_type_for_fb = (course_context.get("course_type") or "").lower() if isinstance(course_context, dict) else ""
-                is_non_engineering_local = False
-                if _course_type_for_fb != "technical":
-                    import re as _re_kw
-                    _blob_kw = f"{title} {mod.title} {step_outline.title}".lower()
-                    _non_eng_kw_re = _re_kw.compile(r"\b(research|user research|ux research|ux designer|product management|product manager|leadership coaching|investor pitch)\b")
-                    is_non_engineering_local = bool(_non_eng_kw_re.search(_blob_kw))
-                if is_non_engineering_local:
-                    # Non-engineering fallback: template with section scaffolding
-                    code = (f"# {step_outline.title}\n"
-                            f"# Objective: {step_desc[:160]}\n\n"
-                            f"## Section 1: Context\n# ____\n\n"
-                            f"## Section 2: Approach\n# ____\n\n"
-                            f"## Section 3: Decision / Artifact\n# ____\n\n"
-                            f"## Section 4: Validation / Follow-up\n# ____\n")
-                else:
-                    # Engineering fallback — Alex + Tomás learner reviews 2026-04-20
-                    # found the prior "# TODO: ...\n# Write your solution below" stub
-                    # rendered as an empty editor with zero scaffolding. Emit a realistic
-                    # Python skeleton: imports, a main function with inputs, one helper,
-                    # and 3 explicit TODO markers the learner fills in.
-                    code = (
-                        "# " + step_outline.title + "\n"
-                        "# Objective: " + (step_desc[:180]) + "\n\n"
-                        "from __future__ import annotations\n"
-                        "from typing import Any\n\n\n"
-                        "def solve(inputs: dict[str, Any]) -> dict[str, Any]:\n"
-                        "    \"\"\"Main entry point for this exercise.\"\"\"\n"
-                        "    # TODO (1): parse `inputs` and validate required keys\n"
-                        "    # TODO (2): implement the core logic described in the task above\n"
-                        "    # TODO (3): return a dict with the result + any diagnostic fields\n"
-                        "    return {\"status\": \"unimplemented\"}\n\n\n"
-                        "if __name__ == '__main__':\n"
-                        "    # Minimal smoke test — expand with your own cases.\n"
-                        "    demo_input = {\"example\": 1}\n"
-                        "    print(solve(demo_input))\n"
-                    )
-                expected_output = None
-                validation = validation or {"hint": f"Complete the task: {step_desc[:100]}",
-                                            "must_contain": ["def ", "return"]}
+                # v8.6 (2026-04-24) DEAD-LETTER per buddy-Opus consult #9.
+                # Previously: `raise RuntimeError` → whole-course rollback, lost
+                # 8 passing steps on TS v11 S9. The v7 silent-Python-fallback
+                # was rightly killed in v8; v8.6 replaces whole-course-failure
+                # with per-step quarantine. Creator UI shows a warning badge +
+                # regenerate button on the flagged step (narrow-scope regen per
+                # CLAUDE.md §"Always regen EXACTLY what is broken"). No junk
+                # ships — the step RENDERS a clear "needs author review" banner,
+                # not a cheese-able Python skeleton.
+                _failure_tail = (_last_invariant_reason[0] or "")[-1200:]
+                logging.error(
+                    "DEAD_LETTER code_exercise %r / %r (course=%r) — retry loop "
+                    "exhausted. Persisting with quality_flag=needs_author_review. "
+                    "Failure tail: %s",
+                    mod.title, step_outline.title, title,
+                    _failure_tail[:400].replace("\n", " \\n "),
+                )
+                _needs_review_steps.append({
+                    "module_title": mod.title,
+                    "step_title": step_outline.title,
+                    "exercise_type": ex_type,
+                    "failure_reason": "code_exercise_retry_exhausted",
+                    "retry_tail": _failure_tail,
+                })
+                content = (
+                    '<div style="background:#3a1f1f; color:#ffd4d4; '
+                    'border:1px solid #5a2f2f; border-radius:8px; padding:16px; '
+                    'margin-bottom:12px;">'
+                    '<h3 style="margin:0 0 8px 0; color:#ffb4b4;">⚠ This exercise needs author review</h3>'
+                    f'<p style="margin:0 0 6px 0; line-height:1.55;">The Creator '
+                    f'retry loop could not produce a runnable code exercise for '
+                    f'<strong>{step_outline.title}</strong>. The step is saved '
+                    f'with the failure trace attached so you can regenerate it '
+                    f'narrowly (per-step regenerate button) or edit the outline.</p>'
+                    '<p style="margin:0; line-height:1.55; font-size:0.9rem; color:#c9a0a0;">'
+                    'Learners will see this banner until the author resolves the step.</p>'
+                    '</div>'
+                )
+                # Minimal starter so the template renders; NO hidden_tests / NO
+                # solution_code so the grader short-circuits (quality_flag also
+                # tells /api/exercises/validate to skip scoring this step).
+                code = code or (
+                    f"# {step_outline.title}\n"
+                    f"# This exercise is pending author review — auto-generation "
+                    f"did not produce a valid code + hidden_tests + solution_code triple.\n"
+                    f"pass\n"
+                )
+                validation = dict(validation) if isinstance(validation, dict) else {}
+                validation["quality_flag"] = "needs_author_review"
+                validation["quality_reason"] = "code_exercise_retry_exhausted"
+                validation["retry_tail"] = _failure_tail
+                validation.pop("hidden_tests", None)
+                validation.pop("solution_code", None)
+            # 2026-04-23 v8.1 — SAME FAIL-LOUD RULE for T4 IMMERSIVE TYPES.
+            # Root cause from PM course v2 direct review: M5.5 adaptive_roleplay
+            # and M7.4 voice_mock_interview both exhausted retry (2/2 too tight),
+            # LLM returned incomplete content, ontology gate rejected, fallback
+            # fired and persisted steps with `demo_data=null`. The step rendered
+            # as an empty widget — pedagogically unusable.
+            #
+            # Every T4 immersive type has a required `demo_data` shape. If we
+            # reach this point with it still unpopulated, the course generation
+            # must fail loudly (same class as code_exercise fallback removal).
+            # Creator will surface the failure to the author who can retry or
+            # change that step's exercise_type.
+            _T4_IMMERSIVE_STRICT = {
+                "adaptive_roleplay", "voice_mock_interview",
+                "incident_console", "simulator_loop",
+            }
+            if ex_type in _T4_IMMERSIVE_STRICT and not (demo_data and (
+                    demo_data.get("scenario_prompt")
+                    or demo_data.get("counterparty")
+                    or demo_data.get("alert")
+                    or demo_data.get("initial_state")
+                    or demo_data.get("voice_mode"))):
+                # v8.6 (2026-04-24) DEAD-LETTER for T4 immersive, same pattern
+                # as code_exercise above. Was `raise RuntimeError` → whole
+                # course lost. Now persist + flag + continue.
+                _failure_tail = (_last_invariant_reason[0] or "")[-1200:]
+                logging.error(
+                    "DEAD_LETTER %s %r / %r (course=%r) — retry loop exhausted, "
+                    "usable demo_data not produced. quality_flag=needs_author_review.",
+                    ex_type, mod.title, step_outline.title, title,
+                )
+                _needs_review_steps.append({
+                    "module_title": mod.title,
+                    "step_title": step_outline.title,
+                    "exercise_type": ex_type,
+                    "failure_reason": f"{ex_type}_demo_data_missing",
+                    "retry_tail": _failure_tail,
+                })
+                content = (
+                    '<div style="background:#3a1f1f; color:#ffd4d4; '
+                    'border:1px solid #5a2f2f; border-radius:8px; padding:16px; '
+                    'margin-bottom:12px;">'
+                    '<h3 style="margin:0 0 8px 0; color:#ffb4b4;">⚠ This immersive exercise needs author review</h3>'
+                    f'<p style="margin:0 0 6px 0; line-height:1.55;">The Creator '
+                    f'retry loop could not produce usable <code>demo_data</code> '
+                    f'for this <strong>{ex_type}</strong> step '
+                    f'(<em>{step_outline.title}</em>). The step is saved with '
+                    f'the failure trace; regenerate it narrowly or change the '
+                    f'exercise type in the outline.</p>'
+                    '</div>'
+                )
+                # Minimal demo_data so the immersive widget doesn't crash on
+                # render. quality_flag tells the runtime to disable interactions.
+                demo_data = dict(demo_data) if isinstance(demo_data, dict) else {}
+                demo_data["_pending_author_review"] = True
+                validation = dict(validation) if isinstance(validation, dict) else {}
+                validation["quality_flag"] = "needs_author_review"
+                validation["quality_reason"] = f"{ex_type}_demo_data_missing"
+                validation["retry_tail"] = _failure_tail
             elif ex_type == "fill_in_blank" and not (validation and validation.get("blanks")):
                 if not code:
                     code = f"# {step_outline.title}\n# Fill in: ____\n# Context: {step_desc[:150]}"
@@ -7587,6 +11668,102 @@ async def creator_generate(
     session["status"] = "generated"
     session["course_id"] = course_id
 
+    # ──────────────────────────────────────────────────────────────────────
+    # v8.6 (2026-04-24) GATE A — COURSE-LANGUAGE INVARIANT
+    # ──────────────────────────────────────────────────────────────────────
+    # Post-gen structural check per user directive after TS v12 domain-expert
+    # review caught 7/10 code_exercise steps shipping Python in a TS course.
+    # The prompt-level LANGUAGE LOCK is belt; this invariant is braces — if
+    # ANY code_exercise step's `demo_data.language` doesn't match the course's
+    # pinned language, we mark that step `quality_flag=needs_author_review`
+    # and add it to the dead-letter accumulator. The course still ships
+    # (partial-success; other steps are valid), and Creator sees which steps
+    # need regeneration with the correct language.
+    #
+    # Rationale: execution IS ground truth. A Python starter in a TS course
+    # passes its Python tests in a Python Docker runner — the per-step
+    # invariant is language-agnostic and can't catch this class. A COURSE-
+    # LEVEL scan must.
+    _course_lang_pinned = str(course_context.get("language") or "").lower() if isinstance(course_context, dict) else ""
+    if _course_lang_pinned:
+        # Aliases: normalize equivalent language tokens so a `ts` course
+        # accepts both "ts" and "typescript" from the LLM, etc.
+        _lang_aliases = {
+            "ts": {"ts", "typescript"},
+            "typescript": {"ts", "typescript"},
+            "js": {"js", "javascript"},
+            "javascript": {"js", "javascript"},
+            "py": {"py", "python"},
+            "python": {"py", "python"},
+            "go": {"go", "golang"},
+            "golang": {"go", "golang"},
+        }
+        _accepted = _lang_aliases.get(_course_lang_pinned, {_course_lang_pinned})
+        _lang_violations: list[dict] = []
+        from sqlalchemy.orm import selectinload as _selectinload
+        _mod_rows = await db.execute(
+            select(Module).options(_selectinload(Module.steps))
+            .where(Module.course_id == course_id)
+        )
+        for _mod in _mod_rows.scalars().all():
+            for _step in _mod.steps:
+                if (_step.exercise_type or "") != "code_exercise":
+                    continue
+                _dd = _step.demo_data or {}
+                _step_lang = str(_dd.get("language") or "").lower()
+                # Skip steps already flagged (dead-letter from gen-time)
+                _val = _step.validation or {}
+                if _val.get("quality_flag") == "needs_author_review":
+                    continue
+                if _step_lang and _step_lang not in _accepted:
+                    _lang_violations.append({
+                        "module_title": _mod.title,
+                        "step_title": _step.title,
+                        "exercise_type": "code_exercise",
+                        "failure_reason": "course_language_mismatch",
+                        "retry_tail": (
+                            f"Course is pinned to '{_course_lang_pinned}' but this step's "
+                            f"demo_data.language='{_step_lang}'. The grader routed to the "
+                            f"wrong Docker runner; the learner's course title promises "
+                            f"{_course_lang_pinned} but the graded artifact is {_step_lang}."
+                        ),
+                    })
+                    # Mutate the Step row: flag + strip hidden_tests/solution_code
+                    # so the learner-facing grader short-circuits to "pending review"
+                    _new_val = dict(_val)
+                    _new_val["quality_flag"] = "needs_author_review"
+                    _new_val["quality_reason"] = "course_language_mismatch"
+                    _new_val["retry_tail"] = _lang_violations[-1]["retry_tail"]
+                    _new_val.pop("hidden_tests", None)
+                    _new_val.pop("solution_code", None)
+                    _step.validation = _new_val
+                    # Overlay a needs-review banner on content so learners see it
+                    _banner = (
+                        '<div style="background:#3a1f1f; color:#ffd4d4; '
+                        'border:1px solid #5a2f2f; border-radius:8px; padding:16px; '
+                        'margin-bottom:12px;">'
+                        '<h3 style="margin:0 0 8px 0; color:#ffb4b4;">⚠ This exercise needs author review</h3>'
+                        f'<p style="margin:0 0 6px 0; line-height:1.55;">Course-level '
+                        f'language invariant failed: this step was generated in '
+                        f'<code>{_step_lang}</code> but the course is pinned to '
+                        f'<code>{_course_lang_pinned}</code>. Regenerate narrowly '
+                        f'(per-step regenerate button) — the grader has been disabled '
+                        f'until fixed.</p></div>'
+                    )
+                    _step.content = _banner + (_step.content or "")
+        if _lang_violations:
+            _needs_review_steps.extend(_lang_violations)
+            logging.error(
+                "GATE_A course_language_invariant: %d step(s) mismatched course_language=%r. Flagged: %s",
+                len(_lang_violations), _course_lang_pinned,
+                [f"{v['module_title']}/{v['step_title']}" for v in _lang_violations],
+            )
+        else:
+            logging.info(
+                "GATE_A course_language_invariant: PASS — all code_exercise steps match course_language=%r",
+                _course_lang_pinned,
+            )
+
     # Re-fetch the course for the response + flip status to "ready"
     # (concurrency fix 2026-04-21: generated rows are committed per-step with
     # status="generating"; the public learner list filters by status="ready"
@@ -7687,10 +11864,23 @@ async def creator_generate(
         # Never fail the generate call because of the review scheduler
         logger.warning("auto_review schedule failed: %s", _e)
 
+    # v8.6 (2026-04-24) DEAD-LETTER response:
+    # When one or more steps were persisted with quality_flag=needs_author_review,
+    # switch status to "generated_with_review" so the frontend knows to show the
+    # partial-success banner. Course is still in catalog (generation_status=ready)
+    # but the Creator Dashboard UI lists which steps to fix.
+    _status = "generated_with_review" if _needs_review_steps else "generated"
+    if _needs_review_steps:
+        logging.warning(
+            "Course %s persisted with %d needs_author_review step(s): %s",
+            course_id, len(_needs_review_steps),
+            [f"{s['module_title']}/{s['step_title']}" for s in _needs_review_steps],
+        )
     return CreatorGenerateResponse(
         course_id=course_id,
-        status="generated",
+        status=_status,
         course=CourseOut.model_validate(saved_course),
+        needs_review_steps=_needs_review_steps or None,
     )
 
 
@@ -7796,7 +11986,30 @@ async def regenerate_step_endpoint(
             raise HTTPException(404, reason)
         if reason == "llm_disabled_budget_exhausted":
             raise HTTPException(503, "LLM budget exhausted — regen unavailable")
-        raise HTTPException(500, f"Regeneration failed: {reason}")
+        # v8.6 (2026-04-24) — structured failure response. Pre-fix: just
+        # returned `Regeneration failed: {reason}` as a string. Post-fix:
+        # JSON body with failure_class (llm_error | llm_returned_non_dict
+        # | completeness_failed | invariant_failed) so Creator UI can
+        # route on category (e.g. invariant_failed → "fix the logic" vs
+        # llm_error → "infrastructure problem, retry").
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "Regeneration failed",
+                "failure_class": result.get("failure_class", "unknown"),
+                "reason": reason,
+                "last_reason_tail": result.get("last_reason_tail", ""),
+                "attempts_used": result.get("attempts_used"),
+                "hint": (
+                    "Full retry feedback dumps are at /tmp/retry_feedback/ "
+                    "(grouped by session or 'nosession'). If failure_class "
+                    "is 'invariant_failed', the LLM output was valid but "
+                    "failed Docker tests — see the dump for exact stderr. "
+                    "If 'completeness_failed', shape validation rejected — "
+                    "the LLM output is missing required fields."
+                ),
+            },
+        )
     return result
 
 
@@ -8794,7 +13007,13 @@ def _validate_exercise(
         "mcq": _validate_mcq,
         "bug_hunt": _validate_bug_hunt,
         "explain_back": _validate_explain_back,
-        "code_read": _validate_explain_back,  # read-and-explain uses same path
+        # 2026-04-22 v4 fix: code_read used to route to _validate_explain_back
+        # which required a text explanation the template never provided —
+        # learners saw "Score: 0%. Please provide your explanation" despite
+        # the step being read-only reference material. v4 agent caught that
+        # `_validate_code_read` was defined but not wired into the dispatcher.
+        "code_read": _validate_code_read,
+        "terminal_exercise": _validate_terminal_exercise,
         "system_build": _validate_system_build,
     }
     validator = validators.get(exercise_type)
@@ -8848,9 +13067,31 @@ def _validate_code_exercise(validation: dict, response: dict, step: Step) -> dic
             }
         score = round(passed / total, 2) if total else 0.0
         if passed == total and failed == 0:
+            # 2026-04-22 v2 — weak-hidden-tests safeguard. Beginner-agent
+            # walkthrough caught 3 code_exercise steps passing 100% with
+            # trivially-wrong submissions (e.g. `return 0`, `return 1`,
+            # `return sum(nums)/len(nums)` that ignored `k`) because the
+            # Creator only emitted 1-2 hidden_tests — too thin to catch an
+            # obviously-wrong implementation. Per user 2026-04-22 directive
+            # "use template/backend safeguards, avoid Creator prompt churn":
+            # append a visible warning to the learner when test coverage is
+            # below the L6 floor (≥4 tests per CLAUDE.md). Score stays 1.0
+            # (not penalizing the learner for our weak tests) but the
+            # warning nudges them to write their own edge-case tests and
+            # tells admins this step needs more tests.
+            weak_tests_warning = ""
+            if total < 4:
+                weak_tests_warning = (
+                    f"\n\n⚠ Heads up — this exercise has only {total} hidden test"
+                    f"{'s' if total != 1 else ''}. Your code passed what we check, "
+                    f"but we can't guarantee it handles all edge cases. Try thinking "
+                    f"through: empty inputs, single element, very large inputs, "
+                    f"boundary values, duplicates. A real code review would test "
+                    f"more cases than we do."
+                )
             return {
                 "correct": True, "score": 1.0,
-                "feedback": f"All {total} hidden tests passed in Docker ({language}).",
+                "feedback": f"All {total} hidden tests passed in Docker ({language}).{weak_tests_warning}",
             }
         return {
             "correct": False, "score": score,
@@ -9106,13 +13347,79 @@ def _validate_code_exercise(validation: dict, response: dict, step: Step) -> dic
 
 
 def _validate_fill_in_blank(validation: dict, response: dict, step: Step) -> dict:
-    # Support multiple data shapes:
-    # 1. validation.blanks[{index, answer, alternatives[]}]
-    # 2. validation.answers[] (list of strings, or list of lists)
-    # 3. validation.correct_answers[]
-    blanks = validation.get("blanks")
+    # v8.6.2 (2026-04-24) — RUBRIC PATH for zero-code / free-text blanks.
+    # Beginner reviewer 2026-04-24 on AI-Powered Workday M3.S2 filled in
+    # sensible PM answers ("Weekly Ops Status for CEO") for blanks whose
+    # Creator-authored expected answers were different phrasings — exact-
+    # match scored 0% with NO per-blank reveal. For non-coder courses the
+    # fill_in_blank shape is a LABELED FORM, not a language-syntax recall;
+    # exact-match grading is hostile. Fix: when validation.rubric is
+    # present, route to LLM-rubric grader on the concatenated
+    # "Label: learner_answer" pairs. Falls back to exact-match when no
+    # rubric (preserves behavior for code-syntax fill_in_blank steps).
+    rubric_text = (validation or {}).get("rubric") or ""
+    user_answers = response.get("answers", [])
+    blanks = validation.get("blanks") or []
+
+    if isinstance(rubric_text, str) and rubric_text.strip():
+        # Rubric path — zero-code / free-text grading.
+        # Build a readable submission: "1. <hint>: <learner answer>".
+        sorted_blanks = sorted(blanks, key=lambda b: b.get("index", 0))
+        lines = []
+        for i, b in enumerate(sorted_blanks):
+            hint = (b.get("hint") or b.get("label") or f"Blank {i+1}").strip()
+            idx = int(b.get("index", i))
+            ans = user_answers[idx].strip() if idx < len(user_answers) else ""
+            lines.append(f"{i+1}. {hint}: {ans}")
+        # Effort floor: reject if EVERY blank is empty (learner didn't try)
+        non_empty = sum(1 for b in sorted_blanks
+                        if (user_answers[int(b.get('index', 0))].strip()
+                            if int(b.get('index', 0)) < len(user_answers) else '') )
+        if non_empty == 0:
+            return {
+                "correct": False, "score": 0.0,
+                "feedback": "All blanks are empty — please fill each field with your answer, then submit.",
+            }
+        passing = float((validation or {}).get("passing_threshold") or 0.6)
+        submission = "\n".join(lines)
+        try:
+            graded = _llm_rubric_grade(
+                rubric=rubric_text.strip(),
+                submission=submission[:12000],
+                step_title=(step.title if step else "") or "",
+                course_title="",
+            )
+        except Exception as e:
+            logging.warning("fill_in_blank rubric grader failed: %s", e)
+            graded = {"score": None, "feedback": ""}
+        rubric_score = graded.get("score")
+        rubric_feedback = graded.get("feedback") or ""
+        if rubric_score is None:
+            # LLM unavailable — generous accept if all blanks non-empty.
+            if non_empty == len(sorted_blanks):
+                return {
+                    "correct": True, "score": 0.8,
+                    "feedback": (
+                        "All fields filled; LLM grader unavailable so scored "
+                        "generously (0.8). Submit again later for a fresh rubric check."
+                    ),
+                }
+            return {
+                "correct": False, "score": round(non_empty / max(len(sorted_blanks), 1), 2),
+                "feedback": (
+                    f"{non_empty}/{len(sorted_blanks)} fields filled. LLM grader "
+                    "unavailable — fill the remaining blanks and resubmit."
+                ),
+            }
+        score = float(rubric_score)
+        return {
+            "correct": score >= passing,
+            "score": round(score, 2),
+            "feedback": rubric_feedback or f"Scored {score:.2f} against the rubric.",
+        }
+
+    # Legacy exact-match path (code-syntax fill_in_blank, unchanged).
     if blanks:
-        # Sort by index, build correct_answers list
         sorted_blanks = sorted(blanks, key=lambda b: b.get("index", 0))
         correct_answers = []
         for b in sorted_blanks:
@@ -9122,8 +13429,6 @@ def _validate_fill_in_blank(validation: dict, response: dict, step: Step) -> dic
             correct_answers.append(accepted)
     else:
         correct_answers = validation.get("answers", validation.get("correct_answers", []))
-
-    user_answers = response.get("answers", [])
 
     if not correct_answers:
         return {"correct": False, "score": 0.0, "feedback": "No answer key defined for this exercise."}
@@ -9159,21 +13464,42 @@ def _validate_parsons(validation: dict, response: dict, step: Step) -> dict:
         lines = validation.get("lines", [])
         if lines:
             correct_order = list(lines)
-    user_order = response.get("order", [])
+    # 2026-04-22 fix (beginner-agent v8 caught): accept BOTH shapes —
+    # response.order (item IDs like "l0","l1") AND response.order_text
+    # (literal line texts). The course stores correct_order in EITHER
+    # shape depending on how the Creator emitted it. Pick whichever user
+    # ordering perfectly matches correct_order; else fall back to the
+    # higher-scoring LCS between the two shapes.
+    user_order = response.get("order", []) or []
+    user_order_text = response.get("order_text", []) or []
 
     if not correct_order:
         return {"correct": False, "score": 0.0, "feedback": "No correct order defined."}
 
-    if user_order == correct_order:
+    # Perfect-match first: either the ID array or the text array
+    if user_order and user_order == correct_order:
+        return {"correct": True, "score": 1.0, "feedback": "Perfect! All lines in the correct order."}
+    if user_order_text and user_order_text == correct_order:
         return {"correct": True, "score": 1.0, "feedback": "Perfect! All lines in the correct order."}
 
-    # Partial credit: longest common subsequence ratio
+    # Partial: score EACH shape separately, keep the winner. This way if
+    # correct_order is in text-shape and we submitted IDs, the text array
+    # still produces a useful LCS.
+    def _partial(u_order):
+        if not u_order:
+            return 0.0, 0, 0
+        total_ = len(correct_order)
+        lcs_ = _lcs_length(correct_order, u_order)
+        pos_ = sum(1 for a, b in zip(correct_order, u_order) if a == b)
+        score_ = lcs_ / total_ if total_ else 0
+        return score_, lcs_, pos_
+    score_id, lcs_id, pos_id = _partial(user_order)
+    score_text, lcs_text, pos_text = _partial(user_order_text)
+    if score_text > score_id:
+        score, lcs_len, positional_matches = score_text, lcs_text, pos_text
+    else:
+        score, lcs_len, positional_matches = score_id, lcs_id, pos_id
     total = len(correct_order)
-    lcs_len = _lcs_length(correct_order, user_order)
-    score = lcs_len / total if total else 0
-
-    # Count exact position matches
-    positional_matches = sum(1 for a, b in zip(correct_order, user_order) if a == b)
 
     return {
         "correct": False,
@@ -9203,7 +13529,9 @@ def _validate_ordering(validation: dict, response: dict, step: Step) -> dict:
     # (b) response.ordering = [...] — alternate key
     # (c) response.positions = {id: pos} — dict shape (convert to list)
     # (d) response itself = {id: pos} — flat top-level positions (Rajiv's case)
+    # (e) response.order_text = [text1, text2, ...] — text-shape (2026-04-22 fix)
     user_order = response.get("order") or response.get("ordering") or []
+    user_order_text = response.get("order_text") or []
     if not user_order and isinstance(response.get("positions"), dict):
         pos_map = response["positions"]
         user_order = [k for k, _ in sorted(pos_map.items(), key=lambda kv: kv[1])]
@@ -9218,13 +13546,27 @@ def _validate_ordering(validation: dict, response: dict, step: Step) -> dict:
     if not correct_order:
         return {"correct": False, "score": 0.0, "feedback": "No correct order defined."}
 
-    if user_order == correct_order:
+    # Perfect-match against ID array OR text array
+    if user_order and user_order == correct_order:
+        return {"correct": True, "score": 1.0, "feedback": "Perfect ordering!"}
+    if user_order_text and user_order_text == correct_order:
         return {"correct": True, "score": 1.0, "feedback": "Perfect ordering!"}
 
+    # Partial: score each shape, keep the winner
     total = len(correct_order)
-    positional_matches = sum(1 for a, b in zip(correct_order, user_order) if a == b)
-    lcs_len = _lcs_length(correct_order, user_order)
-    score = lcs_len / total if total else 0
+    def _partial(u_order):
+        if not u_order:
+            return 0.0, 0, 0
+        lcs_ = _lcs_length(correct_order, u_order)
+        pos_ = sum(1 for a, b in zip(correct_order, u_order) if a == b)
+        return (lcs_ / total if total else 0), lcs_, pos_
+    score_id, lcs_id, pos_id = _partial(user_order)
+    score_text, lcs_text, pos_text = _partial(user_order_text)
+    if score_text > score_id:
+        score, lcs_len, positional_matches = score_text, lcs_text, pos_text
+        user_order = user_order_text  # used by follow-up item_results builders
+    else:
+        score, lcs_len, positional_matches = score_id, lcs_id, pos_id
 
     return {
         "correct": False,
@@ -9564,6 +13906,331 @@ def _validate_explain_back(validation: dict, response: dict, step: Step) -> dict
     }
 
 
+def _llm_rubric_grade(
+    *,
+    rubric: str,
+    submission: str,
+    step_title: str = "",
+    course_title: str = "",
+    reference_material: str = "",
+    model: str = "claude-sonnet-4-20250514",
+    max_tokens: int = 400,
+) -> dict:
+    """Generic LLM-rubric grader (v8.6.2 2026-04-24). Shared by code_read,
+    system_build (zero-code), terminal_exercise, and any future exercise type
+    whose validation shape includes a free-text `rubric` against a pasted
+    submission.
+
+    Returns: {"score": 0.0-1.0, "feedback": str}. On LLM-unavailable or parse
+    failure, returns {"score": None, "feedback": "grader unavailable"} so the
+    caller can decide on fallback policy (generous accept vs. reject).
+
+    Contract: rubric is the author's plain-English criteria (NOT a JSON schema).
+    The LLM is asked to return structured JSON — we parse it defensively.
+    """
+    out = {"score": None, "feedback": ""}
+    if not (rubric and rubric.strip() and submission and submission.strip()):
+        return out
+    if not _llm_enabled():
+        out["feedback"] = "LLM grader unavailable (budget/mock)."
+        return out
+    try:
+        grader_prompt = (
+            "You are grading a learner's submission against a rubric. "
+            "Return STRICT JSON only — no prose, no markdown fences.\n\n"
+            f"COURSE: {course_title[:120]}\n"
+            f"STEP: {step_title[:120]}\n\n"
+            f"RUBRIC (what a passing submission must demonstrate):\n{rubric.strip()[:2500]}\n\n"
+            + (
+                f"REFERENCE MATERIAL (context for grading):\n{reference_material[:1500]}\n\n"
+                if reference_material else ""
+            )
+            + f"LEARNER'S SUBMISSION (verbatim):\n{submission.strip()[:8000]}\n\n"
+            # v8.6.2 (2026-04-24) — anti-hallucination rules. Beginner reviewer
+            # 2026-04-24 on AI-Powered Workday M1.S3 got back feedback claiming
+            # "didn't identify audience/format/structural requirements" when
+            # their submission EXPLICITLY named all three. The grader had
+            # hallucinated the gap. Cure: force the grader to GROUND EVERY
+            # CLAIM in a verbatim quote from the submission — if the grader
+            # says "you missed X", it must either (a) confirm X is absent by
+            # quoting the segment of the submission that WOULD have said X,
+            # or (b) retract the claim.
+            "\nNON-NEGOTIABLE GRADER RULES — violating these makes the feedback "
+            "useless to the learner:\n"
+            "1. BEFORE claiming the learner missed a criterion, scan their submission "
+            "for words/phrases that hit it. If you find any, the criterion is HIT "
+            "(possibly partially) — describe what they got right.\n"
+            "2. EVERY 'missed' claim in feedback MUST include a quoted phrase (≤ 12 "
+            "words, in double-quotes) from THEIR submission that shows the gap. If "
+            "you cannot produce a quote, drop the claim.\n"
+            "3. If the submission mentions a concept by an ALIAS (e.g. 'target reader' "
+            "for 'audience', 'word count' for 'format constraints', 'raised flags to "
+            "leadership' for 'escalation'), count it as HIT and reflect the exact "
+            "phrasing back — don't require the rubric's vocabulary verbatim.\n"
+            "4. Positive feedback MUST also quote — when praising, cite the phrase "
+            "that earned the praise. This prevents generic 'strong submission' text.\n\n"
+            "Respond with ONLY this JSON shape:\n"
+            '{"score": <0.0 to 1.0>, "feedback": "<3-6 sentences — each claim about '
+            "strength or gap MUST include a verbatim quote (≤12 words, in double-quotes) "
+            'from the learner\'s submission. Don\'t give away the answer — teach, don\'t dictate.">}\n'
+            "Score 1.0 only when ALL criteria are clearly hit; 0.7-0.9 for strong "
+            "but missing one aspect; 0.4-0.6 for partial; 0-0.3 for off-topic / "
+            "too-thin / misunderstood."
+        )
+        from anthropic import Anthropic as _Anthropic
+        client = _Anthropic()
+        msg = client.messages.create(
+            model=model,
+            max_tokens=max_tokens,
+            messages=[{"role": "user", "content": grader_prompt}],
+        )
+        try:
+            if hasattr(msg, "usage"):
+                _record_llm_cost(msg.usage.input_tokens, msg.usage.output_tokens, model)
+        except Exception:
+            pass
+        raw = msg.content[0].text if msg.content else ""
+        import json as _j
+        import re as _re
+        m = _re.search(r"\{[\s\S]*\}", raw or "")
+        if m:
+            data = _j.loads(m.group(0))
+            out["score"] = float(data.get("score", 0.0))
+            out["feedback"] = str(data.get("feedback", ""))
+    except Exception as e:
+        logging.warning("_llm_rubric_grade failed: %s", e)
+        out["score"] = None
+        out["feedback"] = "Grader unavailable — try resubmitting."
+    return out
+
+
+def _validate_code_read(validation: dict, response: dict, step: Step) -> dict:
+    """Grade a code_read step — learner READS code + writes an explanation.
+
+    v8.6.1 (2026-04-24) fix — P0.4 BLOCKER from 2026-04-24 review agents:
+    the ontology (backend/ontology.py:338-348) declares code_read as
+    "Learner reads + explains code. Graded on LLM rubric of explanation
+    quality" with `explanation_rubric` as `required_validation`. But the
+    frontend used to auto-complete on view + hide Submit, and this validator
+    returned 100% always → half of every code_read step's pedagogy was
+    unreachable (2026-04-22 v3 over-correction).
+
+    Fix — polymorphic grading:
+
+      A) Step has `validation.explanation_rubric` → this is an EXPLAIN step.
+         Grade the learner's explanation against the rubric via LLM (same
+         pattern as terminal_exercise / adaptive_roleplay).
+
+      B) Step has NO `validation.explanation_rubric` → this is a pure
+         READ-ONLY reference step. Auto-complete, 100% score. (Preserves
+         the v3 fix for legacy code_read steps that never had a rubric.)
+    """
+    rubric = (validation or {}).get("explanation_rubric") or ""
+    explanation = (response or {}).get("explanation") or (response or {}).get("answer") or ""
+    explanation = str(explanation).strip()
+
+    # Case B — no rubric = pure read-only reference. Auto-complete (legacy).
+    if not rubric:
+        return {
+            "correct": True,
+            "score": 1.0,
+            "feedback": "Reference material reviewed. You can move on.",
+        }
+
+    # Case A — rubric present, need a real explanation.
+    if not explanation:
+        return {
+            "correct": False,
+            "score": 0.0,
+            "feedback": (
+                "Please write a short explanation of what the code does + why, "
+                "then submit. The grader evaluates your explanation against a "
+                "rubric."
+            ),
+        }
+    # Length guardrail — too-short submissions can't satisfy a rubric.
+    if len(explanation) < 30:
+        return {
+            "correct": False,
+            "score": 0.0,
+            "feedback": (
+                "Your explanation is too short to evaluate against the rubric. "
+                "Aim for 3-5 sentences describing what the code does + the key "
+                "design choices."
+            ),
+        }
+
+    # LLM-rubric grader — mirrors _validate_terminal_exercise.
+    rubric_score = None
+    rubric_feedback = ""
+    if _llm_enabled():
+        try:
+            grader_prompt = (
+                "You are grading a learner's explanation of a piece of code. "
+                "Score 0-1 based on whether the explanation demonstrates the "
+                "understanding described in the rubric.\n\n"
+                f"CODE THE LEARNER READ:\n{((step.demo_data or {}).get('code') or step.code or '')[:2500]}\n\n"
+                f"RUBRIC (what the explanation should cover):\n{rubric}\n\n"
+                f"LEARNER'S EXPLANATION:\n{explanation[:2500]}\n\n"
+                "Respond with STRICT JSON: "
+                '{"score": 0.0-1.0, "feedback": "2-4 sentences — point out what\'s '
+                'strong + what\'s missing from the rubric. Name specific concepts '
+                'the learner should revisit if they scored <0.8. Don\'t give away '
+                'the full answer."}. '
+                "Score 1.0 only when the explanation clearly hits EVERY criterion "
+                "in the rubric. Score 0.6-0.8 for partial (hit most, missed one "
+                "aspect). Score 0.3-0.5 when surface-level but misses depth. "
+                "Score 0-0.2 for irrelevant/empty/wrong."
+            )
+            from anthropic import Anthropic
+            client = Anthropic()
+            msg = client.messages.create(
+                model="claude-sonnet-4-20250514",
+                max_tokens=300,
+                messages=[{"role": "user", "content": grader_prompt}],
+            )
+            import json as _j
+            import re as _re
+            raw = msg.content[0].text if msg.content else ""
+            m = _re.search(r"\{[\s\S]*\}", raw)
+            if m:
+                data = _j.loads(m.group(0))
+                rubric_score = float(data.get("score", 0))
+                rubric_feedback = data.get("feedback", "")
+        except Exception as e:
+            logging.warning("code_read rubric grader failed: %s", e)
+            rubric_score = None
+
+    if rubric_score is None:
+        # LLM unavailable (budget exhausted / API down / mock mode).
+        # Fall back to generous accept — length already satisfied the 30-char floor.
+        return {
+            "correct": True,
+            "score": 0.75,
+            "feedback": (
+                "Submission received. (LLM grader unavailable — rough 0.75 "
+                "placeholder; your explanation will be reviewed when LLM is "
+                "reachable again.)"
+            ),
+        }
+
+    # Pass threshold: 0.6 (same policy as adaptive_roleplay debrief).
+    return {
+        "correct": rubric_score >= 0.6,
+        "score": round(rubric_score, 2),
+        "feedback": rubric_feedback or (
+            "Scored " + f"{rubric_score:.2f}" + " against the rubric."
+        ),
+    }
+
+
+def _validate_terminal_exercise(validation: dict, response: dict, step: Step) -> dict:
+    """Grade a terminal_exercise — learner pasted output from running commands
+    on their own machine (Claude Code, kubectl, git, etc. — BYO-key).
+
+    Grading signals:
+      - `validation.must_contain`: list of substrings that MUST appear in the paste
+        (cheap cheese-proofing — catches "I read the docs" submissions)
+      - `validation.rubric`: natural-language rubric text. We send the paste +
+        the rubric to Claude Haiku, ask it to score 0-1 with feedback.
+
+    Score is the weighted blend per ontology (llm_rubric 0.8 + must_contain 0.2)
+    when both present; otherwise whichever is configured gets 100% weight.
+    """
+    # v8.6.1 (2026-04-24) — structured paste slots. If the Creator defined
+    # `demo_data.paste_slots`, the frontend sends `pastes: {slot_id: text}`.
+    # We combine for grading (one prompt to the LLM) but surface per-slot
+    # presence in feedback. The plain `paste` field remains for back-compat.
+    pastes_by_slot = (response or {}).get("pastes") or {}
+    if isinstance(pastes_by_slot, dict) and pastes_by_slot:
+        # Build a labeled combined paste so the LLM sees which slot had what.
+        labeled_chunks = []
+        for slot_id, text in pastes_by_slot.items():
+            t = str(text or "").strip()
+            if t:
+                labeled_chunks.append(f"--- SLOT: {slot_id} ---\n{t}")
+        paste = "\n\n".join(labeled_chunks)
+    else:
+        paste = (response or {}).get("paste") or (response or {}).get("output") or ""
+        paste = str(paste).strip()
+    if not paste:
+        return {
+            "correct": False, "score": 0.0,
+            "feedback": "Please paste your terminal output before submitting.",
+        }
+
+    must_contain = (validation or {}).get("must_contain") or []
+    rubric = (validation or {}).get("rubric") or ""
+
+    mc_score = None
+    mc_feedback = ""
+    if must_contain:
+        missing = [s for s in must_contain if s not in paste]
+        hits = len(must_contain) - len(missing)
+        mc_score = hits / max(1, len(must_contain))
+        if missing:
+            # Don't reveal the full list — hint at count
+            mc_feedback = f"Your output is missing {len(missing)} of {len(must_contain)} expected markers."
+        else:
+            mc_feedback = "All expected markers present."
+
+    rubric_score = None
+    rubric_feedback = ""
+    if rubric and _llm_enabled():
+        try:
+            grader_prompt = (
+                "You are grading a terminal-exercise submission. The learner ran commands "
+                "on their own machine and pasted the output. Score 0-1 based on whether "
+                "the output demonstrates the skill described in the rubric.\n\n"
+                f"RUBRIC:\n{rubric}\n\n"
+                f"LEARNER'S PASTED OUTPUT:\n{paste[:3000]}\n\n"
+                "Respond with STRICT JSON: "
+                '{"score": 0.0-1.0, "feedback": "1-2 sentences of specific, actionable feedback"}. '
+                "Score 1.0 only if the output CLEARLY demonstrates the skill. "
+                "Score 0.5-0.8 for partial: right direction, missing rigor. "
+                "Score 0-0.4 for wrong approach or fabricated output."
+            )
+            from anthropic import Anthropic
+            client = Anthropic()
+            msg = client.messages.create(
+                model="claude-sonnet-4-20250514",  # Haiku 404s today; Sonnet is cheap for 500 tokens
+                max_tokens=200,
+                messages=[{"role": "user", "content": grader_prompt}],
+            )
+            import json as _j
+            import re as _re
+            raw = msg.content[0].text if msg.content else ""
+            m = _re.search(r"\{[\s\S]*\}", raw)
+            if m:
+                data = _j.loads(m.group(0))
+                rubric_score = float(data.get("score", 0))
+                rubric_feedback = data.get("feedback", "")
+        except Exception as e:
+            logger.warning("terminal_exercise rubric grader failed: %s", e)
+            rubric_score = None
+
+    # Blend scores
+    if mc_score is not None and rubric_score is not None:
+        score = round(rubric_score * 0.8 + mc_score * 0.2, 2)
+        feedback = (rubric_feedback + "\n" + mc_feedback).strip()
+    elif rubric_score is not None:
+        score = round(rubric_score, 2)
+        feedback = rubric_feedback
+    elif mc_score is not None:
+        score = round(mc_score, 2)
+        feedback = mc_feedback
+    else:
+        # No grader configured — accept any non-empty paste as complete
+        score = 1.0
+        feedback = "Submission received."
+
+    return {
+        "correct": score >= 0.7,
+        "score": score,
+        "feedback": feedback,
+    }
+
+
 _SSRF_BLOCKED_HOSTNAMES = {
     "localhost", "localhost.localdomain",
     "metadata.google.internal",  # GCP metadata
@@ -9786,6 +14453,42 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
         )
         gha_score = 1.0 if gha_result.get("ok") else 0.0
 
+    # v8.6.2 (2026-04-24) — ZERO-CODE CAPSTONE grader: LLM rubric on pasted markdown.
+    # When the Creator emitted `validation.rubric` (string) AND the learner pasted
+    # a doc into `response.paste_markdown` (or `paste` / `submission` aliases),
+    # grade the doc against the rubric using the same LLM-rubric helper code_read
+    # uses. Primary scoring slot (50%) same as GHA/endpoint_check.
+    rubric_text = (validation or {}).get("rubric") or ""
+    rubric_passing = float((validation or {}).get("passing_threshold") or 0.7)
+    rubric_score: float | None = None
+    rubric_feedback = ""
+    paste = (
+        response.get("paste_markdown")
+        or response.get("paste")
+        or response.get("submission")
+        or response.get("markdown")
+        or ""
+    ).strip()
+    if isinstance(rubric_text, str) and rubric_text.strip() and paste:
+        try:
+            # Reuse the same LLM-rubric primitive code_read + terminal_exercise use.
+            # Returns {score: 0..1, feedback: str}. Falls back gracefully if LLM off.
+            # NB: don't traverse `step.module.course` lazy-loaded relationship —
+            # this validator runs in a non-async context so lazy-load triggers
+            # greenlet_spawn errors. Pass only synchronous attributes.
+            graded = _llm_rubric_grade(
+                rubric=rubric_text.strip(),
+                submission=paste[:12000],  # cap submission to stay in budget
+                step_title=step.title or "Capstone",
+                course_title="",  # intentionally empty; title not needed for grading
+            )
+            rubric_score = float(graded.get("score", 0.0)) if graded.get("score") is not None else None
+            rubric_feedback = str(graded.get("feedback", ""))
+        except Exception as e:
+            logging.warning("system_build rubric grader failed: %s", e)
+            rubric_score = None
+            rubric_feedback = "Rubric grader unavailable — try resubmitting."
+
     total_phases = len(phases_defined)
     total_checklist = len(checklist_defined)
 
@@ -9820,8 +14523,8 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
         probe_result = _probe_system_build_endpoint(endpoint_check, endpoint_url)
         endpoint_score = 1.0 if probe_result.get("matched") else 0.0
 
-    # Scoring — GHA result takes the same 50% slot as endpoint_check.
-    # Priority: gha_workflow_check > endpoint_check > phases/checklist-only.
+    # Scoring — GHA / endpoint / rubric all use the same 50% slot (first-match wins).
+    # Priority: gha_workflow_check > endpoint_check > rubric > phases/checklist-only.
     if gha_score is not None:
         total_score = round(
             (gha_score * 0.5) + (phase_score * 0.3) + (check_score * 0.2),
@@ -9832,8 +14535,57 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
             (endpoint_score * 0.5) + (phase_score * 0.3) + (check_score * 0.2),
             2,
         )
+    elif rubric_score is not None:
+        # v8.6.2 (2026-04-24) — zero-code / rubric-only capstone.
+        # Expert + beginner reviewers 2026-04-24 both flagged that
+        # "Phases 0/4" dragged a 90% rubric + 6/6 checklist down to 65%
+        # because the zero-code capstone UI had no way to check off phases.
+        # Root cause: phases are a PLANNING affordance for the LEARNER, NOT
+        # a separate grade primitive orthogonal to the rubric. When the
+        # submission is LLM-graded against a content rubric, the rubric
+        # already evaluates whether the learner did the Structure / Draft
+        # / Validate / Publish work — requiring redundant checkbox clicks
+        # is punishment, not teaching. Fix: auto-credit phases for
+        # rubric-only capstones (no GHA, no endpoint_check). Phases still
+        # appear in the briefing as guidance; they just don't gate score.
+        effective_phase_score = 1.0
+        total_score = round(
+            (rubric_score * 0.5) + (effective_phase_score * 0.3) + (check_score * 0.2),
+            2,
+        )
     else:
         total_score = round((phase_score * 0.6) + (check_score * 0.4), 2)
+
+    # 2026-04-22 v4 — grade-primitive floor for system_build.
+    # Audit P0 (2026-04-22): `system_build` capstones with neither
+    # gha_workflow_check NOR endpoint_check (NOR state_assertion /
+    # artifact_flag) grade on UI checkbox state alone — learner ticks
+    # phases/checklist and "passes" a deploy capstone without deploying
+    # anything. Ontology gate rejects new generations missing a primitive,
+    # but grandfathered courses (gen'd before the gate) still slip through.
+    #
+    # Belt-and-suspenders at grade time: if NO primitive is configured,
+    # cap the score below 0.9 (the `correct=True` threshold) and prepend
+    # a transparency note so the learner knows there's no actual deliverable
+    # gate. Score stays above 0.5 so existing in-flight learners aren't
+    # nuked — but `correct=True` is withheld until the course is regenerated
+    # with a real primitive.
+    primitive_configured = (
+        isinstance(gha_cfg, dict)
+        or isinstance(endpoint_check, dict)
+        or isinstance((validation or {}).get("state_assertion"), dict)
+        or bool((validation or {}).get("artifact_flag"))
+        or bool(rubric_text and isinstance(rubric_text, str) and rubric_text.strip())  # v8.6.2 zero-code path
+    )
+    if not primitive_configured:
+        total_score = min(total_score, 0.85)
+        feedback_parts.insert(
+            0,
+            "⚠ This capstone has no deliverable check configured (no GHA workflow, "
+            "no endpoint probe, no state assertion, no artifact flag) — your score "
+            "reflects checklist completion only, not a real-world deployment. "
+            "Flag this to your course creator."
+        )
 
     # Feedback
     feedback_parts = []
@@ -9865,6 +14617,16 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
     elif not isinstance(gha_cfg, dict):
         if endpoint_url:
             feedback_parts.append(f"Endpoint submitted: {endpoint_url} (no endpoint_check configured)")
+
+    # v8.6.2 — rubric feedback surfaces transparently.
+    if rubric_score is not None:
+        pct = int(round(rubric_score * 100))
+        feedback_parts.append(f"Doc rubric: {pct}% (threshold {int(rubric_passing*100)}%)")
+        if rubric_feedback:
+            # Cap feedback to avoid overflow; surface 800 chars
+            feedback_parts.append(rubric_feedback[:800])
+    elif isinstance(rubric_text, str) and rubric_text.strip() and not paste:
+        feedback_parts.append("No doc submitted — paste your markdown deliverable into the submit textarea.")
 
     is_correct = total_score >= 0.9
 

@@ -6,7 +6,7 @@
 -->
 <div class="tmpl-project" data-template="project">
   <div class="tmpl-header">
-    <h3 class="tmpl-title" data-slot="title"></h3>
+    <!-- 2026-04-22 v6: removed <h3 data-slot="title"> — duplicate of outer .step-title. -->
     <span class="tmpl-capstone-badge">Capstone</span>
     <div class="tmpl-problem" data-slot="problem_statement"></div>
   </div>
@@ -57,6 +57,31 @@
       <input type="url" class="tmpl-url-input" data-role="deploy-url"
              placeholder="https://your-service.railway.app/healthz" />
     </div>
+  </div>
+
+  <!-- v8.6.2 (2026-04-24) ZERO-CODE / RUBRIC capstone paste widget.
+       For non-coder browser-only courses where the deliverable is markdown
+       (prompt-library docs / workflow maps / audit checklists). Shown when
+       validation.rubric is present. The grader LLM-scores the pasted doc
+       against the rubric. -->
+  <div class="tmpl-paste-widget" data-role="paste-widget" style="display:none">
+    <h4 class="tmpl-section-title">📄 Paste your deliverable</h4>
+    <p class="tmpl-paste-prompt" data-role="paste-prompt"></p>
+    <textarea class="tmpl-paste-textarea" data-role="paste-markdown"
+      rows="14"
+      placeholder="# Your Team Prompt Library
+
+## Template 1: Weekly Status Update
+Goal: ...
+Audience: ...
+Format: ...
+Example input: ...
+Example output: ...
+
+## Template 2: ...
+
+(paste your full markdown doc here)"></textarea>
+    <div class="tmpl-paste-hint">Grader: LLM-rubric score. Aim for &gt;= 70% — iterate and resubmit if needed.</div>
   </div>
 
   <div class="tmpl-actions">

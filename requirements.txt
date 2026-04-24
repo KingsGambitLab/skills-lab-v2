@@ -12,3 +12,4 @@ jsonschema>=4.22
 # Headless browser for post-generation automated QC (backend/auto_review.py).
 # After install, also run: .venv/bin/playwright install chromium
 playwright==1.47.0
+celery==5.6.3

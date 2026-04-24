@@ -21,8 +21,11 @@
   function mount(container, data, handlers) {
     handlers = handlers || {};
     const lang = (data.language || 'python').toLowerCase();
-    // Populate slots
-    container.querySelector('[data-slot="title"]').textContent = data.title || '';
+    // Populate slots. 2026-04-22 v6: title slot removed from template HTML
+    // (outer .step-title renders it once). Guard kept for back-compat if the
+    // HTML gets restored.
+    const _titleEl = container.querySelector('[data-slot="title"]');
+    if (_titleEl) _titleEl.textContent = data.title || '';
     const pbEl = container.querySelector('[data-slot="problem_statement"]');
     if (pbEl) pbEl.innerHTML = data.problem_statement || '';
     container.querySelector('[data-slot="lang-badge"]').textContent = lang;
@@ -48,10 +51,27 @@
     // Editor
     const editor = container.querySelector('[data-role="editor"]');
     editor.value = data.starter_code || '';
+    // 2026-04-22: line-number gutter. Mirrors the textarea's line count and
+    // scroll position. Re-renders on `input`, syncs scroll on `scroll`.
+    const gutter = container.querySelector('[data-role="gutter"]');
+    const renderGutter = () => {
+      if (!gutter) return;
+      const lines = Math.max(1, (editor.value || '').split('\n').length);
+      // Only re-render if line count changed (avoid DOM churn on every keystroke).
+      if (gutter.childElementCount !== lines) {
+        let html = '';
+        for (let i = 1; i <= lines; i++) html += '<div>' + i + '</div>';
+        gutter.innerHTML = html;
+      }
+    };
+    const syncGutterScroll = () => {
+      if (gutter) gutter.scrollTop = editor.scrollTop;
+    };
     // Auto-size
     const autoSize = () => { editor.style.height = 'auto'; editor.style.height = Math.max(320, editor.scrollHeight + 2) + 'px'; };
-    editor.addEventListener('input', autoSize);
-    setTimeout(autoSize, 0);
+    editor.addEventListener('input', () => { autoSize(); renderGutter(); });
+    editor.addEventListener('scroll', syncGutterScroll);
+    setTimeout(() => { autoSize(); renderGutter(); }, 0);
     // Tab -> 4 spaces
     editor.addEventListener('keydown', (e) => {
       if (e.key === 'Tab') {
@@ -59,6 +79,7 @@
         const s = editor.selectionStart, end = editor.selectionEnd;
         editor.value = editor.value.substring(0, s) + '    ' + editor.value.substring(end);
         editor.selectionStart = editor.selectionEnd = s + 4;
+        renderGutter();
       }
     });
 

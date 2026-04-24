@@ -20,7 +20,9 @@
 
   function mount(container, data, handlers) {
     handlers = handlers || {};
-    container.querySelector('[data-slot="title"]').textContent = data.title || '';
+    // 2026-04-22 v6: title slot removed from template HTML. Guarded.
+    const _titleEl = container.querySelector('[data-slot="title"]');
+    if (_titleEl) _titleEl.textContent = data.title || '';
     const pb = container.querySelector('[data-slot="problem_statement"]');
     if (pb) pb.innerHTML = data.problem_statement || '';
 
@@ -108,6 +110,19 @@
       epWidget.style.display = '';
     }
 
+    // v8.6.2 — Paste widget (zero-code rubric capstone).
+    // Shows when validation has `rubric` (free-text LLM rubric) AND no GHA/endpoint
+    // primitive is configured. Paste a markdown doc → grader LLM-scores it.
+    const pasteWidget = container.querySelector('[data-role="paste-widget"]');
+    const pastePromptEl = container.querySelector('[data-role="paste-prompt"]');
+    const hasRubric = !!(data.rubric && String(data.rubric).trim());
+    if (pasteWidget && hasRubric && !ghaCfg && !(data.endpoint_check && data.endpoint_check.url)) {
+      pasteWidget.style.display = '';
+      if (pastePromptEl) {
+        pastePromptEl.textContent = data.paste_prompt || 'Paste your complete deliverable (markdown) below.';
+      }
+    }
+
     // Submit
     container.querySelector('[data-action="submit"]').addEventListener('click', async () => {
       if (!handlers.judgeFn) return;
@@ -119,12 +134,14 @@
       });
       const deployUrlEl = container.querySelector('[data-role="deploy-url"]');
       const runUrlEl = container.querySelector('[data-role="gha-run-url"]');
+      const pasteEl = container.querySelector('[data-role="paste-markdown"]');
       const submission = {
         phases_completed: phasesCompleted,
         checklist: checklistData,
       };
       if (deployUrlEl && deployUrlEl.value.trim()) submission.endpoint_url = deployUrlEl.value.trim();
       if (runUrlEl && runUrlEl.value.trim()) submission.workflow_run_url = runUrlEl.value.trim();
+      if (pasteEl && pasteEl.value.trim()) submission.paste_markdown = pasteEl.value.trim();
       const res = await handlers.judgeFn(submission);
       renderFeedback(container, res);
     });

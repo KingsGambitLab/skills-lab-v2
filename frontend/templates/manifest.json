@@ -1,6 +1,6 @@
 {
-  "version": "1.0.0",
-  "comment": "2026-04-22: frontend view templates — shipped per the 'view ≠ data' separation in CLAUDE.md. Templates are static files; LLM provides only JSON data. CDN-portable by copying this directory.",
+  "version": "1.1.2",
+  "comment": "2026-04-22 v1.1.2: Creator wizard now polls /creator/session/{sid}/status after each phase (start/refine/generate) — the v7.5 celery switch made these endpoints return {task_id, status: pending} immediately, and the wizard was jumping straight to step 2 with zero questions rendered. Also includes v1.1.1 parsons fix.",
   "templates": {
     "drag_drop": {
       "html": "drag_drop.html",
@@ -23,6 +23,14 @@
       "css": "project.css",
       "handles": ["system_build", "github_classroom_capstone", "cluster_state_check"],
       "judge_endpoint": "/api/exercises/validate"
+    },
+    "terminal": {
+      "html": "terminal.html",
+      "js": "terminal.js",
+      "css": "terminal.css",
+      "handles": ["terminal_exercise"],
+      "judge_endpoint": "/api/exercises/validate",
+      "comment": "BYO-execution — learner runs on own machine, pastes output. No key handling on page."
     }
   },
   "data_contract": {

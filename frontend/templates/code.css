@@ -51,15 +51,50 @@
   font-weight: 600;
   text-transform: lowercase;
 }
+/* 2026-04-22: line-number gutter. The gutter div is a fixed-width column
+   on the left; the textarea fills the rest. Both share font-size and
+   line-height so gutter numbers align with textarea lines. */
+.tmpl-code .tmpl-editor-shell {
+  display: flex;
+  align-items: stretch;
+  background: #161b26;
+  /* line-height applied at container so both gutter and textarea inherit;
+     numbers and code lines stay vertically aligned. */
+  font-family: "SF Mono", Monaco, Consolas, monospace;
+  font-size: 0.88rem;
+  line-height: 1.55;
+}
+.tmpl-code .tmpl-editor-gutter {
+  flex: 0 0 auto;
+  min-width: 3ch;
+  padding: 14px 8px 14px 12px;
+  background: #11161f;
+  color: #4a5670;
+  text-align: right;
+  user-select: none;
+  pointer-events: none;
+  overflow: hidden;              /* scroll is mirrored from the textarea */
+  border-right: 1px solid #2a3352;
+  font-variant-numeric: tabular-nums;
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
+}
+.tmpl-code .tmpl-editor-gutter > div {
+  height: 1.55em;                /* match line-height */
+}
 .tmpl-code .tmpl-editor {
+  flex: 1 1 auto;
   width: 100%;
   min-height: 320px;
   background: #161b26;
   color: #e8ecf4;
   border: 0;
   padding: 14px;
-  font-family: "SF Mono", Monaco, Consolas, monospace;
-  font-size: 0.88rem;
+  /* font settings inherited from .tmpl-editor-shell so lines align */
+  font-family: inherit;
+  font-size: inherit;
+  line-height: inherit;
   resize: vertical;
   outline: none;
   tab-size: 4;

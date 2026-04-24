@@ -1,0 +1,86 @@
+<!--
+  terminal template — BYO-execution exercises. Learner runs commands on
+  their own machine (Claude Code, kubectl, git, etc.) and pastes the
+  terminal output back for grading.
+
+  Data: {
+    title, briefing,
+    instructions (markdown allowed),
+    byo_key_notice?,
+    hint?,
+
+    // v8.6.1 (2026-04-24) SWITCHING-UX additions:
+    bootstrap_command?,            // one-line shell command to start the step
+    step_slug?, step_task?,         // rendered inside the bootstrap banner
+    dashboard_deeplink?,            // URL back to this step
+    dependencies?,                  // [{kind, label, why, install_hint}]
+    paste_slots?,                   // [{id, label, hint, placeholder}]  — if omitted, single textarea
+  }
+
+  Grading: LLM rubric + optional must_contain — via judgeFn({paste})
+           OR judgeFn({pastes: {slot_id: text}}) if paste_slots used.
+-->
+<div class="tmpl-terminal" data-template="terminal">
+  <div class="tmpl-header">
+    <p class="tmpl-briefing" data-slot="briefing"></p>
+  </div>
+
+  <!-- v8.6.1 SWITCHING: step-aware bootstrap command (copy-to-clipboard) -->
+  <div class="tmpl-bootstrap" data-role="bootstrap" style="display:none;">
+    <div class="tmpl-bootstrap-header">
+      <span class="tmpl-bootstrap-label">⚡ Start: copy this into your terminal</span>
+      <button type="button" class="tmpl-btn tmpl-btn-ghost tmpl-btn-compact" data-action="copy-bootstrap">Copy</button>
+    </div>
+    <pre class="tmpl-bootstrap-code" data-role="bootstrap-code"></pre>
+    <div class="tmpl-bootstrap-foot">One paste sets up your repo + branch + shell prompt + opens Claude Code.</div>
+  </div>
+
+  <!-- v8.6.1 SWITCHING: dependencies panel (what they need running) -->
+  <div class="tmpl-deps" data-role="deps" style="display:none;">
+    <div class="tmpl-deps-header">You'll need:</div>
+    <ul class="tmpl-deps-list" data-role="deps-list"></ul>
+  </div>
+
+  <!-- BYO-key info panel — NO key handling, EVER.
+       We deliberately do not offer any key input on the page (not even
+       localStorage). The key lives on the learner's machine only. -->
+  <div class="tmpl-byo-info" data-role="byo-info" style="display:none;">
+    <span class="tmpl-byo-icon">🔐</span>
+    <span>
+      <strong>Your key stays on your machine.</strong>
+      Configure Claude Code with <code>claude /login</code> (or set
+      <code>ANTHROPIC_API_KEY</code> in your shell). This page will
+      never ask for your key.
+    </span>
+  </div>
+
+  <!-- Instructions: what to run, rendered as markdown-ish HTML -->
+  <div class="tmpl-instructions" data-slot="instructions"></div>
+
+  <!-- Paste area: either ONE big textarea (legacy) or multiple structured slots -->
+  <div class="tmpl-paste-wrapper" data-role="paste-wrapper">
+    <!-- LEGACY single-textarea: used when paste_slots NOT provided -->
+    <div class="tmpl-paste-block" data-role="paste-single-block">
+      <div class="tmpl-paste-header">
+        <span>Paste your terminal output below</span>
+        <span class="tmpl-paste-count" data-role="paste-count">0 chars</span>
+      </div>
+      <textarea class="tmpl-paste" data-role="paste" spellcheck="false"
+                autocomplete="off" autocorrect="off" autocapitalize="off"
+                placeholder="$ claude --version
+claude-code 1.x.x
+
+... full output goes here ..."></textarea>
+    </div>
+    <!-- STRUCTURED SLOTS: populated by JS when paste_slots provided -->
+    <div data-role="paste-slots-container" style="display:none;"></div>
+  </div>
+
+  <div class="tmpl-actions">
+    <button type="button" class="tmpl-btn tmpl-btn-primary" data-action="submit">Submit</button>
+    <button type="button" class="tmpl-btn tmpl-btn-ghost" data-action="reset">Clear paste</button>
+    <span class="tmpl-hint-trigger" data-action="reveal-hint">💡 Hint</span>
+  </div>
+
+  <div class="tmpl-feedback" data-role="feedback"></div>
+</div>

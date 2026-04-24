@@ -1,0 +1,16 @@
+[package]
+name = "sll-prewarm"
+version = "0.0.0"
+edition = "2021"
+
+# Prewarm set — keep small. Covers ~80% of stable-track Rust teaching:
+#   - serde / serde_json: learners serialize structs
+#   - anyhow / thiserror: error handling chapter
+#   - tokio: async module
+# Intentionally OMITTING: tonic, diesel, sqlx (huge, niche in Rust Basics)
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+anyhow = "1"
+thiserror = "1"
+tokio = { version = "1", features = ["macros", "rt", "time"] }
