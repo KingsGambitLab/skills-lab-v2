@@ -1,5 +1,36 @@
 # Skills Lab v2 — AI LMS Platform
 
+## 🧰 v8.6.2 Phase 2 (2026-04-24 latest) — Post-review platform fixes (8 root-cause fixes shipped as wiring, not per-course regen)
+
+**User directive (verbatim, 2026-04-24):** *"Don't fix any symptom, fix root cause. And don't edit course content directly, regen the step. You can fix wiring on the go."*
+
+The v2 dual-agent review of AI-Powered Workday (beginner PM + VP Product AI Enablement expert) both verdicted SHIP-WITH-FIXES. Of the 8 issues flagged, every one had a generic root cause that would bite future non-coder courses. Fixed at the platform layer; the 3 content-drifted steps get per-step regens to verify the prompt change propagates.
+
+### The 8 root-cause fixes
+
+| # | Symptom (reviewer's report) | Root cause | Fix location |
+|---|---|---|---|
+| 1 | 3 `fill_in_blank` steps used Python syntax (`task_name = ""`, dict literals, f-strings) — violated zero-code promise | Creator prompt's `fill_in_blank` branch had only `is_non_engineering` + engineering branches; no `is_zero_code` branch. Zero-code courses fell through to the engineering branch that asks for Python code. | `backend/main.py` — new `if is_zero_code` branch above non_engineering with LABEL-COLON-BLANK shape + HARD RULE forbidding `=`, `{`, `}`, `[`, `]`, `print()`, `def `, `f"..."` in `code` |
+| 2 | M4 simulator Event Stream rendered events as raw JSON `{"id":"ping_1","t_offset_ms":300000,…}` | `appendSimEvent` fell through to `JSON.stringify(ev)` when `ev.text`/`ev.type` were absent (which is always, for ID-only events) | `frontend/index.html` — new `formatSimEventHuman(ev, tick)` resolves `ev.id` against `_simSession.uiConfig.{interruptions,ceo_email,events}` tables populated by the Creator for inbox-style sims + humanizes tick N to "9:MM AM" when `tick_ms=60000` |
+| 3 | "Begin Simulation" button navigated user to M5 instead of starting sim | `simloopStart(index)` read `getSteps()[index]` which is `state.currentModuleData.steps` — a HASH-CHANGE navigation could shift it before the click fired, so the POST used M5's step_id | `frontend/index.html` — `setupSimulatorLoop` now captures `step.id` + `demo_data.ui_config` + `demo_data.tick_ms` at RENDER time into module-scoped `_simSession`; `simloopStart`/`simloopAction`/`simloopAdvance` use `_simSession.stepId`, NEVER `getSteps()[index]` |
+| 4 | Categorization silently navigated away on WRONG submit; learner couldn't iterate | Separate class of nav-race (stale `state.currentModuleData` during hash-change) — affects every step-handler that dispatches by `index` not `step.id`. Broader audit needed. | **Deferred to production-ready**: every `handler(index)` should capture step.id at render time like `_simSession` does. Tracked as "nav-router audit." |
+| 5 | M1.S3 rubric feedback UI stale on re-submit (showed attempt-1 20% even when attempt-2 backend returned 0%) + button disabled after FAIL instead of after PASS | Two bugs in one block: (a) `result.innerHTML` not cleared before fetch, so if the learner clicks again quickly the stale panel persists; (b) `btn.disabled = !isCorrect` disabled on MISS (inverted — comment said "leave disabled on pass" but code did the opposite) | `frontend/index.html` — clear `result.innerHTML = ''` before fetch; `btn.disabled = isCorrect` (disable ONLY when they pass — locks in the win; keeps enabled on miss so they iterate) |
+| 6 | LLM rubric grader HALLUCINATED — claimed learner "didn't identify audience/format" when the submission explicitly named all three | Grader prompt didn't require grounding claims in verbatim quotes from the submission; LLM freely invented "missing" criteria | `backend/main.py` — `_llm_rubric_grade` prompt now has 4 non-negotiable rules: (a) before claiming missed, scan for alias words; (b) every "missed" claim MUST include a quoted phrase ≤12 words from the submission; (c) accept aliases (target reader = audience, word count = format); (d) positive feedback must also quote |
+| 7 | M5.S5 capstone "Phases 0/4" dragged 90% rubric + 6/6 checklist down to 65% composite — no UI to check phases | Phases treated as separate grade primitive orthogonal to the rubric. For rubric-only (zero-code) capstones, the rubric ALREADY evaluates whether the learner did the work — requiring redundant clicks is punishment | `backend/main.py` `_validate_system_build` — when scoring path is `rubric_score is not None`, `effective_phase_score = 1.0` (auto-credit). Phases still render in the briefing as guidance; just don't gate score |
+| 8 | M3.S2 fill_in_blank secretly EXACT-MATCHED sensible PM answers at 0% with no per-item reveal | `_validate_fill_in_blank` only had exact-match path; non-coder worksheets need rubric-based grading on free-text | `backend/main.py` `_validate_fill_in_blank` — new RUBRIC PATH: when `validation.rubric` is present, build concatenated "Label: learner_answer" submission + call `_llm_rubric_grade` + respect `passing_threshold` (default 0.6). Legacy exact-match preserved for code-syntax blanks. Creator prompt now emits `validation.rubric` for zero-code `fill_in_blank` |
+
+### Per-step regens after the platform fixes
+
+After the wiring fixes landed, the **3 content-drifted steps** (AI-Powered Workday 85092/85097/85107) were regenerated via `POST /api/courses/{id}/steps/{step_id}/regenerate` so they inherit the new `is_zero_code` fill_in_blank prompt. This is the canonical pattern per CLAUDE.md §"Do Not Patch Broken Generated Courses": fix Creator → regen → verify fix propagates. **NO direct DB edits to course content.**
+
+### Rule: nav-router state-bleed (deferred — queue for production-ready)
+
+Every frontend handler that dispatches by `index` (e.g. `checkCategorization(index)`, `submitSystemBuild(index)`, `simloopStart(index)`) is vulnerable to a hash-change race: `state.currentModuleData` can shift between render + click, so `getSteps()[index]` can return a step from the WRONG module. The pattern that fixes it (used in `_simSession`): capture `step.id` + needed `demo_data` INTO A MODULE-SCOPED OBJECT at render time; handlers read from that object, NEVER from `state.currentModuleData` after the first render.
+
+Queue as a platform-wide audit: `setupCategorization`, `setupSystemBuild`, `setupAdaptiveRoleplay`, `setupIncidentConsole`, `setupTerminalExercise` — all need the same treatment as `setupSimulatorLoop`.
+
+---
+
 ## 🧰 v8.6.2 (2026-04-24 late-late) — Zero-code / non-coder courses as first-class citizens
 
 **User directive (paraphrased):** *"If this works, create the non-tech course, in similar hands-on style leading to real skills learning."*
