@@ -1703,7 +1703,9 @@ def _build_item_results(exercise_type: str, validation: dict, response: dict) ->
             })
     elif et == "scenario_branch":
         # Scenario branch stores options on each step
-        steps = validation.get("steps") or []
+        # Bug fix 2026-04-25: fall through from validation to demo_data;
+        # Creator emits steps[] under demo_data, not validation.
+        steps = validation.get("steps") or (step.demo_data or {}).get("steps") or []
         resp = response or {}
         # Accept 3 shapes (parity with validator) — learner review 2026-04-20 found
         # the frontend sends `choices: {0:1, 1:2}` (dict) but enrichment only read
@@ -13686,6 +13688,11 @@ def _validate_exercise(
         "code_read": _validate_code_read,
         "terminal_exercise": _validate_terminal_exercise,
         "system_build": _validate_system_build,
+        # Bug fix 2026-04-25 (AIE user-walk M4.S4): github_classroom_capstone
+        # was unmapped → "Unknown exercise type, score 0" for every learner.
+        # The shape (gha_workflow_check + rubric + must_contain) matches
+        # system_build's deploy-graded capstone path. Alias to that validator.
+        "github_classroom_capstone": _validate_system_build,
     }
     validator = validators.get(exercise_type)
     if not validator:
@@ -14415,8 +14422,17 @@ def _validate_scenario_branch(validation: dict, response: dict, step: Step) -> d
     # Derive correct_choices from demo_data.steps[i].options[j].correct
     # Data shape: [{question, options: [{label, correct}]}, ...]
     # Correct answer for step i = index j of the option where `correct: True`
+    #
+    # Bug fix 2026-04-25 (AIE user-walk M3.S2 + M6.S4 scored 0): scenario_branch
+    # answer keys live in `step.demo_data.steps[].options[].correct`, NOT in
+    # `validation.steps`. The dispatcher passes only `validation` so the
+    # validator was reading an empty list and falling through to "No scenario
+    # answer key defined" — score 0. Fall through to step.demo_data when the
+    # validation block has no steps array (the typical Creator output shape).
     correct_choices: dict[str, int] = {}
     steps_arr = validation.get("steps", [])
+    if not (isinstance(steps_arr, list) and steps_arr):
+        steps_arr = (step.demo_data or {}).get("steps", []) if step else []
     if isinstance(steps_arr, list) and steps_arr:
         for i, st in enumerate(steps_arr):
             if not isinstance(st, dict):
