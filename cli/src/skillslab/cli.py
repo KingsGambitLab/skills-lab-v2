@@ -273,6 +273,11 @@ def start(slug: str):
                 "step_id": s.get("id"),
                 "title": s.get("title", ""),
                 "exercise_type": s.get("exercise_type") or "concept",
+                # Phase 3 (2026-04-25) — surface-aware split. Captured at
+                # `start` time so status/spec/check can dispatch by surface
+                # without refetching the step. NULL → 'web' default (legacy
+                # course pre-backfill).
+                "learner_surface": s.get("learner_surface") or "web",
                 "filename": p.name,
             })
 
@@ -306,6 +311,44 @@ def _load_cursor(slug: str) -> tuple[dict, int, dict]:
     return meta, cur, steps[cur] if steps else {}
 
 
+def _step_surface(step: dict) -> str:
+    """Return the step's learner_surface — defaults to 'web' if missing
+    (legacy course pre-backfill OR a cached meta.json from before Phase 3
+    shipped). 'web' is the safe default — sends the learner to the dashboard
+    rather than to a CLI flow that won't grade their work."""
+    return (step.get("learner_surface") or "web").lower()
+
+
+def _browser_url(course_id: str, step: dict) -> str:
+    """Build the dashboard deeplink for a step. The web frontend's hash
+    router accepts `#<courseId>` and the active step is restored from the
+    last visited cursor — for a more precise link we'd want a step-id-based
+    deep route, but that lives in a separate router change."""
+    base = state.api_url().rstrip("/")
+    return f"{base}/#{course_id}"
+
+
+def _print_web_pointer(step: dict, course_id: str, action_verb: str = "see") -> None:
+    """Render the cross-surface pointer panel for a `web` step. The CLI
+    can't render or grade browser widgets — print a clean copy-paste URL +
+    instructions. Per Opus's headless-context note, we do NOT call
+    webbrowser.open (silently fails in Codespaces / SSH / Docker)."""
+    url = _browser_url(course_id, step)
+    label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}"
+    console.print()
+    console.print(Panel(
+        f"This step is a [bold]browser-native widget[/bold] "
+        f"([yellow]{step.get('exercise_type','?')}[/yellow]) — "
+        f"the CLI can't {action_verb} it from the terminal.\n\n"
+        f"Open in your browser:\n"
+        f"  [bold cyan]{url}[/bold cyan]\n\n"
+        f"Navigate to [bold]{label} — {step.get('title','')[:60]}[/bold] in the dashboard.\n"
+        f"When you finish, run [bold]skillslab progress[/bold] to refresh, "
+        f"then [bold]skillslab next[/bold] to advance to the next terminal step.",
+        title=f"WEB step  ·  {label}", border_style="magenta", box=box.ROUNDED,
+    ))
+
+
 @cli.command()
 @click.option("--course", default=None, help="Course slug (defaults to most-recent)")
 @click.pass_context
@@ -314,22 +357,47 @@ def status(ctx, course):
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
     total = len(meta.get("steps", []))
+    # Surface-aware progress summary: count terminal vs web steps so the
+    # learner knows how many CLI-vs-browser hops the course has.
+    surfaces = [_step_surface(s) for s in meta.get("steps", [])]
+    n_terminal = surfaces.count("terminal")
+    n_web = surfaces.count("web")
+    surface_breakdown = ""
+    if n_terminal and n_web:
+        surface_breakdown = f"\nsurfaces: [bold]{n_terminal}[/bold] terminal · [bold]{n_web}[/bold] web"
+    # Cross-surface staleness signal — has the browser advanced beyond the
+    # CLI's view since the last `skillslab progress` sync? Compare server's
+    # last_activity_at (set by `progress` command) against meta's local
+    # `last_active_at` (set by `next` / `goto` / passing `check`).
+    stale_banner = ""
+    server_la = meta.get("server_last_activity_at") or ""
+    cli_la = meta.get("last_active_at") or ""
+    if server_la and cli_la and server_la > cli_la:
+        stale_banner = (
+            f"\n[yellow]⚠ Server activity at {server_la} is newer than the CLI's "
+            f"({cli_la}) — run [bold]skillslab progress[/bold] to refresh.[/yellow]"
+        )
     console.print(Panel(
         f"[bold]{meta.get('course_title','')}[/bold]\n"
         f"slug: [cyan]{slug}[/cyan]    course_id: [dim]{meta.get('course_id','')}[/dim]\n"
-        f"cursor: step [bold]{cur + 1}[/bold] of {total}",
+        f"cursor: step [bold]{cur + 1}[/bold] of {total}{surface_breakdown}{stale_banner}",
         border_style="cyan", box=box.ROUNDED,
     ))
     if step:
         m_pos = step.get("module_pos", 0)
         s_pos = step.get("step_pos", 0)
         label = f"M{m_pos - 1}.S{s_pos}"
+        surface = _step_surface(step)
         console.print(f"\n▸ [bold cyan]{label}[/bold cyan] — {step.get('title','')}")
-        console.print(f"  type: [yellow]{step.get('exercise_type')}[/yellow]")
+        console.print(f"  type: [yellow]{step.get('exercise_type')}[/yellow]    "
+                      f"surface: [{'magenta' if surface == 'web' else 'green'}]{surface.upper()}[/]")
         console.print(f"  file: [dim]{state.course_dir(slug) / 'steps' / step.get('filename','')}[/dim]")
-        console.print()
-        console.print("[dim]skillslab spec     # cat the briefing[/dim]")
-        console.print("[dim]skillslab check    # grade your work + advance on pass[/dim]")
+        if surface == "web":
+            _print_web_pointer(step, meta.get("course_id", ""), action_verb="render")
+        else:
+            console.print()
+            console.print("[dim]skillslab spec     # cat the briefing[/dim]")
+            console.print("[dim]skillslab check    # grade your work + advance on pass[/dim]")
 
 
 @cli.command()
@@ -337,24 +405,65 @@ def status(ctx, course):
 @click.option("--no-pager", is_flag=True, help="Print as raw markdown (don't rich-render)")
 @click.pass_context
 def spec(ctx, course, no_pager):
-    """Print the current step's briefing (markdown)."""
+    """Print the current step's briefing (markdown).
+
+    For browser-native steps (categorization / drag-drop / simulators), the
+    full briefing is rendered in the dashboard's widget — the CLI prints a
+    short summary + the dashboard URL.
+    """
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
+    surface = _step_surface(step)
     p = state.course_dir(slug) / "steps" / step.get("filename", "")
     if not p.exists():
         console.print(f"[red]Step file missing: {p}[/red]")
         sys.exit(2)
     md = p.read_text()
+
+    if surface == "web":
+        # Print the YAML front-matter + first heading + first paragraph
+        # of the briefing only, then the browser pointer. The full
+        # interactive widget content lives on the web surface — there's
+        # no value in dumping the whole markdown here.
+        head_lines = []
+        in_fm = False
+        body_started = False
+        body_paragraphs = 0
+        for line in md.splitlines():
+            if line.startswith("---") and not in_fm:
+                in_fm = True
+                continue
+            if line.startswith("---") and in_fm:
+                in_fm = False
+                continue
+            if in_fm:
+                continue
+            head_lines.append(line)
+            if line.strip() and not line.startswith("#") and not line.startswith("_"):
+                body_started = True
+            if body_started and line.strip() == "":
+                body_paragraphs += 1
+                if body_paragraphs >= 2:
+                    break
+        summary = "\n".join(head_lines).strip()
+        if no_pager:
+            click.echo(summary)
+        else:
+            console.print(Markdown(summary))
+        _print_web_pointer(step, meta.get("course_id", ""), action_verb="render")
+        return
+
+    # Terminal step: render full briefing
     if no_pager:
         click.echo(md)
     else:
         console.print(Markdown(md))
 
 
-@cli.command()
+@cli.command(name="next")
 @click.option("--course", default=None)
 @click.pass_context
-def next(ctx, course):
+def next_cmd(ctx, course):
     """Advance the cursor to the next step (does NOT auto-check)."""
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta = state.read_meta(slug)
@@ -373,10 +482,10 @@ def next(ctx, course):
     console.print("[dim]skillslab spec[/dim]")
 
 
-@cli.command()
+@cli.command(name="prev")
 @click.option("--course", default=None)
 @click.pass_context
-def prev(ctx, course):
+def prev_cmd(ctx, course):
     """Move the cursor back one step."""
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta = state.read_meta(slug)
@@ -440,6 +549,17 @@ def check(ctx, course, paste, cwd, verbose):
     p = cdir / "steps" / step.get("filename", "")
     if not p.exists():
         console.print(f"[red]Step file missing: {p}[/red]"); sys.exit(2)
+
+    # Surface gate: web-native steps grade in the browser; CLI can't
+    # validate drag-drop / simulator submissions. Print the dashboard
+    # pointer + bail (don't auto-mark, don't advance — let the learner
+    # finish in browser, then `skillslab progress` syncs the result).
+    if _step_surface(step) == "web":
+        _print_web_pointer(step, meta.get("course_id", ""), action_verb="grade")
+        console.print("\n[dim]After completing in the browser, run "
+                      "[bold]skillslab progress[/bold] to sync, then "
+                      "[bold]skillslab next[/bold] to advance.[/dim]")
+        return
 
     # Pull the latest validation spec for this step
     cid = meta.get("course_id")
@@ -524,10 +644,10 @@ def check(ctx, course, paste, cwd, verbose):
                           "+ grader response[/dim]")
 
 
-@cli.command()
+@cli.command(name="sync")
 @click.option("--course", default=None)
 @click.pass_context
-def progress(ctx, course):
+def sync_cmd(ctx, course):
     """Sync progress from the LMS (in case you completed steps elsewhere)."""
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta = state.read_meta(slug)
@@ -539,8 +659,15 @@ def progress(ctx, course):
         console.print("[yellow]Not enrolled in this course on the server.[/yellow]")
         return
     state.write_progress(slug, mine)
+    # Phase 3 (2026-04-25) — record server's last activity into meta so
+    # status/spec can surface a "browser advanced beyond your CLI" banner.
+    if mine.get("last_activity_at"):
+        meta["server_last_activity_at"] = mine["last_activity_at"]
+        state.write_meta(slug, meta)
     pct = mine.get("progress_percent") or 0
     console.print(f"[green]✓ Synced[/green] — {pct}% complete on the server")
+    if mine.get("last_activity_at"):
+        console.print(f"  last activity (any surface): [dim]{mine['last_activity_at']}[/dim]")
 
 
 @cli.command()

@@ -379,6 +379,18 @@ async def enroll(course_id: str, request: Request, db: AsyncSession = Depends(ge
 
 @router.get("/my-courses")
 async def my_courses(request: Request, db: AsyncSession = Depends(get_db)):
+    """List the learner's enrolled courses with progress + last-activity
+    timestamps.
+
+    `last_activity_at` is MAX(UserProgress.completed_at) for this user/course
+    — used by the surface-aware-split (Phase 3 v8.7) so the CLI can detect
+    when the browser has advanced state since the CLI's last sync. Compared
+    against meta.json's `last_active_at`; mismatch = "browser advanced;
+    run `skillslab progress`".
+    """
+    from .database import UserProgress, Module, Step
+    from sqlalchemy import func
+
     user = await require_user(request)
     enrolled = (await db.execute(
         select(Enrollment).where(Enrollment.user_id == user.id)
@@ -388,12 +400,24 @@ async def my_courses(request: Request, db: AsyncSession = Depends(get_db)):
         c = (await db.execute(select(Course).where(Course.id == e.course_id))).scalar_one_or_none()
         if c is None or c.archived_at is not None:
             continue
+        # Compute last_activity_at = max completed_at across this user's
+        # progress on any step in this course. SQLite needs the join chain
+        # course → modules → steps → user_progress.
+        last_activity_q = (
+            select(func.max(UserProgress.completed_at))
+            .join(Step, Step.id == UserProgress.step_id)
+            .join(Module, Module.id == Step.module_id)
+            .where(Module.course_id == c.id)
+            .where(UserProgress.user_id == str(user.id))
+        )
+        last_activity = (await db.execute(last_activity_q)).scalar()
         out.append({
             "course_id": c.id,
             "title": c.title,
             "progress_percent": e.progress_percent,
             "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
             "completed_at": e.completed_at.isoformat() if e.completed_at else None,
+            "last_activity_at": last_activity.isoformat() if last_activity else None,
         })
     return {"courses": out}
 

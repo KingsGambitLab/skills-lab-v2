@@ -4325,8 +4325,101 @@ function createTemplateHandlers(step, index) {
 }
 
 
+// Phase 3 (2026-04-25) — surface-aware split. Render a pointer panel for
+// terminal-native steps so the browser doesn't try to half-baked a CLI
+// experience. Maps each course's slug to the per-course wrapper command
+// (kimi-course / aie-course / jspring-course) so learners get the right
+// invocation. Falls back to plain `skillslab` if course isn't recognized.
+function _surfaceWrapperForCourse(courseTitle) {
+  const t = (courseTitle || '').toLowerCase();
+  if (t.includes('kimi') || t.includes('aider')) return 'kimi-course';
+  if (t.includes('claude code') || t.includes('ai-augmented engineering')) return 'aie-course';
+  if (t.includes('spring boot') || t.includes('java +')) return 'jspring-course';
+  return 'skillslab';
+}
+
+function renderTerminalNativePanel(rawStep, index) {
+  const title = esc(rawStep.title || `Step ${index + 1}`);
+  const exType = esc(rawStep.exercise_type || 'terminal_exercise');
+  const courseTitle = (state.currentCourse && state.currentCourse.title) || '';
+  const wrapper = _surfaceWrapperForCourse(courseTitle);
+  // Try to derive the M.S label from any context we have. The dashboard
+  // doesn't naturally expose module/step position to renderStep; we'll
+  // best-effort it from state.currentModuleData.
+  let label = '';
+  try {
+    const modIdx = (state.currentModuleData && typeof state.currentModuleData.position === 'number')
+      ? state.currentModuleData.position - 1 : 0;
+    label = `M${modIdx}.S${index}`;
+  } catch (e) { label = ''; }
+
+  return `
+    <div class="step-content">
+      <div class="step-header">
+        <div class="step-banner" style="background:#0f3460; color:#a3d8ff; padding:6px 12px; border-radius:6px; display:inline-block; font-size:13px; font-weight:600;">
+          🖥  TERMINAL-NATIVE STEP
+        </div>
+        <div class="step-title" style="margin-top:14px;">${title}</div>
+      </div>
+
+      <div style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:20px; color:#e8ecf4;">
+        <p style="margin:0 0 14px 0; line-height:1.6;">
+          This step is meant to be done in <strong>your terminal</strong>, not the browser.
+          The skillslab CLI gives you the briefing, runs your acceptance command (pytest /
+          mvn / git diff), and grades the result — all in one surface, with
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">claude</code> /
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">aider</code> /
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">mvn</code>
+          where you already work.
+        </p>
+
+        <div style="margin-top:18px;">
+          <div style="font-size:12px; color:#8892a8; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">
+            ① Open your terminal
+          </div>
+          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8;"># first time only — build the toolchain image</span>
+docker compose run --rm ${esc(wrapper === 'skillslab' ? 'skillslab' : 'skillslab')}</pre>
+        </div>
+
+        <div style="margin-top:18px;">
+          <div style="font-size:12px; color:#8892a8; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">
+            ② Jump to this step
+          </div>
+          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;">${esc(wrapper)} login                    <span style="color:#8892a8"># first run only</span>
+${esc(wrapper)} start                    <span style="color:#8892a8"># downloads every step as markdown</span>
+${esc(wrapper)} ${label ? `goto ${label}` : 'status'}
+${esc(wrapper)} spec                     <span style="color:#8892a8"># read the briefing in your editor</span></pre>
+        </div>
+
+        <div style="margin-top:18px;">
+          <div style="font-size:12px; color:#8892a8; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">
+            ③ Do the work + grade
+          </div>
+          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8"># edit code in your editor, run tests in terminal</span>
+${esc(wrapper)} check                    <span style="color:#8892a8"># grades + advances on pass</span></pre>
+        </div>
+
+        <div style="margin-top:20px; padding-top:16px; border-top:1px solid #2a3352; font-size:13px; color:#8892a8;">
+          When you finish + run <code style="color:#a3d8ff;">${esc(wrapper)} check</code>, this page updates automatically.
+          Don't have skillslab? See <a href="https://github.com/KingsGambitLab/skills-lab-v2/blob/main/cli/README.md" target="_blank" style="color:#4a7cff;">cli/README.md</a> for setup.
+          <br/><br/>
+          <span style="color:#8892a8;">step type:</span> <code>${exType}</code>
+        </div>
+      </div>
+    </div>
+  `;
+}
+
+
 function renderStep(rawStep, index) {
   const container = document.getElementById('contentScroll');
+  // Phase 3 surface gate (2026-04-25). Terminal-native steps render the
+  // CLI-pointer panel and skip the exercise dispatch entirely. Legacy
+  // steps without the field (NULL → undefined) stay on the existing path.
+  if (rawStep && rawStep.learner_surface === 'terminal') {
+    container.innerHTML = renderTerminalNativePanel(rawStep, index);
+    return;
+  }
   // Merge demo_data and validation into step so renderers can access fields directly.
   // Explicitly preserve expertise-variant content fields on the merged step so
   // adaptive renderers can pick the right variant.
