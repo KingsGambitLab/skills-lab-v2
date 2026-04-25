@@ -12682,6 +12682,43 @@ async def regenerate_module_endpoint(
     return result
 
 
+@app.patch("/api/admin/courses/{course_id}/steps/{step_id}/outline")
+async def patch_step_outline_admin_endpoint(
+    course_id: str,
+    step_id: int,
+    body: dict,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """ADMIN-ONLY outline-shape patch (v8.7 2026-04-25). Allows changing
+    title + exercise_type — fields the general PATCH safelist locks.
+
+    Use case: F2 violation cleanup where the right fix is "this step is a
+    different exercise_type", not "regenerate content of the same type".
+    Burning a full module regen for a single-step shape flip is wasteful.
+
+    Body: {"title": "...", "exercise_type": "..."} (either field optional;
+    at least one required). Audit-logged to
+    /tmp/skillslab_admin_audit/outline_patches.jsonl with before/after.
+    """
+    user = await _auth.require_role("admin")(request)
+    if not isinstance(body, dict) or not body:
+        raise HTTPException(400, "Body must be a non-empty JSON object with title and/or exercise_type")
+    result = await _per_step.patch_step_outline_admin(
+        course_id=course_id, step_id=step_id, updates=body,
+        db=db, Course=Course, Module=Module, Step=Step,
+        actor_email=getattr(user, "email", "?"),
+    )
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        if reason in ("step_not_found", "step_not_in_course"):
+            raise HTTPException(404, reason)
+        if reason == "no_valid_fields_in_updates":
+            raise HTTPException(400, f"No valid outline fields. Rejected: {result.get('rejected', [])}")
+        raise HTTPException(500, f"Admin outline patch failed: {reason}")
+    return result
+
+
 @app.patch("/api/admin/courses/{course_id}/steps/{step_id}/title")
 async def patch_step_title_admin_endpoint(
     course_id: str,
@@ -12702,7 +12739,7 @@ async def patch_step_title_admin_endpoint(
     without burning LLM regen budget. NOT for outline restructuring —
     use module regen for that.
     """
-    user = await require_role("admin")(request)
+    user = await _auth.require_role("admin")(request)
     if not isinstance(body, dict) or "title" not in body:
         raise HTTPException(400, "Body must be {\"title\": \"<new title>\"}")
     result = await _per_step.patch_step_title_admin(

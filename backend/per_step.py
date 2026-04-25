@@ -900,6 +900,104 @@ async def patch_step_fields(
     }
 
 
+async def patch_step_outline_admin(
+    *,
+    course_id: str,
+    step_id: int,
+    updates: dict[str, Any],
+    db: AsyncSession,
+    Course: Any,
+    Module: Any,
+    Step: Any,
+    actor_email: str = "?",
+) -> dict[str, Any]:
+    """ADMIN-ONLY outline-shape patch — allows changing fields the regular
+    PATCH safelist locks (title, exercise_type) for narrow drift cleanup
+    that doesn't warrant a full module regen.
+
+    Use case: F2 violation cleanup (M2.S3 was code_exercise for a CLAUDE.md
+    deliverable; flip exercise_type to terminal_exercise + drop the F2-
+    violating Python scaffolding). Module regen would burn more LLM budget
+    for a single-step shape fix the schema's F2 invariant already names.
+
+    Audit-logged. Buddy-Opus #1 endorsed the admin-route pattern as the
+    right shape vs widening the general safelist.
+
+    Allowed fields: title (length-capped), exercise_type (must be in the
+    valid-types list).
+    """
+    OUTLINE_ALLOWED = {"title", "exercise_type"}
+    VALID_EXERCISE_TYPES = {
+        "concept", "code_read", "code_exercise", "fill_in_blank", "parsons",
+        "ordering", "categorization", "scenario_branch", "sjt", "code_review",
+        "mcq", "system_build", "adaptive_roleplay", "incident_console",
+        "simulator_loop", "voice_mock_interview", "terminal_exercise",
+        "github_classroom_capstone", "document_authoring",
+    }
+    applied: dict[str, Any] = {}
+    rejected: list[str] = []
+
+    step_res = await db.execute(select(Step).where(Step.id == step_id))
+    step_row = step_res.scalars().first()
+    if not step_row:
+        return {"ok": False, "reason": "step_not_found"}
+    mod_res = await db.execute(select(Module).where(Module.id == step_row.module_id))
+    mod_row = mod_res.scalars().first()
+    if not mod_row or mod_row.course_id != course_id:
+        return {"ok": False, "reason": "step_not_in_course"}
+
+    before_snapshot = {"title": step_row.title, "exercise_type": step_row.exercise_type}
+
+    if "title" in updates:
+        nt = (updates["title"] or "").strip()
+        if not nt or len(nt) > 300:
+            rejected.append("title (empty or too long)")
+        else:
+            step_row.title = nt
+            applied["title"] = nt
+
+    if "exercise_type" in updates:
+        et = (updates["exercise_type"] or "").strip().lower()
+        if et and et not in VALID_EXERCISE_TYPES:
+            rejected.append(f"exercise_type ({et!r} not in valid set)")
+        else:
+            step_row.exercise_type = et if et else None
+            applied["exercise_type"] = et
+
+    for k in updates:
+        if k not in OUTLINE_ALLOWED:
+            rejected.append(f"{k} (not in admin-outline allowlist)")
+
+    if not applied:
+        return {"ok": False, "reason": "no_valid_fields_in_updates", "rejected": rejected}
+
+    await db.commit()
+    await db.refresh(step_row)
+
+    try:
+        import json as _json, time as _time
+        from pathlib import Path as _Path
+        log_dir = _Path("/tmp/skillslab_admin_audit")
+        log_dir.mkdir(exist_ok=True)
+        with open(log_dir / "outline_patches.jsonl", "a") as fh:
+            fh.write(_json.dumps({
+                "ts": _time.time(),
+                "actor": actor_email,
+                "course_id": course_id, "step_id": step_id,
+                "before": before_snapshot, "applied": applied,
+                "rejected": rejected,
+            }) + "\n")
+    except Exception:
+        pass
+
+    return {
+        "ok": True, "applied": applied, "rejected": rejected,
+        "step": {"id": step_row.id, "title": step_row.title,
+                 "exercise_type": step_row.exercise_type,
+                 "module_id": step_row.module_id, "position": step_row.position},
+    }
+
+
 async def patch_step_title_admin(
     *,
     course_id: str,
