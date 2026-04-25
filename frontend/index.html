@@ -4343,14 +4343,29 @@ function renderTerminalNativePanel(rawStep, index) {
   const exType = esc(rawStep.exercise_type || 'terminal_exercise');
   const courseTitle = (state.currentCourse && state.currentCourse.title) || '';
   const wrapper = _surfaceWrapperForCourse(courseTitle);
+  // Per-course example tools to surface in the boilerplate paragraph (so the
+  // Kimi course mentions aider/pytest, the AIE course mentions claude/pytest,
+  // jspring mentions claude/mvn). Beginner reviewer caught the boilerplate
+  // saying "claude / aider / mvn" for every course; that drift now fixed.
+  let exampleTools;
+  if (wrapper === 'kimi-course') exampleTools = ['aider', 'pytest', 'git'];
+  else if (wrapper === 'aie-course') exampleTools = ['claude', 'pytest', 'git'];
+  else if (wrapper === 'jspring-course') exampleTools = ['claude', 'mvn', 'git'];
+  else exampleTools = ['claude', 'aider', 'pytest'];
+
   // Try to derive the M.S label from any context we have. The dashboard
   // doesn't naturally expose module/step position to renderStep; we'll
   // best-effort it from state.currentModuleData.
+  //
+  // Bug fix (Kimi beginner agent 2026-04-25): step labels are 1-INDEXED in
+  // the CLI (filename M0.S1 = first step, S2 = second). The frontend's
+  // `index` here is 0-INDEXED (array position in state.currentModuleData.steps).
+  // Add 1 to align so `goto M0.S1` from the panel = M0.S1 in the CLI.
   let label = '';
   try {
     const modIdx = (state.currentModuleData && typeof state.currentModuleData.position === 'number')
       ? state.currentModuleData.position - 1 : 0;
-    label = `M${modIdx}.S${index}`;
+    label = `M${modIdx}.S${index + 1}`;
   } catch (e) { label = ''; }
 
   return `
@@ -4365,11 +4380,12 @@ function renderTerminalNativePanel(rawStep, index) {
       <div style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:20px; color:#e8ecf4;">
         <p style="margin:0 0 14px 0; line-height:1.6;">
           This step is meant to be done in <strong>your terminal</strong>, not the browser.
-          The skillslab CLI gives you the briefing, runs your acceptance command (pytest /
-          mvn / git diff), and grades the result — all in one surface, with
-          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">claude</code> /
-          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">aider</code> /
-          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">mvn</code>
+          The <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(wrapper)}</code>
+          CLI gives you the briefing, runs your acceptance command, and grades the
+          result — all in one surface, with
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(exampleTools[0])}</code> /
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(exampleTools[1])}</code> /
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(exampleTools[2])}</code>
           where you already work.
         </p>
 
@@ -4377,8 +4393,9 @@ function renderTerminalNativePanel(rawStep, index) {
           <div style="font-size:12px; color:#8892a8; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">
             ① Open your terminal
           </div>
-          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8;"># first time only — build the toolchain image</span>
-docker compose run --rm ${esc(wrapper === 'skillslab' ? 'skillslab' : 'skillslab')}</pre>
+          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8;"># first time only — build the toolchain image (Docker service is always
+# named "skillslab"; the per-course wrapper lives inside the container)</span>
+docker compose run --rm skillslab</pre>
         </div>
 
         <div style="margin-top:18px;">
