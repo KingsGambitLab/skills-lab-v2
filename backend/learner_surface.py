@@ -85,10 +85,25 @@ _ALWAYS_TERMINAL = frozenset({
     "system_build",
 })
 
-# `<script>` body is the strong signal an interactive widget lives in the
-# concept content. Heuristic only used at backfill time (Creator emits the
-# field explicitly going forward).
-_SCRIPT_RE = re.compile(r"<script\b", re.IGNORECASE)
+# 2026-04-25 v5 — surface classification is decided by EXERCISE TYPE +
+# VALIDATION SHAPE only, per user directive (verbatim, 2026-04-25):
+#   1. Code assignment + Docker test cases + single file → WEB
+#   2. Code assignment + GitHub Actions + multiple files → TERMINAL
+#   3. Everything else → WEB
+#
+# Mapping to our taxonomy:
+#   - terminal_exercise (cli_commands) → TERMINAL
+#   - system_build with validation.gha_workflow_check → TERMINAL
+#   - everything else → WEB
+#
+# Why this rule and not v4 (renderer-derived): v4 keyed on "did the
+# renderer's stripper change the content" which is correct in principle
+# but produces flapping classification when LLMs add minor styling. The
+# user's structural insight: surface follows the GRADING SHAPE, not the
+# look-and-feel of the briefing. Single rule, no content sniffing.
+#
+# `markdown_strip.has_browser_only_blocks` lives in `backend/markdown_strip.py`
+# for the renderer's own use, but is no longer consulted by the classifier.
 
 
 _TITLE_HINTS_CLI: tuple[tuple[str, ...], ...] = (
@@ -137,44 +152,60 @@ def is_cli_eligible_course(course_title: str = "", course_id: str = "") -> bool:
 def classify_step(
     *,
     exercise_type: str | None,
-    content: str | None,
-    course_cli_eligible: bool,
+    content: str | None = None,
+    validation: dict | None = None,
+    course_cli_eligible: bool = True,
 ) -> str:
-    """Return 'web' or 'terminal' for a single step. Pure function — caller
-    is responsible for resolving `course_cli_eligible` from the course id.
+    """Return 'web' or 'terminal' for a single step.
 
-    Used:
-      - by `scripts/backfill_learner_surface.py` to fill the new column
-      - by the Creator prompt's default-suggestion logic (so the LLM sees a
-        sensible default it can override per step)
+    2026-04-25 v5 — three-line rule per user directive (verbatim):
+      1. Code assignment + Docker test cases + single file → WEB
+      2. Code assignment + GitHub Actions + multiple files → TERMINAL
+      3. Everything else → WEB
 
-    Never called at runtime by API endpoints. The runtime reads
-    step.learner_surface directly.
+    Materialized on our exercise-type taxonomy:
+      - `terminal_exercise` (cli_commands runner — multi-file work in a
+        real repo) → TERMINAL.
+      - `system_build` WITH `validation.gha_workflow_check` (multi-file
+        capstone graded by GHA) → TERMINAL.
+      - Everything else (concept, mcq, categorization, scenario_branch,
+        sjt, ordering, parsons, code_review, code_read, code_exercise
+        with hidden_tests, system_build with endpoint_check or rubric,
+        adaptive_roleplay, voice_mock_interview, simulator_loop,
+        incident_console, fill_in_blank) → WEB.
+
+    Why this rule (and not the v4 renderer-based derivation): the v4 rule
+    keyed on "did the renderer's stripper change the content?" — that's
+    correct in principle but produced flapping results when the LLM
+    emitted minor styling. The user's structural insight: surface is
+    determined by HOW THE LEARNER GRADES, not by the look-and-feel of
+    the briefing content. GHA-graded multi-file work needs a real
+    terminal; sandboxed Docker single-file works in the browser; reading
+    + drag-drop + MCQ all work in the browser. That's it.
+
+    `content` and `course_cli_eligible` are accepted for back-compat
+    but no longer drive classification — only `exercise_type` and
+    `validation` matter.
     """
     et = (exercise_type or "concept").strip().lower()
 
-    if et in _ALWAYS_WEB:
+    # Rule 2: terminal_exercise is by definition multi-file repo work.
+    if et == "terminal_exercise":
+        return TERMINAL if course_cli_eligible else WEB
+
+    # Rule 2 (cont.): system_build is terminal IFF graded by GHA.
+    # Otherwise (endpoint_check / rubric / phases-only) it's web — the
+    # learner pastes a deploy URL or markdown into the browser.
+    # Use `in` check (not .get truthy) so an empty/sparse gha_workflow_check
+    # block still classifies as terminal — its presence is the signal.
+    if et == "system_build":
+        v = validation or {}
+        if "gha_workflow_check" in v and v["gha_workflow_check"] is not None:
+            return TERMINAL if course_cli_eligible else WEB
         return WEB
-    if et in _ALWAYS_TERMINAL:
-        return TERMINAL if course_cli_eligible else WEB
 
-    # Course-dependent: code_exercise / code_read / concept
-    if et == "code_exercise":
-        return TERMINAL if course_cli_eligible else WEB
-
-    if et == "code_read":
-        # Heuristic only meaningful at backfill — the Creator should declare
-        # this explicitly going forward
-        return TERMINAL if course_cli_eligible else WEB
-
-    if et == "concept":
-        # Has interactive widget? → web. Else terminal-friendly text.
-        if content and _SCRIPT_RE.search(content):
-            return WEB
-        return TERMINAL if course_cli_eligible else WEB
-
-    # Unknown exercise type — safest default is WEB (browser-grading is
-    # the universal fallback)
+    # Rule 3: everything else (mcq, drag-drop, scenario_branch, concept,
+    # code_exercise with Docker tests, code_review, code_read, etc.) → web.
     return WEB
 
 

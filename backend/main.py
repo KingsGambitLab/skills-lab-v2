@@ -360,6 +360,7 @@ async def seed_courses_if_empty():
                             content=sdata.get("content"),
                             course_title=cdata.get("title", ""),
                             declared=sdata.get("learner_surface"),
+                            validation=sdata.get("validation"),
                         ),
                         content=sdata.get("content"),
                         code=sdata.get("code"),
@@ -567,55 +568,56 @@ def _resolve_learner_surface(
     content: str | None,
     course_title: str = "",
     declared: object = None,
+    validation: dict | None = None,
 ) -> str:
     """Resolve a step's `learner_surface` value at persist time.
 
-    2026-04-25 v3 — IMMUTABLE RULES OVERRIDE declared values. User caught a
-    live bug where Kimi M0.S3 (scenario_branch — interactive browser widget)
-    was tagged surface=terminal because the LLM hallucinated `learner_surface:
-    "terminal"` and we trusted it verbatim. The CLI then routed the learner
-    into a "run commands + paste output" flow for a step that has no
-    commands and only renders in the browser.
+    2026-04-25 v4 — SURFACE IS DERIVED, never declared. Per buddy-Opus
+    consult + CLAUDE.md §EXECUTION IS GROUND TRUTH:
+
+    The renderer is the source of truth. Whether a step renders in the
+    terminal is decided by RUNNING the markdown converter's browser-only
+    stripper and observing what survives — not by trusting a label the
+    LLM emitted, and not by regex-sniffing the input.
 
     Resolution order:
-      1. **Immutable rules** — for exercise types that are STRUCTURALLY
-         browser-only (scenario_branch, mcq, categorization, etc.) or
-         STRUCTURALLY terminal-only (terminal_exercise, system_build), the
-         classifier's mandate WINS over any declared value. The LLM does
-         not get to override structural facts.
-      2. `declared` — when the exercise type allows either surface
-         (concept, code_exercise, code_read), trust the LLM's declaration.
-      3. Classifier heuristic — same fallback as before.
+      1. **Type-immutable** — for exercise types that are STRUCTURALLY
+         browser-only (mcq / categorization / scenario_branch / …) or
+         STRUCTURALLY terminal-only (terminal_exercise / system_build),
+         the type alone decides. Cannot be overridden.
+      2. **Content-derived** — for concept / code_exercise / code_read,
+         the classifier asks "does the renderer's stripper change the
+         content?" — i.e. "does the content contain blocks the terminal
+         markdown converter cannot represent?" If yes → web. If no →
+         course-dependent (terminal for CLI-eligible, web otherwise).
+      3. **Declared values are LOGGED, never trusted.** If the LLM
+         declared a surface that disagrees with what the renderer
+         derives, log it as a warning. The renderer wins.
 
-    Always returns a valid value. The contract is:
-      - Caller emitting a value that conflicts with structural rules: silently
-        corrected (logged at WARNING). The LLM doesn't see an error;
-        downstream consumers always see the right value.
+    Why v3 was wrong (the bug this kills): v3 honored declared values
+    for non-structural types. The LLM declared `terminal` for a step
+    whose content was a `<style>` widget. v3 trusted the declaration
+    over the renderer's truth. v4: ignore the declaration entirely.
+
+    Always returns a valid value.
     """
     from .learner_surface import (
         classify_step, is_cli_eligible_course, normalize,
-        _ALWAYS_WEB, _ALWAYS_TERMINAL,
     )
     declared_norm = normalize(declared)
     classified = classify_step(
         exercise_type=ex_type,
         content=content,
+        validation=validation,
         course_cli_eligible=is_cli_eligible_course(course_title=course_title),
     )
-    # Immutable: structural exercise types pin their surface regardless
-    # of what the LLM declared.
-    is_structural = (ex_type in _ALWAYS_WEB) or (ex_type in _ALWAYS_TERMINAL)
-    if is_structural:
-        if declared_norm and declared_norm != classified:
-            logger.warning(
-                "learner_surface: declared %r conflicts with structural rule for "
-                "exercise_type=%r; forcing %r (the only valid surface for this type).",
-                declared_norm, ex_type, classified,
-            )
-        return classified
-    # Non-structural (course-dependent) types may honor the declared value.
-    if declared_norm:
-        return declared_norm
+    if declared_norm and declared_norm != classified:
+        logger.warning(
+            "learner_surface: declared %r disagrees with renderer-derived %r "
+            "for exercise_type=%r (course=%r). Using derived value — the "
+            "renderer is the source of truth.",
+            declared_norm, classified, ex_type, course_title,
+        )
     return classified
 
 
@@ -12030,6 +12032,7 @@ async def _creator_generate_impl(
                         content=content,
                         course_title=title,
                         declared=llm_content.get("learner_surface"),
+                        validation=validation,
                     ),
                     content=content,
                     code=code,
@@ -12387,6 +12390,7 @@ async def _creator_generate_impl(
                     content=content,
                     course_title=title,
                     declared=(llm_content or {}).get("learner_surface"),
+                    validation=validation,
                 ),
                 content=content,
                 code=code,
