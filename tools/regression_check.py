@@ -71,6 +71,11 @@ def scan_drift(lms_url: str, course_filter: list[str] | None) -> dict:
     """Walk every relevant course's modules+steps; run the registry-driven
     drift checker on each step's content. Returns a dict with per-course
     violation lists.
+
+    Buddy-Opus 2026-04-25: tightened scope at iteration entry. Catalog
+    has 4671 courses; ~6 are in-scope for any registered tech. Now we
+    pre-filter by `in_scope_techs` BEFORE fetching modules, so the SCAN
+    is O(in-scope) not O(catalog).
     """
     from backend import verified_facts as vf
     from backend import verified_facts_data  # noqa: F401  (registers on import)
@@ -89,7 +94,12 @@ def scan_drift(lms_url: str, course_filter: list[str] | None) -> dict:
             elif f in KNOWN_COURSES:
                 course_ids.append(KNOWN_COURSES[f])
     else:
-        course_ids = [c["id"] for c in catalog]
+        # Pre-filter by tech-scope at the catalog level — avoids iterating
+        # through 4000+ unrelated courses on every CI run.
+        for c in catalog:
+            if vf.in_scope_techs(c.get("title", ""), c.get("description", ""), ""):
+                course_ids.append(c["id"])
+        print(f"  scoped: {len(course_ids)} of {len(catalog)} catalog entries are tech-tagged")
 
     total = 0
     course_results = {}

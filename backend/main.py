@@ -9001,17 +9001,33 @@ IMPORTANT for incident_console:
                     _cc_desc = str(course_context.get("description") or "")
                     _cc_src = str(course_context.get("source_material") or "")
                 _cc_title = _cc_title or (step_title or "")
-                # v8.7 (2026-04-25) — registry-driven facts injection. Each
-                # tech (claude_code, aider, future kubernetes/terraform/etc.)
-                # registers via backend/verified_facts_data.py. The registry
-                # iterates every in-scope tech for THIS course and concatenates
-                # all matching facts blocks. Adding a new tech = ONE
-                # register_tech(...) call there; no edits here.
-                from . import verified_facts as _vf
-                from . import verified_facts_data as _vfd  # noqa: F401  (registers on import)
-                _facts_blob = _vf.assemble_facts_blocks(_cc_title, _cc_desc, _cc_src)
+                # v8.7 F3 (2026-04-25) — schema-driven facts injection.
+                # Per buddy-Opus #2: blocklist registry → allowlist schema.
+                # Each tech registers a TechSchema in backend/tech_schema_data.py
+                # populated from cached canonical docs (backend/tech_docs/).
+                # Creator prompt sees explicit allowlists ("only these CLI
+                # flags / slash commands / config keys are real"). The same
+                # schema drives the post-gen drift gate below — single
+                # source of truth, two consumers.
+                #
+                # Legacy verified_facts_data still imported for any course
+                # that triggers its older patterns (during migration); will
+                # be removed once schema coverage matches.
+                from . import tech_schema as _ts
+                from . import tech_schema_data as _tsd  # noqa: F401
+                _facts_blob = _ts.assemble_creator_prompt_block(_cc_title, _cc_desc, _cc_src)
                 if _facts_blob:
                     prompt += "\n\n" + _facts_blob + "\n"
+                # Belt-and-braces: also inject the legacy facts-block while
+                # the schema's coverage stabilizes. Will be removed.
+                try:
+                    from . import verified_facts as _vf
+                    from . import verified_facts_data as _vfd  # noqa: F401
+                    _legacy = _vf.assemble_facts_blocks(_cc_title, _cc_desc, _cc_src)
+                    if _legacy:
+                        prompt += "\n\n" + _legacy + "\n"
+                except Exception:
+                    pass
             except Exception as _cc_err:
                 logging.warning("Verified-facts injection failed (non-fatal): %s", _cc_err)
             # v8.6 (2026-04-24) LANGUAGE LOCK — domain-expert review of TS v12
@@ -10532,14 +10548,20 @@ async def _creator_generate_impl(
                     # Gate bug must NOT hard-fail generation; log + continue.
                     logging.warning("ontology gate error (soft-pass): %s", _onto_err)
 
-                # 2026-04-25 v8.7 — VERIFIED-FACTS DRIFT GATE (registry-driven).
-                # Iterates every in-scope tech registered in verified_facts_data
-                # and runs each tech's drift_patterns against the produced
-                # content. Adding a new tech's drift coverage = ONE
-                # register_tech(...) call there; no edits here.
+                # 2026-04-25 v8.7 F3 — SCHEMA-DRIVEN DRIFT GATE.
+                # Replaces the blocklist registry with allowlist conformance.
+                # Each in-scope tech's TechSchema enumerates the canonical
+                # set of CLI flags / slash commands / config keys / paths /
+                # tool names / settings event names / frontmatter fields.
+                # The gate runs structural conformance + the staged
+                # additional_drifts patterns + the F2 exercise invariants.
+                #
+                # The legacy verified_facts gate runs in parallel during
+                # migration to catch anything the schema misses (will be
+                # removed once schema coverage matches).
                 try:
-                    from . import verified_facts as _vf
-                    from . import verified_facts_data as _vfd  # noqa: F401
+                    from . import tech_schema as _ts
+                    from . import tech_schema_data as _tsd  # noqa: F401
                     _vf_title = ""
                     _vf_desc = ""
                     _vf_src = ""
@@ -10548,29 +10570,50 @@ async def _creator_generate_impl(
                         _vf_desc = str(course_context.get("description") or "")
                         _vf_src = str(course_context.get("source_material") or "")
                     _vf_title = _vf_title or (step_outline.title or "")
-                    _violations = _vf.check_drift(
+                    _violations = _ts.check_drift(
                         content=content_obj.get("content") or "",
                         code=content_obj.get("code") or "",
                         validation=content_obj.get("validation") or {},
                         demo_data=content_obj.get("demo_data") or {},
                         title=getattr(step_outline, "title", "") or "",
+                        exercise_type=ex_type or "",
+                        expected_output=content_obj.get("expected_output") or "",
                         course_title=_vf_title,
                         course_description=_vf_desc,
                         source_material=_vf_src,
                     )
+                    # Belt-and-braces: also run legacy gate during migration
+                    try:
+                        from . import verified_facts as _vf
+                        from . import verified_facts_data as _vfd  # noqa: F401
+                        _violations.extend(_vf.check_drift(
+                            content=content_obj.get("content") or "",
+                            code=content_obj.get("code") or "",
+                            validation=content_obj.get("validation") or {},
+                            demo_data=content_obj.get("demo_data") or {},
+                            title=getattr(step_outline, "title", "") or "",
+                            course_title=_vf_title,
+                            course_description=_vf_desc,
+                            source_material=_vf_src,
+                        ))
+                    except Exception:
+                        pass
+
                     if _violations:
+                        # Dedupe (schema + legacy may overlap)
+                        _violations = list(dict.fromkeys(_violations))
                         logging.warning(
-                            "VERIFIED-FACTS DRIFT step=%r ex_type=%s n_violations=%d:\n  - %s",
+                            "DRIFT GATE step=%r ex_type=%s n_violations=%d:\n  - %s",
                             getattr(step_outline, "title", "?"), ex_type,
                             len(_violations), "\n  - ".join(_violations[:5]),
                         )
                         _last_invariant_reason[0] = (
-                            "Verified-facts drift — fix THESE specific issues from the prior attempt:\n"
+                            "Drift gate — fix THESE specific issues from the prior attempt:\n"
                             + "\n".join(f"  - {v}" for v in _violations[:8])
                         )[-1500:]
                         return False
                 except Exception as _vf_err:
-                    logging.warning("verified-facts drift gate error (soft-pass): %s", _vf_err)
+                    logging.warning("schema drift gate error (soft-pass): %s", _vf_err)
                 # Reject any concept/roleplay content that is self-referential filler — text that
                 # references its own step title or module title as the topic ("In the work you'll do
                 # after this course, *[module-title]* shows up most often...") was identified by the
@@ -12634,6 +12677,44 @@ async def regenerate_module_endpoint(
         if reason in ("module_not_in_course", "module_has_no_steps"):
             raise HTTPException(404, reason)
         raise HTTPException(500, f"Module regeneration failed: {reason}")
+    return result
+
+
+@app.patch("/api/admin/courses/{course_id}/steps/{step_id}/title")
+async def patch_step_title_admin_endpoint(
+    course_id: str,
+    step_id: int,
+    body: dict,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """ADMIN-ONLY title patch (v8.7 2026-04-25 — buddy-Opus review fix).
+
+    Title PATCHes were briefly allowed via the general
+    `PATCH /api/courses/.../steps/{id}` safelist. Buddy-Opus flagged that
+    as eroding the outline-shape invariant CLAUDE.md asserts. Reverted —
+    title changes now route here, gated by admin role + audit-logged.
+
+    Use case: narrow drift-cleanup on a single title (e.g. remove
+    `kimi-k2-latest` lingering after the body was correctly regenerated)
+    without burning LLM regen budget. NOT for outline restructuring —
+    use module regen for that.
+    """
+    user = await require_role("admin")(request)
+    if not isinstance(body, dict) or "title" not in body:
+        raise HTTPException(400, "Body must be {\"title\": \"<new title>\"}")
+    result = await _per_step.patch_step_title_admin(
+        course_id=course_id, step_id=step_id, new_title=body["title"],
+        db=db, Course=Course, Module=Module, Step=Step,
+        actor_email=getattr(user, "email", "?"),
+    )
+    if not result.get("ok"):
+        reason = result.get("reason", "unknown")
+        if reason in ("step_not_found", "step_not_in_course"):
+            raise HTTPException(404, reason)
+        if reason in ("empty_title", "title_too_long"):
+            raise HTTPException(400, reason)
+        raise HTTPException(500, f"Admin title patch failed: {reason}")
     return result
 
 

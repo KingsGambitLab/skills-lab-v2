@@ -151,11 +151,37 @@ def _drift_match_excluding_negation(
     pattern: str, haystack: str, *, ignore_case: bool
 ) -> bool:
     """Return True iff `pattern` matches at least once in POSITIVE-teaching
-    context (not preceded by a negation marker within ~80 chars)."""
+    context (not preceded by a negation marker within ~80 chars OF THE SAME
+    CONTENT BLOCK).
+
+    Buddy-Opus 2026-04-25: prior version applied the negation skip
+    BLINDLY across code-fence boundaries. So content like
+        "AVOID kimi-k2-0905. Do this instead:\n```bash\ncurl --model kimi-k2-0905\n```"
+    passed the gate because the negation marker (AVOID) was within 80
+    chars of the bad slug INSIDE the code block — but the code block IS
+    teaching the wrong thing. Fix: when computing the lookbehind window,
+    truncate at the most recent code-fence boundary (``` or `<pre>` /
+    `<code>` open) before the match. Inside a code block, prose negation
+    doesn't reach.
+    """
     flags = re.IGNORECASE if ignore_case else 0
     flat = haystack.lower().replace("\n", " ")
     for m in re.finditer(pattern, haystack, flags):
-        window = flat[max(0, m.start() - 80):m.start()]
+        # Find the most recent code-fence boundary before this match. If
+        # one exists within the lookbehind window, the negation context
+        # is sealed off — we're INSIDE a code block.
+        match_start = m.start()
+        window_start = max(0, match_start - 80)
+        window = flat[window_start:match_start]
+        # Code-fence start markers in the haystack (case-insensitive)
+        fence_open_pos = -1
+        for fence in ("```", "<pre", "<code"):
+            idx = haystack[window_start:match_start].lower().rfind(fence)
+            if idx > fence_open_pos:
+                fence_open_pos = idx
+        if fence_open_pos >= 0:
+            # Negation must be AFTER the fence open to count
+            window = window[fence_open_pos:]
         if any(neg in window for neg in NEGATION_MARKERS):
             continue
         return True

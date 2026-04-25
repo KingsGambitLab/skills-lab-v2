@@ -179,10 +179,15 @@ _CLAUDE_CODE_DRIFTS = [
 
 register_tech(
     tech_id="claude_code",
+    # Buddy-Opus 2026-04-25: tightened scope markers. Dropped "anthropic api"
+    # and "anthropic claude" — too broad, would match any course that
+    # mentions the API in passing without teaching Claude Code specifically.
+    # The remaining markers each REQUIRE the course to be teaching Claude
+    # Code as a tool, not just referencing it.
     scope_markers=(
-        "claude code", "claude-code", "anthropic api", "anthropic claude",
+        "claude code", "claude-code",
         "@anthropic-ai/claude-code", "claude /login", "claude.ai/code",
-        "ai-augmented engineering", "byo-key claude",
+        "ai-augmented engineering", "byo-key claude", "byo claude key",
     ),
     facts_block=_CLAUDE_CODE_FACTS,
     drift_patterns=_CLAUDE_CODE_DRIFTS,
@@ -286,9 +291,14 @@ _AIDER_DRIFTS = [
 
 register_tech(
     tech_id="aider",
+    # Buddy-Opus 2026-04-25: tightened scope markers. Dropped bare
+    # "openrouter" — OpenRouter is used by many tools (Claude, Cursor,
+    # litellm-routed apps); a course mentioning it isn't necessarily an
+    # Aider course. Kept the Kimi K2 markers because they ARE specific to
+    # this course family (Kimi+Aider+OpenRouter is the only stack we ship).
     scope_markers=(
         "aider", ".aider.conf", "aider-chat", "aider.chat",
-        "openrouter", "kimi k2", "kimi-k2", "moonshotai",
+        "kimi k2", "kimi-k2", "moonshotai/kimi",
     ),
     facts_block=_AIDER_FACTS,
     drift_patterns=_AIDER_DRIFTS,

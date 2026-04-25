@@ -856,13 +856,18 @@ async def patch_step_fields(
     if not mod_row or mod_row.course_id != course_id:
         return {"ok": False, "reason": "step_not_in_course"}
 
-    # Safelist of editable fields. v8.7 (2026-04-25): added `title` — the
-    # registry-driven drift gate now scans titles too, and a title-only fix
-    # for verified-facts drift (e.g. `kimi-k2-latest` lingering in a title)
-    # is overkill to regen the whole step. Title doesn't affect step-index
-    # references (those are by step.id). It DOES affect step-filename hashing
-    # for the CLI's local markdown cache — learner reruns `start` to refresh.
-    allowed_fields = {"title", "content", "code", "expected_output", "validation", "demo_data"}
+    # Safelist of editable fields. v8.7 (2026-04-25): I briefly added `title`
+    # to allow drift-cleanup PATCHes (e.g. removing a stale `kimi-k2-latest`
+    # from a step title) without burning LLM regen budget. Buddy-Opus review
+    # caught this as an invariant erosion: titles are part of the outline
+    # shape; widening the general safelist quietly weakens the
+    # outline-shape contract CLAUDE.md asserts. REVERTED back to the
+    # content/code/expected_output/validation/demo_data set. Drift cleanup
+    # for titles now goes through the explicit admin route below
+    # (`patch_step_title_admin` — gated by an admin-flag header, scoped to
+    # title-only, audit-logged). Future title PATCHes therefore can't be
+    # hit accidentally by the author UI.
+    allowed_fields = {"content", "code", "expected_output", "validation", "demo_data"}
     applied: list[str] = []
     for k, v in (updates or {}).items():
         if k not in allowed_fields:
@@ -892,4 +897,77 @@ async def patch_step_fields(
             "validation": step_row.validation,
             "demo_data": step_row.demo_data,
         },
+    }
+
+
+async def patch_step_title_admin(
+    *,
+    course_id: str,
+    step_id: int,
+    new_title: str,
+    db: AsyncSession,
+    Course: Any,
+    Module: Any,
+    Step: Any,
+    actor_email: str = "?",
+) -> dict[str, Any]:
+    """ADMIN-ONLY title patch — no LLM call. Used for narrow drift-cleanup
+    (e.g. removing `kimi-k2-latest` from a step title without burning LLM
+    regen budget on a 1-line fix).
+
+    Buddy-Opus review (2026-04-25) flagged that adding `title` to the
+    general PATCH safelist erodes the outline-shape invariant. This route
+    keeps the carve-out narrow:
+      - Admin-only (gated by header / role at the endpoint level)
+      - Title-only (no other fields editable)
+      - Logs the actor + before/after for audit
+      - Length cap to prevent silent outline drift via essay-length titles
+
+    The author UI's `PATCH .../steps/{id}` does NOT route here — that
+    endpoint stays restricted to content/code/expected_output/validation/
+    demo_data per the safelist. Title changes go through this admin path
+    OR a module-level regen.
+    """
+    new_title = (new_title or "").strip()
+    if not new_title:
+        return {"ok": False, "reason": "empty_title"}
+    if len(new_title) > 300:
+        return {"ok": False, "reason": "title_too_long"}
+
+    step_res = await db.execute(select(Step).where(Step.id == step_id))
+    step_row = step_res.scalars().first()
+    if not step_row:
+        return {"ok": False, "reason": "step_not_found"}
+    mod_res = await db.execute(select(Module).where(Module.id == step_row.module_id))
+    mod_row = mod_res.scalars().first()
+    if not mod_row or mod_row.course_id != course_id:
+        return {"ok": False, "reason": "step_not_in_course"}
+
+    old_title = step_row.title
+    step_row.title = new_title
+    await db.commit()
+    await db.refresh(step_row)
+
+    # Audit log — keeps a paper trail of admin title patches even though we
+    # don't have a dedicated audit table yet. /tmp is fine for now; a real
+    # audit table goes in the production-ready queue.
+    try:
+        import json as _json, time as _time
+        from pathlib import Path as _Path
+        log_dir = _Path("/tmp/skillslab_admin_audit")
+        log_dir.mkdir(exist_ok=True)
+        with open(log_dir / "title_patches.jsonl", "a") as fh:
+            fh.write(_json.dumps({
+                "ts": _time.time(),
+                "actor": actor_email,
+                "course_id": course_id, "step_id": step_id,
+                "old_title": old_title, "new_title": new_title,
+            }) + "\n")
+    except Exception:
+        pass
+
+    return {
+        "ok": True, "old_title": old_title, "new_title": new_title,
+        "step": {"id": step_row.id, "title": new_title,
+                 "module_id": step_row.module_id, "position": step_row.position},
     }
