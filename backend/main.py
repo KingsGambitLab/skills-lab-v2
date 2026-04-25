@@ -1466,6 +1466,19 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
                 "line": ir.get("line"),
                 "bug_on_line": ir.get("bug_on_line"),
                 "found_by_user": ir.get("found_by_user"),
+                # 2026-04-25 v5 — explanation + label MUST survive the strip for
+                # the learner's own picks. The gate above ALREADY filters to
+                # user-picked rows for scenario_branch (line 1507) and user-
+                # flagged lines for code_review (line 1534) — so by the time
+                # we get here, every row describes the LEARNER'S OWN choice.
+                # Explanation of "you picked X, here's why it was right/wrong"
+                # IS the teaching signal — without it, the widget shows correct/
+                # incorrect color but no rationale (AIE beginner v5 reviewer
+                # flagged this as P0: 'widget shows no explanation, advances as
+                # if right'). For unpicked options, the gate already drops the
+                # row entirely, so there's no answer-key leak.
+                "label": ir.get("label"),
+                "explanation": ir.get("explanation"),
             }
             return {k: v for k, v in safe.items() if v is not None}
         # F22 fix 2026-04-21 (revised from F1): for scenario_branch, the full
