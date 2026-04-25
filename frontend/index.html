@@ -4368,6 +4368,18 @@ function renderTerminalNativePanel(rawStep, index) {
     label = `M${modIdx}.S${index + 1}`;
   } catch (e) { label = ''; }
 
+  // Phase 3.2 (2026-04-25 — fix from AIE expert review): include the step's
+  // briefing content (rawStep.content) so the dashboard learner SEES what
+  // the step is about, not just the "open your terminal" pointer. Without
+  // this, the principle of "complete + helpful within the terminal" looks
+  // like "hand off and pray the CLI has the rest". The CLI's `spec` command
+  // shows the same briefing rendered in markdown — so the surfaces stay in
+  // lockstep on what the step IS, even though the WORK + GRADING lives
+  // exclusively in the terminal.
+  const briefingHtml = (rawStep.content && typeof rawStep.content === 'string')
+    ? rawStep.content
+    : '';
+
   return `
     <div class="step-content">
       <div class="step-header">
@@ -4377,11 +4389,20 @@ function renderTerminalNativePanel(rawStep, index) {
         <div class="step-title" style="margin-top:14px;">${title}</div>
       </div>
 
-      <div style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:20px; color:#e8ecf4;">
+      ${briefingHtml ? `
+      <div style="margin-top:20px;">
+        ${briefingHtml}
+      </div>
+      ` : ''}
+
+      <div style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:24px; color:#e8ecf4;">
+        <div style="font-size:12px; color:#a3d8ff; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px;">
+          ▶ How to do this step
+        </div>
         <p style="margin:0 0 14px 0; line-height:1.6;">
-          This step is meant to be done in <strong>your terminal</strong>, not the browser.
-          The <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(wrapper)}</code>
-          CLI gives you the briefing, runs your acceptance command, and grades the
+          The work happens in <strong>your terminal</strong>, not the browser. The
+          <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(wrapper)}</code>
+          CLI gives you the full briefing, runs your acceptance command, and grades the
           result — all in one surface, with
           <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(exampleTools[0])}</code> /
           <code style="background:#161b26; padding:2px 6px; border-radius:3px;">${esc(exampleTools[1])}</code> /
