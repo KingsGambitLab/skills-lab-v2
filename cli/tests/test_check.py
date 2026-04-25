@@ -180,3 +180,34 @@ def test_run_check_no_grading_hook_returns_useful_message(tmp_path):
     out = check.run_check(step, cwd=str(tmp_path))
     assert out["correct"] is False
     assert "no cli_check" in out["feedback"] or "concept-only" in out["feedback"]
+
+
+def test_run_check_attaches_debug_for_native(tmp_path):
+    """--verbose mode renders the _debug field. Verify every dispatch path
+    populates it so learners always have a signal to iterate from."""
+    step = {
+        "id": 1,
+        "exercise_type": "code_exercise",
+        "validation": {"cli_check": {"kind": "file_exists", "path": "missing.txt"}},
+    }
+    out = check.run_check(step, cwd=str(tmp_path))
+    assert "_debug" in out
+    assert out["_debug"]["dispatch"] == "cli_check:file_exists"
+    assert "submission" in out["_debug"]
+    assert "accept_rc" in out["_debug"]
+
+
+def test_run_check_attaches_debug_for_must_contain(tmp_path):
+    step = {
+        "id": 1, "exercise_type": "concept",
+        "validation": {"must_contain": ["FOO", "BAR"]},
+    }
+    out = check.run_check(step, cwd=str(tmp_path), paste="only FOO here")
+    assert out["_debug"]["dispatch"] == "must_contain"
+    assert "FOO" in out["_debug"]["submission"]
+
+
+def test_run_check_attaches_debug_for_no_hook(tmp_path):
+    step = {"id": 1, "exercise_type": "concept", "validation": {}}
+    out = check.run_check(step, cwd=str(tmp_path))
+    assert out["_debug"]["dispatch"] == "no_hook"

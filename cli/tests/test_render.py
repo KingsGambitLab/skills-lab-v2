@@ -64,6 +64,67 @@ def test_html_entities_are_decoded():
     assert "5 > 3 & 2 < 4" in md
 
 
+def test_script_blocks_are_stripped_body_and_all():
+    """Browser-only widgets ship as <script>(function(){...})()</script>. The
+    body must vanish — not just the <script> tags. Without this, JS source
+    code bleeds into the terminal as 60+ lines of gibberish."""
+    html = """<p>Concept text.</p>
+<script>
+(function(){
+  let count = 0;
+  document.getElementById('x').textContent = 'hi';
+  window.runDemo = () => { count++; };
+})();
+</script>
+<p>More text.</p>"""
+    md = html_to_markdown(html)
+    assert "Concept text." in md
+    assert "More text." in md
+    assert "(function()" not in md
+    assert "document.getElementById" not in md
+    assert "window.runDemo" not in md
+    assert "let count" not in md
+
+
+def test_style_blocks_are_stripped():
+    html = """<style>.foo { background: red; color: white; }</style><p>real content</p>"""
+    md = html_to_markdown(html)
+    assert "real content" in md
+    assert "background:" not in md
+    assert ".foo" not in md
+
+
+def test_svg_replaced_with_placeholder():
+    html = '<p>before</p><svg width="100"><circle r="10"/></svg><p>after</p>'
+    md = html_to_markdown(html)
+    assert "before" in md
+    assert "after" in md
+    assert "[interactive diagram" in md
+    assert "<circle" not in md
+
+
+def test_iframe_replaced_with_placeholder():
+    html = '<p>see widget below</p><iframe src="/demo">fallback</iframe>'
+    md = html_to_markdown(html)
+    assert "see widget" in md
+    assert "[embedded frame" in md
+    assert "fallback" not in md
+
+
+def test_noscript_is_stripped():
+    html = '<noscript>JS required</noscript><p>actual content</p>'
+    md = html_to_markdown(html)
+    assert "actual content" in md
+    assert "JS required" not in md
+
+
+def test_script_with_attrs_is_stripped():
+    html = '<script type="module" src="/x.js">alert(1)</script><p>ok</p>'
+    md = html_to_markdown(html)
+    assert "ok" in md
+    assert "alert" not in md
+
+
 def test_step_to_markdown_includes_frontmatter_and_title():
     step = {
         "id": 12345,

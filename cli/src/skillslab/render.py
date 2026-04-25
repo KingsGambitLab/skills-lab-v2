@@ -32,11 +32,41 @@ _DIV_RE = re.compile(r"<div[^>]*>(.*?)</div>", re.DOTALL | re.IGNORECASE)
 _TAG_RE = re.compile(r"<[^>]+>")
 _BLANK_LINES_RE = re.compile(r"\n{3,}")
 
+# Block-level browser-only content that must be REMOVED ENTIRELY (tag + body),
+# not just have its tags stripped — otherwise the body bleeds into the terminal
+# as raw JS / CSS / SVG markup. The web frontend executes / renders these; the
+# terminal can't, so they're noise either way.
+_SCRIPT_RE = re.compile(r"<script\b[^>]*>.*?</script\s*>", re.DOTALL | re.IGNORECASE)
+_STYLE_RE = re.compile(r"<style\b[^>]*>.*?</style\s*>", re.DOTALL | re.IGNORECASE)
+_NOSCRIPT_RE = re.compile(r"<noscript\b[^>]*>.*?</noscript\s*>", re.DOTALL | re.IGNORECASE)
+_HEAD_RE = re.compile(r"<head\b[^>]*>.*?</head\s*>", re.DOTALL | re.IGNORECASE)
+_SVG_RE = re.compile(r"<svg\b[^>]*>.*?</svg\s*>", re.DOTALL | re.IGNORECASE)
+_IFRAME_RE = re.compile(r"<iframe\b[^>]*>.*?</iframe\s*>", re.DOTALL | re.IGNORECASE)
+_TEMPLATE_RE = re.compile(r"<template\b[^>]*>.*?</template\s*>", re.DOTALL | re.IGNORECASE)
+
+
+# Steps that are interactive widgets in the browser still ship via the LMS
+# as "concept" content with embedded <script>. The CLI doesn't have a JS
+# runtime — without this strip, the script body bleeds in as raw JS source.
+def _strip_browser_only_blocks(s: str) -> str:
+    s = _SCRIPT_RE.sub("", s)
+    s = _STYLE_RE.sub("", s)
+    s = _NOSCRIPT_RE.sub("", s)
+    s = _HEAD_RE.sub("", s)
+    s = _SVG_RE.sub("[interactive diagram — see browser]", s)
+    s = _IFRAME_RE.sub("[embedded frame — see browser]", s)
+    s = _TEMPLATE_RE.sub("", s)
+    return s
+
 
 def html_to_markdown(html: str) -> str:
     if not html:
         return ""
-    s = html
+    # Step 0: strip browser-only blocks BEFORE any other processing — their
+    # bodies must vanish, not just their tags. (Bug surfaced 2026-04-25 on
+    # AIE M5.S1 widget that dumped 60+ lines of (function(){})() into the
+    # learner's terminal.)
+    s = _strip_browser_only_blocks(html)
 
     # Code blocks: keep the inside verbatim, wrap as ``` fence
     def _pre_to_fence(m: re.Match) -> str:

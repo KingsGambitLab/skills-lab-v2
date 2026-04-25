@@ -418,12 +418,22 @@ def goto(ctx, label, course):
 @click.option("--course", default=None)
 @click.option("--paste", default=None, help="Provide submission text directly (default: read stdin if piped)")
 @click.option("--cwd", default=".", help="Working directory for the acceptance command (default: cwd)")
+@click.option("--verbose", "-v", is_flag=True,
+              help="On failure, show the full submission + grader response + dispatch path.")
 @click.pass_context
-def check(ctx, course, paste, cwd):
+def check(ctx, course, paste, cwd, verbose):
     """Grade the current step. Native cli_check spec runs locally; rubric-only
     steps fall back to bridge mode (capture stdout/git diff and POST to LMS).
     On pass: marks step complete + advances cursor.
+
+    Use `--verbose` (or set `SKILLSLAB_DEBUG=1`) on failure to inspect:
+        - what submission text was sent
+        - the acceptance_command exit code (was `aider` actually on PATH?)
+        - the raw grader response (so you can iterate from real signal)
     """
+    # Env override matches the standard verbose pattern across CLIs
+    if os.environ.get("SKILLSLAB_DEBUG") == "1":
+        verbose = True
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
     cdir = state.course_dir(slug)
@@ -482,6 +492,36 @@ def check(ctx, course, paste, cwd):
         console.print(f"\n[red]✗ Not yet[/red] — score: [bold]{score or 'n/a'}[/bold]")
         if result.get("feedback"):
             console.print(Panel(result["feedback"], title="Grader feedback", border_style="yellow"))
+
+        # Debug surface — only shown with -v / --verbose / SKILLSLAB_DEBUG=1.
+        # Without this, learners see "0% — re-read the briefing" and have no
+        # signal to iterate from. With it, they see exactly what was sent +
+        # what the grader saw + which dispatch path produced the verdict.
+        dbg = result.get("_debug") or {}
+        if verbose and dbg:
+            console.print()
+            console.print(Panel(
+                f"[bold]dispatch path:[/bold] {dbg.get('dispatch','?')}\n"
+                f"[bold]acceptance_command exit_code:[/bold] {dbg.get('accept_rc','?')}",
+                title="Debug", border_style="dim",
+            ))
+            sub = dbg.get("submission") or ""
+            console.print(Panel(
+                sub if sub else "[dim](submission was empty — did you run `git add` "
+                                  "/ pipe content with --paste / set acceptance_command "
+                                  "in .skillslab.yml?)[/dim]",
+                title="Submission sent to grader", border_style="dim",
+            ))
+            raw = dbg.get("raw_response")
+            if raw is not None:
+                try:
+                    pretty = json.dumps(raw, indent=2, default=str)
+                except Exception:
+                    pretty = str(raw)
+                console.print(Panel(pretty, title="Raw grader response", border_style="dim"))
+        elif not verbose:
+            console.print("[dim]   re-run with --verbose to see the submission "
+                          "+ grader response[/dim]")
 
 
 @cli.command()

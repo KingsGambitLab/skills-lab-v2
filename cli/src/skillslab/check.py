@@ -360,14 +360,28 @@ def _bridge_validate(step: dict, submission: str, accept_rc: int) -> dict:
     try:
         out = api.validate_exercise(sid, etype, payload)
     except api.ApiError as e:
-        return {"correct": False, "score": 0, "feedback": f"LMS validate error: {e}"}
+        return {"correct": False, "score": 0, "feedback": f"LMS validate error: {e}",
+                "_debug": {"submission": submission, "accept_rc": accept_rc, "error": str(e)}}
 
     score = out.get("score")
     correct = bool(out.get("correct") or (isinstance(score, (int, float)) and score >= 0.7))
     feedback = out.get("feedback") or out.get("message") or ""
     if not feedback and out.get("explanations"):
         feedback = "\n".join(out["explanations"])
-    return {"correct": correct, "score": score if score is not None else (1.0 if correct else 0.0), "feedback": feedback}
+    return {
+        "correct": correct,
+        "score": score if score is not None else (1.0 if correct else 0.0),
+        "feedback": feedback,
+        # Stash the full payload + raw grader response so `--verbose` can show
+        # learners exactly what was submitted + evaluated. Also includes the
+        # _captured_ output of `acceptance_command` so they can see whether
+        # (e.g.) `aider` was actually on PATH.
+        "_debug": {
+            "submission": submission,
+            "accept_rc": accept_rc,
+            "raw_response": out,
+        },
+    }
 
 
 # ── Public entry point ────────────────────────────────────────────────────
@@ -389,12 +403,24 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
 
     submission, accept_rc = _build_submission(step, cwd, paste)
 
+    def _attach_debug(result: dict, *, path: str) -> dict:
+        """Add _debug context so `skillslab check --verbose` can show learners
+        exactly what was submitted, what the acceptance command exited with,
+        and which dispatch path the verdict came from. Quiet by default (the
+        UI only surfaces this with --verbose).
+        """
+        result.setdefault("_debug", {})
+        result["_debug"].setdefault("submission", submission)
+        result["_debug"].setdefault("accept_rc", accept_rc)
+        result["_debug"]["dispatch"] = path
+        return result
+
     # 1) Explicit cli_check on the step → run it locally
     if isinstance(cli_check, dict) and cli_check.get("kind"):
         kind = cli_check["kind"]
         fn = _NATIVE_KINDS.get(kind)
         if fn is not None:
-            return fn(cli_check, submission, cwd, cfg)
+            return _attach_debug(fn(cli_check, submission, cwd, cfg), path=f"cli_check:{kind}")
         if console is not None:
             console.print(f"[yellow]Unknown cli_check kind '{kind}', falling back.[/yellow]")
 
@@ -402,16 +428,22 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
     must_contain = validation.get("must_contain") or []
     rubric_raw = validation.get("rubric") or validation.get("explanation_rubric")
     if must_contain and not rubric_raw:
-        return _check_paste_contains({"tokens": must_contain}, submission)
+        return _attach_debug(
+            _check_paste_contains({"tokens": must_contain}, submission),
+            path="must_contain",
+        )
 
     # 3) Rubric (or rubric+must_contain) → bridge to LMS by default. Verdict
     #    comes back through the API and we render it in the terminal.
     if rubric_raw or must_contain:
-        return _bridge_validate(step, submission, accept_rc)
+        return _attach_debug(
+            _bridge_validate(step, submission, accept_rc),
+            path="bridge_validate",
+        )
 
     # 4) No grading hook at all
-    return {
+    return _attach_debug({
         "correct": False, "score": 0,
         "feedback": ("This step has no cli_check / rubric / must_contain — "
                      "it may be a concept-only step. Run `skillslab next` to advance."),
-    }
+    }, path="no_hook")
