@@ -50,13 +50,19 @@ from typing import Any
 
 @dataclass
 class CliCmdResult:
-    """One executed cli_commands entry."""
+    """One executed cli_commands entry.
+
+    2026-04-25 v3 — `expected_pattern` / `expected_match` removed. User
+    directive: "Regex is a bad way to check here." Tool output format
+    varies (e.g. `aider 0.86` vs `Aider v0.86`); LLM-emitted regexes are
+    brittle. The LMS rubric + must_contain grade the captured TEXT — the
+    CLI's job is to RUN the commands and capture, not predict output
+    shape. Exit code is the only deterministic CLI-side signal.
+    """
     cmd: str
     stdout: str = ""
     stderr: str = ""
     exit_code: int = 0
-    expected_pattern: str | None = None
-    expected_match: bool | None = None  # None if no `expect` was set
     duration_s: float = 0.0
 
 
@@ -82,17 +88,25 @@ def run_cli_commands(
     Each entry in `commands`:
       {
         "cmd": "aider --version",                         # required
-        "expect": r"Aider v\\d+\\.\\d+",                  # optional, regex on stdout+stderr
         "label": "Aider version smoke",                   # optional, used as section header
         "timeout_s": 30,                                  # optional, default 120
         "ok_exit_codes": [0],                             # optional, default [0]
       }
 
+    2026-04-25 v3 — `expect` regex retired. User directive: "Regex is a
+    bad way to check here." The cmd's exit code is the only hard CLI-side
+    signal; semantic grading (did the OUTPUT prove the skill?) happens on
+    the LMS side via validation.must_contain (substring) + validation.rubric
+    (LLM-graded). Tool output format varies — `aider 0.86` vs `Aider v0.86`
+    — and predicting it with regex is fragile. The runner now reads only
+    cmd / label / timeout_s / ok_exit_codes. If `expect` is present in
+    legacy data, it's silently ignored.
+
     UX (per user directive — preview/confirm, never paste):
       - For each cmd: print `▶ Running: <cmd>` BEFORE running.
       - Show captured output beneath (collapsed if long).
-      - Inline ✓/✗ per-cmd result based on `expect` regex AND `ok_exit_codes`.
-      - At the end, summary table + "Submit captured output for grading? [Y/n]"
+      - Inline ✓/✗ per-cmd result based ONLY on `ok_exit_codes`.
+      - At the end, summary + "Submit captured output for grading? [Y/n]"
         unless `auto_confirm=True` (used by --yes flag and tests).
 
     Returns: CliCmdsRunSummary with the artifact ready for grader submission.
@@ -121,9 +135,9 @@ def run_cli_commands(
     for i, c in enumerate(normalized, 1):
         cmd = c["cmd"]
         label = c.get("label") or f"Command {i}"
-        expect = c.get("expect")
         ok_codes = set(c.get("ok_exit_codes") or [0])
         timeout = int(c.get("timeout_s") or timeout_per_cmd)
+        # `expect` field on legacy data is silently ignored (see docstring).
 
         if console:
             console.print(f"[bold]{i}/{len(normalized)}[/bold]  [cyan]{label}[/cyan]")
@@ -144,38 +158,19 @@ def run_cli_commands(
             stdout, stderr, exit_code = "", f"[skillslab] failed to launch: {e}", 127
         elapsed = time.time() - t0
 
-        # Combined text for `expect` regex matching (stdout+stderr both count —
-        # `aider --version` emits to stdout, but lots of CLIs use stderr for
-        # version lines, e.g. `python --version` historically).
         combined = stdout + ("\n" + stderr if stderr else "")
-
-        expect_match: bool | None = None
-        if expect:
-            try:
-                expect_match = bool(re.search(expect, combined))
-            except re.error as e:
-                # Bad regex from Creator — treat as missing, surface as ⚠
-                expect_match = False
-                combined += f"\n[skillslab] bad expect regex: {e}"
-
-        exit_ok = exit_code in ok_codes
-        # Pass requires BOTH expect match (if set) AND exit code OK.
-        cmd_passed = exit_ok and (expect_match is not False)
+        cmd_passed = exit_code in ok_codes
 
         if console:
             tail = combined.strip()
             if tail:
-                # Show first 8 lines of output; if longer, indicate truncation.
                 lines = tail.splitlines()
                 shown = "\n  ".join(lines[:8])
                 console.print(f"  {shown}")
                 if len(lines) > 8:
                     console.print(f"  [dim]... ({len(lines) - 8} more lines captured)[/dim]")
             mark = "[green]✓[/green]" if cmd_passed else "[red]✗[/red]"
-            bits = [f"exit={exit_code}", f"{elapsed:.1f}s"]
-            if expect:
-                bits.append(f"expect={'matched' if expect_match else 'no match'}")
-            console.print(f"  {mark} [dim]({', '.join(bits)})[/dim]")
+            console.print(f"  {mark} [dim](exit={exit_code}, {elapsed:.1f}s)[/dim]")
             console.print()
 
         if not cmd_passed:
@@ -183,9 +178,7 @@ def run_cli_commands(
 
         summary.results.append(CliCmdResult(
             cmd=cmd, stdout=stdout, stderr=stderr,
-            exit_code=exit_code,
-            expected_pattern=expect, expected_match=expect_match,
-            duration_s=elapsed,
+            exit_code=exit_code, duration_s=elapsed,
         ))
         chunks.append(
             f"--- ${cmd} (exit={exit_code}) ---\n"
@@ -195,14 +188,14 @@ def run_cli_commands(
     summary.captured_text = "\n".join(chunks).strip()
 
     if console:
-        passed = sum(1 for r in summary.results
-                     if (r.expected_match is not False) and r.exit_code in {0})
+        passed = sum(1 for r in summary.results if r.exit_code == 0)
         total = len(summary.results)
-        line = f"[bold]Summary:[/bold] {passed}/{total} commands passed"
+        line = f"[bold]Summary:[/bold] {passed}/{total} commands ran successfully"
         if summary.all_passed:
             console.print(f"[green]{line} ✓[/green]")
         else:
-            console.print(f"[yellow]{line} — some checks failed; submission will reflect that[/yellow]")
+            console.print(f"[yellow]{line} — some commands had non-zero exit; submission will reflect that[/yellow]")
+        console.print(f"[dim]Semantic grading happens on the LMS side via the rubric; the captured output above is what gets submitted.[/dim]")
         console.print()
 
     if not auto_confirm and console:

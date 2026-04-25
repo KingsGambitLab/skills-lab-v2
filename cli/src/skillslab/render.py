@@ -334,9 +334,63 @@ def step_to_markdown(
     rubric = validation.get("rubric") or validation.get("explanation_rubric") or ""
     must_contain = validation.get("must_contain") or []
     cli_check = validation.get("cli_check")
-    if cli_check or rubric or must_contain:
+    cli_commands = validation.get("cli_commands") or []
+    gha_check = validation.get("gha_workflow_check")
+    if cli_check or cli_commands or gha_check or rubric or must_contain:
         parts += ["", "## Acceptance (`skillslab check`)", ""]
-        if cli_check:
+        if cli_commands:
+            # 2026-04-25 v3 — CLI-walk v3 P1: every regenerated terminal_exercise
+            # has cli_commands in DB, the runner executes them at check-time,
+            # but the briefing never told the learner WHAT would run. This
+            # branch closes the discoverability gap. Each cmd renders as a
+            # labeled code block so `skillslab spec` is now a TRUE preview of
+            # what `skillslab check` will do.
+            parts += [
+                "When you run `skillslab check`, the CLI runs the following "
+                "commands on your machine, captures their output, and submits "
+                "the captured text to the LMS rubric grader. No copy-paste — "
+                "the CLI handles capture + submission.",
+                "",
+                f"**{len(cli_commands)} command{'s' if len(cli_commands) != 1 else ''} will run:**",
+                "",
+            ]
+            for i, c in enumerate(cli_commands, 1):
+                if isinstance(c, dict):
+                    label = c.get("label") or f"Command {i}"
+                    cmd = c.get("cmd", "")
+                else:
+                    label = f"Command {i}"
+                    cmd = str(c)
+                parts += [
+                    f"{i}. **{label}**",
+                    "   ```",
+                    f"   $ {cmd}",
+                    "   ```",
+                ]
+            parts += [
+                "",
+                "_Pass criterion: each command exits 0. Semantic grading "
+                "(did the output prove the skill?) is done by the LMS rubric "
+                "below on the captured text._",
+                "",
+            ]
+        elif gha_check:
+            # 2026-04-25 v3 — GHA-push capstone branch. Runner does git push,
+            # polls GHA, watches to conclusion, submits run URL. Briefing
+            # explains that flow + what the workflow file checks.
+            wf = gha_check.get("workflow_file", "lab-grade.yml")
+            expected = gha_check.get("expected_conclusion", "success")
+            parts += [
+                f"When you run `skillslab check` from inside your fork's clone, "
+                f"the CLI commits + pushes the current branch, waits for the "
+                f"`{wf}` workflow to complete on GitHub Actions, and submits "
+                f"the run URL to the LMS. Pass requires the run's conclusion "
+                f"to be `{expected}`.",
+                "",
+                "_No copy-paste of the run URL — the CLI captures it from `gh run view` and submits._",
+                "",
+            ]
+        elif cli_check:
             parts += [
                 "This step has a native CLI check. Run `skillslab check` to evaluate.",
                 "Spec:",

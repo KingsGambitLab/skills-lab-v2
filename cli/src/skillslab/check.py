@@ -442,6 +442,25 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
 
     # 0b) gha_workflow_check runner — push + watch + submit run URL
     if isinstance(gha_check, dict):
+        # 2026-04-25 v3 — `--paste <run-url>` short-circuit. CLI-walk v3 P2
+        # caught: the GHA-watch timeout error advertised "or pass --paste
+        # <run-url>" but --paste fed legacy _build_submission, not the GHA
+        # validator. Now: if `paste` looks like a GitHub Actions run URL
+        # AND the step has gha_workflow_check, skip push/watch and submit
+        # the URL directly to the LMS validator. Same dispatch path label
+        # for telemetry.
+        import re as _re
+        paste_str = (paste or "").strip()
+        if paste_str and _re.search(
+            r"https://github\.com/[^/]+/[^/]+/actions/runs/\d+",
+            paste_str,
+        ):
+            run_url = paste_str.splitlines()[0].strip()
+            if console:
+                console.print(f"[dim]Using --paste run URL directly (skipping push/watch): {run_url}[/dim]")
+            attach = _attach_debug_factory(run_url, accept_rc_val=0)
+            return attach(_bridge_validate(step, run_url, accept_rc=0),
+                           path="gha_push_watch:via_paste")
         from .cli_runners import run_gha_push_and_watch
         gha = run_gha_push_and_watch(gha_check, cwd=cwd, console=console)
         if not gha.ok or not gha.run_url:
@@ -453,8 +472,6 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
         # Submit the run URL as the "paste" — LMS grader (or _check_gha) will
         # hit the GitHub API to verify conclusion. SAME backend contract.
         attach = _attach_debug_factory(gha.run_url, accept_rc_val=0)
-        # Prefer the LMS bridge so the server records completion; fall back to
-        # the local _check_gha if the step has no LMS-side validator wired.
         return attach(_bridge_validate(step, gha.run_url, accept_rc=0),
                        path="gha_push_watch")
 

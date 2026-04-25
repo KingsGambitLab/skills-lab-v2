@@ -106,7 +106,7 @@ def build_prompt(
         f" known to surface the rendering issues)."
     ) if sample_step_id else "Pick any meaty terminal_exercise step to render."
 
-    return f"""You are a beginner-level CLI user (1-2 yrs of terminal experience, never used `skillslab` CLI before) walking through the Docker container CLI to validate UX. Your job: find friction points a real learner would hit. You are NOT a developer reviewing code — you are a learner trying to do an assignment.
+    return f"""You are a beginner-level CLI user (1-2 yrs of terminal experience, never used `skillslab` CLI before) walking through the Docker container CLI to validate UX. Your job: find friction points a real learner would hit. You are NOT a developer reviewing code (except in the STATIC-INVARIANT sections explicitly below) — you are a learner trying to do an assignment.
 
 ## CONTEXT
 
@@ -119,6 +119,117 @@ def build_prompt(
 - Docker image `skillslab:latest` is pre-built. `cli/docker-compose.yml` is the
   compose entrypoint. `cli/bin/skillslab` is the host launcher script.
 - {sample_pin}
+
+## EXPLICIT INVARIANTS (run BEFORE the behavioral walk)
+
+The user has caught too many issues live that the previous walks missed.
+These are mandatory STATIC checks — fast, deterministic, structural.
+Most are grep / source-read / DB-scan; a few exec real commands.
+Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, etc.)
+
+### I. Command-name integrity
+
+**I1.** Extract every `skillslab <CMD>` reference from CLI user-facing strings
+       (panels, help text, error messages, docstrings). Sources to grep:
+         - cli/src/skillslab/cli.py
+         - cli/src/skillslab/check.py
+         - cli/src/skillslab/cli_runners.py
+         - cli/src/skillslab/render.py
+       Run: `grep -hoE "skillslab [a-z][a-z\\-]+" {repo_root}/cli/src/skillslab/*.py | sort -u`
+       Then list every Click-registered command via:
+         `python3 -c "import sys; sys.path.insert(0, '{repo_root}/cli/src'); from skillslab.cli import cli; print('\\n'.join(sorted(cli.commands)))"`
+       FAIL if any referenced `skillslab <CMD>` is not in the registered set.
+       (v3 missed: `skillslab progress` was an unknown command.)
+
+### II. URL precision (deeplink correctness)
+
+**II1.** Pick a known web step (e.g. {course_slug} M1.S1, exercise_type=concept).
+       Render via Path C, extract the dashboard URL emitted by `_print_web_pointer`.
+       Verify it has the 3-part form `#<courseId>/<moduleId>/<stepIdx>` (NOT
+       just `#<courseId>` which lands on stale cursor).
+       Cross-check moduleId + stepIdx against the actual step you targeted —
+       parse like the frontend's `parseHash` would.
+       (v3 missed: web-step URL was `#<courseId>` only → user landed on M0.S1
+       when they were on M1.S1.)
+
+### III. cli_commands runner integrity
+
+**III1.** For 3 sample terminal_exercise steps (cover M0, mid, capstone),
+       extract `validation.cli_commands` via API. For EACH cmd:
+         - Run it with `subprocess.run(cmd, shell=True, ...)` against the
+           current container's tools (PATH C does this from the host's
+           Python — agent confirms each cmd actually executes cleanly).
+         - Verify exit_code == 0 OR cmd intentionally tests failure.
+         - Verify the cmd uses CORRECT model invocations: bare
+           `moonshotai/kimi-k2` is FORBIDDEN; must be
+           `openrouter/moonshotai/kimi-k2-0905`. claude-code course uses
+           `claude /login`, `claude --version`, `claude -p`, etc.
+       FAIL if any cmd produces non-zero exit OR uses forbidden invocation.
+       (v3+live missed: `[Aa]ider v\\d+\\.\\d+` regex didn't match real
+       `aider 0.86.2` output; `aider --model moonshotai/kimi-k2` failed
+       litellm.BadRequestError.)
+
+### IV. Renderer/grader alignment
+
+**IV1.** Read `cli/src/skillslab/render.py:step_to_markdown`. For each grading
+       primitive in the validation schema, verify there's a render branch:
+         - cli_commands     → must have a section listing each cmd in the rendered MD
+         - gha_workflow_check → must mention push/watch flow
+         - cli_check        → must show YAML spec
+         - rubric           → must show rubric criteria
+         - must_contain     → must show evidence-token list
+       FAIL if any primitive has no render branch (briefing won't preview
+       what `skillslab check` will do).
+       (v3 caught the cli_commands gap as P1; v4 should keep this invariant.)
+
+### V. Stale-string sweep
+
+**V1.** Grep CLI source for terms that should be retired post-rename:
+         - `\\baie\\b` (the slug, NOT inside `_SLUG_ALIASES` map or backwards-compat
+           comments) — anywhere user-facing should say `claude-code` instead.
+         - `host\\.docker\\.internal` (in URL emission paths — use web_url() instead)
+         - `paste your output` / `copy and paste` / `pastes? two complete` /
+           `final paste` / `pasted output` (in user-facing prose for
+           terminal_exercise — terminal-first means no paste verbiage).
+       FAIL with file:line for each match in user-facing context.
+       (v3 missed: `--course aie` in --help text. Live missed: "next terminal step".)
+
+### VI. Surface-bias prose
+
+**VI1.** Scan pointer / CTA texts for surface-presupposing phrases when the
+       next step's surface might be either:
+         - "next terminal step" (assumes terminal)
+         - "back to the dashboard" (assumes web)
+         - "in your browser" without an "if web" qualifier
+       FAIL with the verbatim phrase + file:line.
+       (Live missed: "advance to the next terminal step" — user caught it.)
+
+### VII. Flag wiring (every advertised flag must be implemented)
+
+**VII1.** Grep CLI source for advertised flags in error messages, help text,
+       comments, panel content:
+         `grep -hE -- "--[a-z][a-z\\-]+" {repo_root}/cli/src/skillslab/*.py | sort -u`
+       For each flag, verify it's registered via @click.option somewhere
+       AND that the consuming code path actually USES the value.
+       FAIL on any advertised flag with no consumer.
+       (v3 caught `--paste <run-url>` advertised but not wired to GHA runner.)
+
+### VIII. Surface immutability (DB scan)
+
+**VIII1.** Scan ALL steps in {course_id}: assert `learner_surface` is
+        consistent with exercise_type per `backend/learner_surface.py`'s
+        ALWAYS_WEB / ALWAYS_TERMINAL sets. Any mismatch is a structural bug.
+       (v3 caught the M0.S3 scenario_branch=terminal bug; the immutable rule
+       fix was added; this invariant ensures it stays enforced.)
+
+### IX. Static smoke: cli_runners imports + no syntax errors
+
+**IX1.** `python3 -m py_compile cli/src/skillslab/{{cli,check,cli_runners,render,state}}.py`
+       FAIL on any non-zero exit.
+
+After running I-IX, proceed to the BEHAVIORAL WALK below. The static
+invariants run in <30s; no LLM cost. Fail-fast on these — don't waste
+walk time on a CLI with structural bugs.
 
 ## HOW TO RUN THE CLI (pick whichever path is cleanest)
 

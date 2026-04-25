@@ -124,7 +124,7 @@ def _get_course_id_or_die(slug: str) -> str:
 
 @click.group(context_settings={"help_option_names": ["-h", "--help"]})
 @click.version_option(__version__, prog_name="skillslab")
-@click.option("--course", default=None, help="Course slug (kimi / aie / jspring) — also via per-course wrapper")
+@click.option("--course", default=None, help="Course slug (kimi / claude-code / jspring) — also via per-course wrapper. `aie` is a deprecated alias for `claude-code`.")
 @click.pass_context
 def cli(ctx: click.Context, course: str | None):
     """Skills Lab — AI-augmented engineering courses, in your terminal."""
@@ -568,13 +568,37 @@ def _print_next_actions(actions: list[tuple[str, str]]) -> None:
     if not actions:
         return
     # Primary action: boxed panel with bold command (cannot be missed).
+    # 2026-04-25 v3 — explicit `$ ` prompt prefix in front of the primary
+    # command so it visually reads "type this at your shell prompt." Plus
+    # secondary actions render command-FIRST so the typeable command is the
+    # leftmost token on each row (was verb-first → command buried).
+    # User-filed: "make skillslab spec more clear as the next line user
+    # should type."
     primary_verb, primary_cmd = actions[0]
-    body_lines = [f"[bold cyan]{primary_cmd}[/bold cyan]"]
+    is_typeable = (
+        not primary_cmd.startswith("#")
+        and not primary_cmd.startswith("[link=")
+        and not primary_cmd.startswith("http")
+    )
+    if is_typeable:
+        body_lines = [f"[dim]$[/dim] [bold cyan]{primary_cmd}[/bold cyan]"]
+    else:
+        body_lines = [f"[bold cyan]{primary_cmd}[/bold cyan]"]
     if len(actions) > 1:
         body_lines.append("")
         body_lines.append("[dim]then:[/dim]")
         for verb, cmd in actions[1:]:
-            body_lines.append(f"  [cyan]{verb}[/cyan]   [dim]{cmd}[/dim]")
+            cmd_typeable = (
+                not cmd.startswith("#")
+                and not cmd.startswith("[link=")
+                and not cmd.startswith("http")
+            )
+            if cmd_typeable:
+                # COMMAND first (left-aligned), description in dim parens to the right
+                body_lines.append(f"  [cyan]{cmd}[/cyan]  [dim]— {verb}[/dim]")
+            else:
+                # Non-typeable hint (URL or shell-comment) — verb first
+                body_lines.append(f"  [cyan]{verb}[/cyan]   [dim]{cmd}[/dim]")
     console.print()
     console.print(Panel(
         "\n".join(body_lines),
