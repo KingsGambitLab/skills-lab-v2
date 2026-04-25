@@ -1,5 +1,64 @@
 # Skills Lab v2 — AI LMS Platform
 
+## 🎨 RENDERING LAYER OWNS TYPOGRAPHY — NOT THE CREATOR (2026-04-25)
+
+**User directive (verbatim, 2026-04-25):** *"How can we improve the data presentation here? The indentation is broken + too much context. Fix the root cause, don't fix symptoms. Add to claude.md and follow here."*
+
+**The principle**: the front-end CSS is responsible for VERTICAL RHYTHM,
+SPACING, and DENSITY CONTROL of every concept-content artifact. The
+LLM-Creator emits semantic HTML (`<h2>`, `<ol>`, `<pre>`, `<table>`,
+`<blockquote>`); the renderer makes it readable. Inconsistent margins
+or jammed elements emitted by the Creator MUST be normalized by CSS,
+NEVER by re-prompting the LLM to "add more breaks."
+
+**Why this is a structural rule (not a one-off polish task)**: every time
+the Creator emits a new shape (a new tech, a new layout pattern), it
+will produce slightly-different HTML. The reactive fix path ("the LLM
+forgot a break, regen with feedback") is a symptom-chasing tar pit —
+identical to the verified-facts blocklist trap (see §F3 v8.7). The
+structural fix is the same shape: ENFORCE the invariant at the layer
+that owns the concern (CSS for typography, schema for tech facts).
+
+**What the rendering layer MUST guarantee for `.step-content` /
+`.concept-content` descendants**:
+
+1. **Vertical rhythm** — `h2/h3` get `margin-top: 28px`, `h4` gets 22,
+   `p` gets `0 0 14px`, `ol/ul` get `14px 0 18px`. Adjacent-sibling
+   selectors smooth list→heading transitions (`ol + h3 { margin-top:
+   32px }`).
+2. **Code-block density cap** — `pre` is `max-height: 360px;
+   overflow: auto`. A 50-line tool_use JSON block can no longer eat
+   the whole viewport. Inline `<code>` is left at natural width.
+3. **List spacing** — `li { margin-bottom: 6px }` so 5-item lists
+   breathe without the LLM having to add `<br>` tags.
+4. **Boundary trimming** — `> *:first-child { margin-top: 0 }` and
+   `> *:last-child { margin-bottom: 0 }` strip phantom space at the
+   container edges, regardless of which element the Creator chose to
+   start/end with.
+5. **Tables, blockquotes, paragraphs after lists** — all get explicit
+   margins. Same principle: the Creator can emit any combination, the
+   renderer makes it readable.
+
+**What the Creator does NOT have to manage**: line breaks between
+sections, inter-paragraph margins, code-block scrolling, table-cell
+padding, list-item spacing. That's all CSS now.
+
+**What the Creator IS still responsible for**: SEMANTIC structure —
+using `<h3>` for sub-headings (not `<p><strong>`), wrapping examples
+in `<pre><code>` (not raw `<div>` with whitespace), using `<ol>` for
+numbered steps (not `1. text<br>`). The renderer can only make
+semantic HTML rhythm correctly; if the Creator emits `<div>` soup, no
+amount of CSS will rescue it.
+
+**Adding new content patterns**: when a new layout pattern lands (e.g.
+two-column compare blocks, stat-callouts, inline diagram explanations),
+extend the `.step-content` / `.concept-content` typography block in
+`frontend/index.html` rather than asking the Creator to add inline
+styles. Inline styles are course-content drift; CSS is content-shape
+contract.
+
+---
+
 ## 🚢 SHIP-AS-YOU-WIN — commit + push after every major upgrade or successful win (2026-04-25)
 
 **User directive (verbatim, 2026-04-25):** *"After every successful major upgrade / win — commit to github."*

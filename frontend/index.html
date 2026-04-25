@@ -538,6 +538,145 @@ body.catalog-mode .content-scroll {
 .step-content { animation: fadeIn 0.25s ease; }
 @keyframes fadeIn { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
 
+/* 2026-04-25 — STEP-CONTENT TYPOGRAPHY INVARIANTS (root-cause fix per
+ * CLAUDE.md "rendering layer owns typography"). User screenshot caught
+ * Kimi M5.S1 dispatch-pattern teaching with: numbered list jammed
+ * directly into a following <h3>, no paragraph breaks between sections,
+ * code block consuming the whole viewport. The Creator's emitted HTML
+ * had inconsistent margins; the renderer was dumping it raw. The
+ * rendering layer is responsible for VERTICAL RHYTHM regardless of what
+ * HTML the Creator emits. Targets BOTH .step-content (everywhere) and
+ * .concept-content (concept-step body specifically). */
+.step-content h2,
+.step-content h3,
+.concept-content h2,
+.concept-content h3 {
+  margin-top: 28px;
+  margin-bottom: 12px;
+  line-height: 1.3;
+}
+.step-content h4,
+.concept-content h4 {
+  margin-top: 22px;
+  margin-bottom: 10px;
+  line-height: 1.35;
+}
+.step-content h5,
+.step-content h6,
+.concept-content h5,
+.concept-content h6 {
+  margin-top: 18px;
+  margin-bottom: 8px;
+}
+.step-content p,
+.concept-content p {
+  margin: 0 0 14px;
+  line-height: 1.65;
+}
+/* Paragraph FOLLOWED by a list / heading / blockquote / preformatted —
+ * close the small gap so they don't double-space. */
+.step-content p + ol, .step-content p + ul,
+.concept-content p + ol, .concept-content p + ul {
+  margin-top: 0;
+}
+.step-content ol,
+.step-content ul,
+.concept-content ol,
+.concept-content ul {
+  margin: 14px 0 18px;
+  padding-left: 28px;
+  line-height: 1.65;
+}
+.step-content li,
+.concept-content li {
+  margin-bottom: 6px;
+}
+.step-content li > p:last-child,
+.concept-content li > p:last-child {
+  margin-bottom: 0;
+}
+/* List end → next heading: ensure breathing room. Without this, a
+ * numbered list ending step 5 ran straight into "Anthropic's tool_use
+ * blocks: Same semantics, different shape" with zero gap. */
+.step-content ol + h2, .step-content ol + h3, .step-content ol + h4,
+.step-content ul + h2, .step-content ul + h3, .step-content ul + h4,
+.concept-content ol + h2, .concept-content ol + h3, .concept-content ol + h4,
+.concept-content ul + h2, .concept-content ul + h3, .concept-content ul + h4 {
+  margin-top: 32px;
+}
+/* Code blocks (the "too much context" complaint): cap height + scroll.
+ * A 50-line tool_use JSON block was eating the whole viewport. Now caps
+ * at 360px with vertical scroll. Inline `<code>` left untouched. */
+.step-content pre,
+.concept-content pre {
+  max-height: 360px;
+  overflow: auto;
+  margin: 16px 0 22px;
+  padding: 14px 16px;
+  border-radius: 8px;
+  background: #0f1620;
+  border: 1px solid #2a3352;
+  font-size: 0.85rem;
+  line-height: 1.55;
+}
+.step-content pre code,
+.concept-content pre code {
+  background: transparent;
+  border: 0;
+  padding: 0;
+  font-size: inherit;
+  white-space: pre;
+}
+.step-content code:not(pre code),
+.concept-content code:not(pre code) {
+  background: rgba(74, 124, 255, 0.12);
+  border: 1px solid rgba(74, 124, 255, 0.25);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 0.88em;
+  color: #b8c8e8;
+}
+.step-content blockquote,
+.concept-content blockquote {
+  margin: 18px 0;
+  padding: 12px 18px;
+  border-left: 3px solid var(--accent);
+  background: rgba(74, 124, 255, 0.06);
+  color: var(--text-secondary);
+  border-radius: 0 6px 6px 0;
+}
+.step-content table,
+.concept-content table {
+  border-collapse: collapse;
+  margin: 18px 0;
+  width: 100%;
+  font-size: 0.9rem;
+}
+.step-content th, .step-content td,
+.concept-content th, .concept-content td {
+  padding: 10px 14px;
+  border-bottom: 1px solid #2a3352;
+  text-align: left;
+  vertical-align: top;
+}
+.step-content thead th,
+.concept-content thead th {
+  background: #1a2030;
+  font-weight: 600;
+  border-bottom: 2px solid #2a3352;
+}
+/* Trim leading/trailing whitespace at the boundaries — the Creator
+ * sometimes emits `<h2>` as the first child OR `<p>` as the last,
+ * which inherits its own top margin and creates phantom space. */
+.step-content > *:first-child,
+.concept-content > *:first-child {
+  margin-top: 0;
+}
+.step-content > *:last-child,
+.concept-content > *:last-child {
+  margin-bottom: 0;
+}
+
 .step-header {
   margin-bottom: 24px;
 }
