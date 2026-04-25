@@ -310,7 +310,10 @@ def run_gha_push_and_watch(
     if rc != 0:
         out.error = (
             f"Current directory `{cwd}` is not inside a git repository.\n"
-            "Run `skillslab clone --fork` first (clones the capstone repo + sets up your fork)."
+            "Fork the capstone repo on GitHub first, then clone YOUR fork:\n"
+            "  gh repo fork <upstream-url> --clone\n"
+            "  cd <repo-name>\n"
+            "Then re-run `skillslab check` from inside the clone."
         )
         if console:
             console.print(f"[red]✗ {out.error}[/red]")
@@ -321,8 +324,9 @@ def run_gha_push_and_watch(
     origin_out, _, rc = _git(["config", "--get", "remote.origin.url"], cwd=repo_root)
     if rc != 0:
         out.error = (
-            "No `origin` remote configured. Did you `skillslab clone --fork`?\n"
-            "If you cloned manually, set origin to YOUR fork (not upstream)."
+            "No `origin` remote configured. Re-clone via `gh repo fork "
+            "<upstream-url> --clone` (sets origin to your fork) OR set "
+            "origin manually to YOUR fork (not upstream)."
         )
         if console:
             console.print(f"[red]✗ {out.error}[/red]")

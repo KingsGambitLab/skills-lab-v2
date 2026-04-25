@@ -480,7 +480,7 @@ def _next_action(slug: str, meta: dict, step: dict | None,
       - cursor past last step → 🎉 course complete
       - current step is web → open browser + sync + next
       - current step is terminal:
-         - has module_repo + cwd not the clone → skillslab clone [--fork]
+         - has module_repo + cwd not the clone → `gh repo fork` / `git clone` (native)
          - has module_repo + cwd IS the clone → spec / edit / check
          - no module_repo (concept-only) → spec / next
     """
@@ -535,15 +535,18 @@ def _next_action(slug: str, meta: dict, step: dict | None,
         if _cwd_is_clone_of(repo_url):
             # Already inside the clone — straight to work
             actions.append(("Read briefing",   f"skillslab spec"))
-            actions.append(("Edit code",       f"# claude  /  aider --model openrouter/moonshotai/kimi-k2  /  vim ..."))
+            actions.append(("Edit code",       f"# claude  /  aider --model openrouter/moonshotai/kimi-k2-0905  /  vim ..."))
             actions.append(("Test locally",    f"# pytest -q   /   mvn -q test   /   ./gradlew test"))
             actions.append(("Grade + advance", f"skillslab check"))
         else:
-            # Need to clone first
-            actions.append(("Clone the module repo",
-                            f"skillslab clone --fork    # forks to your account, clones to /work/<repo>"))
-            actions.append(("Or just clone (no push)",
-                            f"skillslab clone           # read-only practice"))
+            # Need to clone first — point at the native GitHub/git commands
+            # directly. Capstone steps need push, so fork. Read-only practice
+            # uses git clone. (CLAUDE.md: "let the user interact with github
+            # directly; don't invent tech that is not needed".)
+            actions.append(("Fork + clone (capstone push needed)",
+                            f"gh repo fork {repo_url} --clone"))
+            actions.append(("Or just clone (read-only)",
+                            f"git clone {repo_url}.git"))
     else:
         # No module repo. Decide between:
         #   (a) pure concept / browser-companion → just read + advance
@@ -962,95 +965,20 @@ def goto(ctx, label, course):
     sys.exit(2)
 
 
-@cli.command()
-@click.option("--course", default=None)
-@click.option("--fork/--no-fork", default=False,
-              help="Fork the upstream repo to your account first (requires gh CLI authed).")
-@click.option("--dir", "target_dir", default=None,
-              help="Where to clone (default: /work/<repo-name>).")
-@click.pass_context
-def clone(ctx, course, fork, target_dir):
-    """Clone the current module's starter repo into your toolchain workspace.
-
-    Designed to run INSIDE the toolchain container — keeps learners
-    immersive without ever exiting to the host. Reads the current
-    cursor's `module_repo_url` (cached at `start` time), optionally
-    forks via `gh` CLI, clones into `/work/<repo-name>`, then prints
-    the cd command to enter it.
-
-    With --fork: requires `gh` (GitHub CLI) on PATH and `gh auth status`
-    showing logged-in. Forks the upstream to your account, clones THAT,
-    and sets the upstream remote so `git pull` against the original
-    branch still works.
-
-    Without --fork: clones the upstream directly (read-only practice).
-    For capstone steps that ask you to PUSH back, use --fork.
-    """
-    import shutil, subprocess, os
-    slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
-    meta, cur, step = _load_cursor(slug)
-    repo_url = step.get("module_repo_url")
-    repo_ref = step.get("module_repo_ref")
-    if not repo_url:
-        console.print("[yellow]Current module has no discoverable starter repo.[/yellow]")
-        console.print("[dim]Run `skillslab status` — module_repo line is shown if any.[/dim]")
-        sys.exit(1)
-
-    # Derive repo name from URL: tusharbisht/kimi-eng-course-repo → kimi-eng-course-repo
-    repo_name = repo_url.rstrip("/").rstrip(".git").rsplit("/", 1)[-1]
-    dest = Path(target_dir) if target_dir else Path("/work") / repo_name
-    if dest.exists():
-        console.print(f"[yellow]{dest}[/yellow] already exists — skipping clone.")
-        console.print(f"  cd {dest}")
-        return
-
-    if fork:
-        if not shutil.which("gh"):
-            console.print("[red]`gh` CLI not on PATH.[/red] Install gh inside the container "
-                          "(it ships with the latest skillslab image — rebuild via "
-                          "`docker compose build`).")
-            sys.exit(1)
-        # Verify auth
-        rc = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
-        if rc.returncode != 0:
-            console.print("[red]`gh` not authenticated.[/red] Run `gh auth login` "
-                          "(or set GITHUB_TOKEN env) before --fork.")
-            sys.exit(1)
-        console.print(f"[cyan]Forking[/cyan] {repo_url} to your account…")
-        # gh repo fork accepts the upstream URL; --clone clones the fork
-        gh_args = ["gh", "repo", "fork", repo_url, "--clone", "--remote", "--default-branch-only=false"]
-        if str(dest) != str(Path.cwd() / repo_name):
-            # gh fork doesn't take an explicit dest; clone to cwd then move
-            tmp_parent = dest.parent
-            tmp_parent.mkdir(parents=True, exist_ok=True)
-            os.chdir(tmp_parent)
-        r = subprocess.run(gh_args, text=True)
-        if r.returncode != 0:
-            console.print("[red]Fork failed.[/red] Try forking via the GitHub web UI then "
-                          "re-running `skillslab clone` (no --fork).")
-            sys.exit(1)
-        # gh clones to cwd/<repo-name> by default — that's our `dest`.
-    else:
-        dest.parent.mkdir(parents=True, exist_ok=True)
-        clone_url = repo_url if repo_url.endswith(".git") else repo_url + ".git"
-        r = subprocess.run(["git", "clone", clone_url, str(dest)], text=True)
-        if r.returncode != 0:
-            console.print(f"[red]git clone failed (rc={r.returncode}).[/red]")
-            sys.exit(1)
-
-    # If module specifies a branch, check it out
-    if repo_ref:
-        console.print(f"[cyan]Checking out branch[/cyan] {repo_ref}…")
-        subprocess.run(["git", "-C", str(dest), "fetch", "origin"], text=True)
-        subprocess.run(["git", "-C", str(dest), "checkout", repo_ref], text=True)
-
-    console.print(f"\n[green]✓ Ready[/green] at [bold]{dest}[/bold]")
-    console.print()
-    console.print("[bold]Next:[/bold]")
-    console.print(f"  cd {dest}")
-    console.print(f"  skillslab spec        # read the briefing")
-    console.print(f"  # ...edit code with claude / aider...")
-    console.print(f"  skillslab check       # grade + advance")
+# 2026-04-25 v6 — `skillslab clone` removed (user directive: "let the user
+# interact and work with github" + "don't invent tech that is not needed").
+#
+# The previous wrapper around `git clone` / `gh repo fork --clone` added no
+# real value over the native commands learners already need to know. The
+# briefing prose now points learners directly at the native commands:
+#   git clone <repo-url>             # read-only practice
+#   gh repo fork <repo-url> --clone  # fork to your account, push back
+# `_next_action`'s "no clone yet" branch surfaces both verbs as
+# secondary actions when the step has a module_repo_url.
+#
+# The `gha_workflow_check` runner (cli_runners.run_gha_push_and_watch)
+# stays — it orchestrates push + poll + URL submission as one flow,
+# which IS valuable abstraction; not a thin GitHub wrapper.
 
 
 @cli.command()

@@ -1494,13 +1494,21 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
         # learners NEED it to iterate. Structural split: by exercise-type.
         attempts_left = 2 - attempt_num + 1
         n_wrong = sum(1 for r in (item_results or []) if isinstance(r, dict) and not r.get("correct"))
-        # Code exercise + test-runner types: PRESERVE the raw grader feedback.
-        # These types don't produce `item_results` (no per-answer leak risk),
-        # and the grader's feedback string IS the failing-test names + stderr
-        # tail — that's what the learner needs to iterate.
-        if exercise_type in ("code_exercise", "code_read", "system_build"):
+        # Code exercise + test-runner + terminal_exercise types: PRESERVE the
+        # raw grader feedback. These types don't produce `item_results` (no
+        # per-answer leak risk), and the grader's feedback string IS the
+        # specific signal the learner needs to iterate:
+        #   - code_exercise / code_read / system_build: failing-test names + stderr tail
+        #   - terminal_exercise: "Your output is missing N of M expected markers" +
+        #     optional LLM-rubric criteria-specific feedback. CLI captured output
+        #     is execution signal (CLAUDE.md §"EXECUTION SIGNAL IS NOT AN ANSWER KEY").
+        # 2026-04-25: terminal_exercise added — user filed live that the
+        # generic "didn't match what the exercise expects" gave them no
+        # signal on which of the 3 must_contain markers (aider / Python 3.1
+        # / Kimi) was missing from their captured output.
+        if exercise_type in ("code_exercise", "code_read", "system_build", "terminal_exercise"):
             original_feedback = str(vresult.get("feedback") or "") or (
-                "Your submission didn't meet the hidden-test expectations. "
+                "Your submission didn't meet the grader expectations. "
                 "The runner didn't return a feedback string."
             )
             hint_feedback = (

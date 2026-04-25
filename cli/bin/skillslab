@@ -17,7 +17,7 @@
 #     skillslab                       # interactive shell inside container
 #     skillslab status                # one-shot subcommand (no shell)
 #     skillslab login
-#     skillslab clone --fork
+#     gh repo fork <upstream-url> --clone   # native, see step briefing
 #     skillslab spec
 #     skillslab check
 #
