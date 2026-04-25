@@ -463,9 +463,16 @@ def _cwd_is_clone_of(repo_url: str) -> bool:
         return False
 
 
-def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, str]]:
+def _next_action(slug: str, meta: dict, step: dict | None,
+                  caller: str | None = None) -> list[tuple[str, str]]:
     """Return a list of `(verb, command)` tuples the learner should run next.
     Always called from status/start/check/clone — keeps "what now?" omnipresent.
+
+    `caller` is the name of the command currently emitting the panel
+    ('spec' / 'next' / 'now' / 'status' / 'check'). When set, the helper
+    prunes any action whose primary command is the SAME as the caller —
+    a CTA that says "Read briefing  skillslab spec" right after the
+    learner DID `skillslab spec` is wasted ink. CLI-walk v4 P2.
 
     State tree:
       - no token → skillslab login
@@ -501,9 +508,16 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
         # this live: "Link missing". Now emit the dashboard URL as the primary
         # action (Rich [link=...] markup → clickable on modern terminals) and
         # the sync/next as a secondary follow-up.
+        # 2026-04-25 v4 — CLI-walk v4 caught this branch was building the URL
+        # from course_id ALONE, bypassing _browser_url(course_id, step) which
+        # is the canonical site for the 3-part deeplink. Result: clicking the
+        # CTA after `skillslab next` on a web step lands on a stale cursor
+        # instead of the actual current step (regression of the v3 live bug).
+        # Single URL-emission helper now wins: route ALL CTA URL builds
+        # through _browser_url() so module_id+step_pos precision flows.
         course_id = (meta or {}).get("course_id") or ""
         if course_id:
-            url = f"{state.web_url().rstrip('/')}/#{course_id}"
+            url = _browser_url(course_id, step)
             actions.append(("Open in browser (Cmd/Ctrl-click)",
                             f"[link={url}]{url}[/link]"))
         actions.append(("After completing in the browser",
@@ -550,6 +564,17 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
             actions.append(("Read briefing", f"skillslab spec"))
             actions.append(("Run + grade (CLI auto-runs the declared commands)",
                             f"skillslab check"))
+
+    # 2026-04-25 v4 P2 fix — caller-aware pruning. Drop any action whose
+    # primary command verb is the SAME as the calling command. After
+    # `skillslab spec` finishes, advertising "Read briefing  skillslab spec"
+    # as the next action is wasted ink. After `skillslab next` advances
+    # the cursor, advertising "Advance  skillslab next" is the same.
+    # Pruning promotes the next-best action to primary.
+    if caller and actions:
+        caller_token = f"skillslab {caller}"
+        actions = [(v, c) for (v, c) in actions
+                   if not c.strip().startswith(caller_token)]
     return actions
 
 
@@ -723,7 +748,7 @@ def status(ctx, course):
             # while next/now/spec got Panel highlighting. Same Panel
             # treatment here for visual consistency — every "what's next"
             # surfaces in a green-bordered Panel.
-            actions = _next_action(slug, meta, step)
+            actions = _next_action(slug, meta, step, caller="status")
             _print_next_actions(actions)
 
 
@@ -805,7 +830,9 @@ def spec(ctx, course, no_pager):
         console.print(Markdown(md_body))
 
     # Always end with the next-action hint so learners know what's coming.
-    actions = _next_action(slug, meta, step)
+    # caller="spec" prunes "Read briefing → skillslab spec" since they JUST
+    # did spec — promotes the actual next step (`check`) to primary.
+    actions = _next_action(slug, meta, step, caller="spec")
     _print_next_actions(actions)
 
 
@@ -846,7 +873,9 @@ def now_cmd(ctx, course):
         title_line += f"\n[dim]📦 module repo:[/dim] [cyan]{step['module_repo_url']}[/cyan]"
     console.print()
     console.print(Panel(title_line, border_style="cyan", box=box.ROUNDED, padding=(0, 1)))
-    actions = _next_action(slug, meta, step)
+    # caller="now" — `now` is itself an "answer the question" cmd, so we
+    # don't prune `now`, but we still pass the kwarg for symmetry/clarity.
+    actions = _next_action(slug, meta, step, caller="now")
     _print_next_actions(actions)
 
 
@@ -886,7 +915,8 @@ def next_cmd(ctx, course):
         f"[dim]step id:[/dim] [cyan]{s.get('id') or s.get('step_id')}[/cyan]"
     )
     # 2026-04-25 — replaced the dim-grey hint with a highlighted CTA panel.
-    actions = _next_action(slug, meta, s)
+    # caller="next" prunes "Advance → skillslab next" (they just advanced).
+    actions = _next_action(slug, meta, s, caller="next")
     _print_next_actions(actions)
     console.print()
 
@@ -1107,7 +1137,9 @@ def check(ctx, course, paste, cwd, verbose):
                 # post-pass message is one of the most-rewarded moments
                 # (learner just succeeded), so keeping it visually
                 # consistent reinforces the loop.
-                actions = _next_action(slug, meta, nxt)
+                # caller="check" prunes "Run + grade → skillslab check" —
+                # they just passed it; show the NEW step's actions.
+                actions = _next_action(slug, meta, nxt, caller="check")
                 _print_next_actions(actions)
             else:
                 console.print(f"\n[bold green]🎉 Course complete![/bold green]")
@@ -1213,7 +1245,12 @@ def dashboard(ctx, course):
     # this command. Both must use web_url().
     # 2026-04-25 v3 — wrap URL in Rich [link=...] markup so modern terminals
     # render it as Cmd/Ctrl-clickable. User-filed live walk request.
-    url = f"{state.web_url()}/#{cid}"
+    # 2026-04-25 v5 — route through _browser_url() so this site doesn't
+    # bypass the canonical URL helper. dashboard is course-level (no
+    # specific step in scope) so we pass an empty step dict; _browser_url's
+    # fallback path emits the 1-part `#<courseId>` form, which is correct
+    # for course-landing. CLI-walk v4 invariant II2 caught this bypass.
+    url = _browser_url(cid, {})
     console.print(f"  [link={url}]{url}[/link]   [dim](Cmd/Ctrl-click to open)[/dim]")
 
 

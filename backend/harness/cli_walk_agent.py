@@ -141,7 +141,7 @@ Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, e
        FAIL if any referenced `skillslab <CMD>` is not in the registered set.
        (v3 missed: `skillslab progress` was an unknown command.)
 
-### II. URL precision (deeplink correctness)
+### II. URL precision — every emission site routes through `_browser_url`
 
 **II1.** Pick a known web step (e.g. {course_slug} M1.S1, exercise_type=concept).
        Render via Path C, extract the dashboard URL emitted by `_print_web_pointer`.
@@ -149,8 +149,26 @@ Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, e
        just `#<courseId>` which lands on stale cursor).
        Cross-check moduleId + stepIdx against the actual step you targeted —
        parse like the frontend's `parseHash` would.
-       (v3 missed: web-step URL was `#<courseId>` only → user landed on M0.S1
-       when they were on M1.S1.)
+
+**II2.** **CALL-SITE AUDIT (v5)** — `_browser_url(course_id, step)` is the
+       canonical URL builder. Audit EVERY URL-emission site to ensure it
+       routes through this function. Bypass detection: any line that
+       constructs a URL with `web_url()` AND a literal `#` on the same
+       line is a candidate bypass. Run (a single command line; no
+       continuation):
+
+       ```bash
+       grep -nE 'web_url\\(\\).*#' cli/src/skillslab/*.py
+       ```
+
+       Should return ONLY lines inside `_browser_url`'s own body. Each
+       hit OUTSIDE that function is a URL-emission site that needs to
+       be migrated to `url = _browser_url(course_id, step_or_empty_dict)`.
+
+       (v4 caught: `_next_action` web branch built URL from course_id ALONE,
+       bypassing `_browser_url`. v5 caught a 3rd site at `dashboard` cmd.
+       Same precision-bug class repeated. v5+ must audit all sites, not
+       just verify the function is correct.)
 
 ### III. cli_commands runner integrity
 
