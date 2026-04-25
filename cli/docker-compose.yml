@@ -47,4 +47,13 @@ services:
       - ${HOME}/.skillslab:/root/.skillslab
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.aider:/root/.aider
+      # 2026-04-25 — bind-mount the cli source over the build-time COPY so
+      # `git pull` on the host instantly updates the in-container `skillslab`
+      # binary (because pip installed it editable to /skillslab-cli at build
+      # time). Without this, every cli code change required `docker compose
+      # build` to take effect — confusing user filed a stale image with
+      # missing surface badge + module repo line that had been shipped
+      # weeks earlier. The mount points at THIS docker-compose.yml's parent
+      # dir (= cli/) so it works whether the user runs from any cwd.
+      - ./:/skillslab-cli
     command: /bin/bash

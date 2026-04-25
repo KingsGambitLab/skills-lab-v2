@@ -63,10 +63,21 @@ RUN pip install --no-cache-dir \
     && pytest --version \
     && aider --version
 
-# ── Skillslab CLI itself (installed editable from the mounted source) ────
-# We copy the source tree at build time so the image is self-contained even
-# if the host pyproject changes between runs. `pip install -e .` keeps it
-# editable for devs who mount /skillslab-cli over the top.
+# ── Skillslab CLI itself ─────────────────────────────────────────────────
+# COPY at build time (so `docker run skillslab:latest` works standalone
+# without any volume mounts), THEN install editable from /skillslab-cli.
+#
+# Upgrade story (2026-04-25 — keep this in sync with the README):
+#   * Source-only changes (Python files under src/skillslab/): NO REBUILD
+#     needed if you `docker compose run` — docker-compose.yml bind-mounts
+#     `./:/skillslab-cli` over this build-time copy, so the in-container
+#     `skillslab` binary picks up host changes the moment you `git pull`.
+#   * Dependency changes (pyproject.toml, system deps in apt-get, npm
+#     packages, pinned aider/pytest versions): REBUILD with
+#     `docker compose build` so the new versions land.
+#
+# For ad-hoc `docker run skillslab:latest` (no compose), the build-time
+# copy is what runs — rebuild for any source change.
 COPY . /skillslab-cli
 RUN pip install --no-cache-dir -e /skillslab-cli \
     && skillslab --version
