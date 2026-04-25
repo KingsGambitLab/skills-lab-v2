@@ -1032,6 +1032,57 @@ Artifact path convention: `reviews/beginner_stream_walkthrough_<date>_<pass_tag>
 
 **Why this split matters**: wiring bugs affect EVERY course that uses the template. Regenerating the course doesn't fix them; the next course will hit the same wall. Wiring fixes are free + structural + propagate to every future course. Content-layer fixes need a regen for the specific course to inherit them.
 
+### Step 1.5 — CLI-Walk Agent (MANDATORY; blocking) — added 2026-04-25
+
+**User directive (verbatim, 2026-04-25):** *"Is there a way to run an agent to test out these flows? These are basic ones that should be easy to catch from a user pov."*
+
+The browser-walk gate (Step 1) catches browser-surface bugs. It does NOT exercise the `skillslab` CLI / Docker container surface. **Every UX bug in the CLI** — frontmatter dumps as one wrapped line, `host.docker.internal` hardcoded in a learner-facing URL, missing problem-statement section, terse `must_contain` bullets, `/work` polluted with cli source files, next-step CTA invisible — **reached the user because no automated walk exercises the CLI**. We had a structural blind spot: every UX layer needs its own walk.
+
+**The fix (2026-04-25):** any change touching `cli/src/skillslab/*` MUST pass a CLI-walk before merge. Mirror of the browser-walk pattern, but for the terminal surface. Use the harness shim — don't hand-author prompts.
+
+```python
+from backend.harness import cli_walk_agent
+prompt = cli_walk_agent.build_prompt(
+    course_id="created-698e6399e3ca",
+    course_title="Open-Source AI Coding: Aider + Kimi K2",
+    course_slug="kimi",
+    pass_tag="v1",
+    sample_step_id=85163,                 # pin to a specific known-failure step
+    user_filed_issues=[                   # optional — lets the agent verify
+        "frontmatter dumps as wrapped line",  #   each is closed in this iteration
+        "host.docker.internal in browser URL",
+        # ...
+    ],
+)
+# Then hand `prompt` to the Agent tool with subagent_type="general-purpose".
+```
+
+Artifact path convention: `reviews/cli_walk_<date>_<pass_tag>[_<slug>].md`. Bump `pass_tag` each iteration.
+
+**What it grades** (per command + per rendered step, with verbatim output):
+- Section A — `--help` discoverability across every subcommand (would a beginner know what each does?)
+- Section B — rendering correctness (frontmatter NOT visible as prose; no raw `—` / `‘` escapes; `## What to do` section present for terminal_exercise; `must_contain` bullets carry descriptions, not bare tokens)
+- Section C — next-step guidance (highlighted CTA after `next`, useful `now` panel, post-`check` instruction obvious)
+- Section D — browser URL correctness (web_url ≠ api_url; `localhost` in dev, FQDN in prod, override env honored)
+- Section E — launcher + work-dir cleanliness (running through `cli/bin/skillslab` from any host dir gives clean `/work`; running directly from `cli/` SHOULD pollute, confirming the launcher is the fix)
+- Section F — error recovery (no token, missing course, no paste — does each suggest the right next command?)
+- Section G — first-impression friction (what's a beginner's FIRST point of confusion?)
+
+Grades: ✅ clear · ⚠ works-but-noisy · ❌ confusing-or-broken. Verdict: SHIP / SHIP-WITH-FIXES / REJECT.
+
+**Approval criteria** (parallel to Step 1's table):
+
+| Outcome | Decision |
+|---|---|
+| All sections ✅; no friction worse than ⚠ on the user-filed-issues list | ✅ **APPROVE** — CLI change ready to merge |
+| ≥1 ❌ on rendering / browser URL / launcher / error-recovery sections | ❌ **REJECT** — fix the CLI / harness, re-run with `pass_tag=v2` |
+| Mixed: works but >2 ⚠ items | ⚠ **CONDITIONAL** — ship + queue follow-ups |
+
+**Approval loop** (mirror of Step 1):
+1. CLI change lands → 2. Spawn `cli_walk_agent` → 3. Read artifact → 4. If REJECT: triage, fix at the right layer (state config / cli command / render.py / docker-compose / launcher), re-run as v2 → 5. APPROVE → merge.
+
+**Why this is non-negotiable**: every UX bug filed by the user 2026-04-25 (4 explicit issues + 1 followup on `/work` pollution) was beginner-trivial — none required coding chops to spot. The CLI just needed a beginner pair of eyes. The harness gives us those eyes on every iteration.
+
 ### Step 2 — Solver harness (`tools/test_course.py`) (QUICK FAITH CHECK)
 
 Runs the deterministic + admin-access harness that confirms every exercise is gradable from canonical answers. Non-blocking but expected to be ≥95%.

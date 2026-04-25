@@ -2,16 +2,19 @@
 
 Exports reusable primitives for spawning test agents against generated courses.
 Current modules:
-  - beginner_agent: RL-style learner walkthrough prompt builder.
+  - beginner_agent: RL-style learner walkthrough prompt builder (BROWSER).
+  - cli_walk_agent: terminal-surface counterpart for CLI changes (TERMINAL).
   - domain_expert: senior-practitioner review prompt builder
     (v8 dual-agent gate for AI-enablement courses).
 """
 from .beginner_agent import build_prompt, ARTIFACT_DIR, default_artifact_path
+from . import cli_walk_agent
 from . import domain_expert
 
 __all__ = [
     "build_prompt",
     "ARTIFACT_DIR",
     "default_artifact_path",
+    "cli_walk_agent",
     "domain_expert",
 ]
