@@ -72,6 +72,29 @@ def all_courses() -> list[dict[str, Any]]:
     return _check(r) or []
 
 
+def get_course_content_etag(course_id: str) -> dict[str, Any] | None:
+    """Cheap stale-cache detection. The server returns a 16-char hash
+    that changes on ANY step content / metadata mutation in the course.
+    The CLI stores it at `start` time and re-checks on every `next` /
+    `spec` / `status`. If the etag drifted, `~/.skillslab/<slug>/` is
+    stale and the learner needs to refresh.
+
+    Returns None if the endpoint is missing (older server) or errored —
+    caller treats that as "etag check disabled, no warning."
+    """
+    try:
+        with _client(with_auth=False, timeout=8.0) as c:
+            r = c.get(f"/api/courses/{course_id}/content-etag")
+        if r.status_code != 200:
+            return None
+        body = r.json()
+        if not isinstance(body, dict) or "etag" not in body:
+            return None
+        return body
+    except Exception:
+        return None
+
+
 def enroll(course_id: str) -> dict[str, Any]:
     with _client() as c:
         r = c.post(f"/api/auth/enroll/{course_id}")

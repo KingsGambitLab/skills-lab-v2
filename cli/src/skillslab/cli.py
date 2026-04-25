@@ -367,12 +367,19 @@ def start(slug: str):
     # Set cursor to first incomplete step (heuristic: pick step 0 if no progress data;
     # otherwise pick first whose progress is incomplete via /api/progress/{cid})
     cursor_idx = 0
+    # 2026-04-25 v6 — capture content-etag at start time. _check_content_etag
+    # below compares this against the live server etag on every read; on
+    # mismatch, surfaces a clear "your local cache is stale, run skillslab
+    # start <slug>" warning so learners aren't reading old content.
+    etag_info = api.get_course_content_etag(cid)
     state.write_meta(slug, {
         "course_id": cid,
         "course_title": title,
         "steps": cursor_steps,
         "cursor": cursor_idx,
         "last_active_at": _now_iso(),
+        "content_etag": (etag_info or {}).get("etag"),
+        "content_etag_at": _now_iso(),
     })
 
     console.print(f"[green]✓ Wrote {written} step files to[/green] {cdir / 'steps'}")
@@ -400,6 +407,48 @@ def _load_cursor(slug: str) -> tuple[dict, int, dict]:
     cur = int(meta.get("cursor", 0))
     cur = max(0, min(cur, len(steps) - 1))
     return meta, cur, steps[cur] if steps else {}
+
+
+def _check_content_etag(slug: str, meta: dict) -> None:
+    """Compare local stored content_etag against live server etag. On
+    mismatch, print a single Rich panel warning telling the learner their
+    cache is stale + the exact command to refresh.
+
+    Silently no-op if:
+      - No etag stored locally (legacy meta.json from before v6)
+      - Server endpoint returns 404 / errors (older server, network issue)
+      - Etags match (cache is fresh)
+
+    2026-04-25 v6 — closes the stale-cache trap. User filed twice the
+    same day: M0.S2 spec rendered with old paste-flow shape after
+    render.py shipped cli_commands branch; M1.S3 cursor entry had
+    surface=terminal after DB auto-correction set it to web. Both times
+    the user only saw the new state after manually re-running
+    `skillslab start <slug>`. Now the CLI flags it on every read.
+    """
+    cached_etag = (meta or {}).get("content_etag")
+    if not cached_etag:
+        return  # legacy meta — no etag, nothing to compare
+    cid = (meta or {}).get("course_id")
+    if not cid:
+        return
+    info = api.get_course_content_etag(cid)
+    if not info or "etag" not in info:
+        return  # endpoint missing OR errored — silent no-op
+    live_etag = info["etag"]
+    if live_etag == cached_etag:
+        return  # cache is fresh
+    console.print()
+    console.print(Panel(
+        f"Course content has changed on the server since you ran "
+        f"[bold]skillslab start {slug}[/bold].\n\n"
+        f"[dim]cached:[/dim] [yellow]{cached_etag}[/yellow]    "
+        f"[dim]server:[/dim] [green]{live_etag}[/green]\n\n"
+        f"[bold]Run [cyan]skillslab start {slug}[/cyan] to refresh local "
+        f"cache (~/.skillslab/{slug}/).[/bold] Otherwise the briefing, "
+        f"acceptance criteria, and next-action panel may show stale data.",
+        title="⚠ Stale local cache", border_style="yellow", box=box.ROUNDED,
+    ))
 
 
 def _step_surface(step: dict) -> str:
@@ -701,6 +750,7 @@ def status(ctx, course):
     """Show current step + progress."""
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
+    _check_content_etag(slug, meta)  # warn if local cache is stale
     total = len(meta.get("steps", []))
     # Surface-aware progress summary: count terminal vs web steps so the
     # learner knows how many CLI-vs-browser hops the course has.
@@ -768,6 +818,7 @@ def spec(ctx, course, no_pager):
     """
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
+    _check_content_etag(slug, meta)  # warn if local cache is stale
     surface = _step_surface(step)
     p = state.course_dir(slug) / "steps" / step.get("filename", "")
     if not p.exists():
@@ -861,6 +912,7 @@ def now_cmd(ctx, course):
     # rewrote as user-facing prose with `\b` to preserve the example block.
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
+    _check_content_etag(slug, meta)  # warn if local cache is stale
     total = len(meta.get("steps", []))
     label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}" if step else "—"
     surface = _step_surface(step) if step else "?"
@@ -891,6 +943,7 @@ def next_cmd(ctx, course):
     meta = state.read_meta(slug)
     if not meta:
         console.print("[red]No active course state.[/red]"); sys.exit(2)
+    _check_content_etag(slug, meta)  # warn if local cache is stale
     cur = int(meta.get("cursor", 0))
     steps = meta.get("steps", [])
     if cur + 1 >= len(steps):

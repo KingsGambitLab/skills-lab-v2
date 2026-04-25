@@ -890,6 +890,63 @@ async def admin_get_course_raw(course_id: str, db: AsyncSession = Depends(get_db
     return out
 
 
+@app.get("/api/courses/{course_id}/content-etag")
+async def get_course_content_etag(course_id: str, db: AsyncSession = Depends(get_db)):
+    """Return a short hash that changes whenever any step content / metadata
+    in this course changes. The CLI compares this against the etag stored
+    at `start` time; on mismatch, it knows the local `~/.skillslab/<slug>/`
+    cache is stale and prompts (or auto-refreshes).
+
+    2026-04-25 v6 — added to close the stale-cache trap. User filed twice:
+    (a) M0.S2 spec render had old paste-flow shape after I shipped the
+    cli_commands branch in render.py; (b) M1.S3 cursor had stale
+    surface=terminal after I auto-corrected the DB to surface=web.
+    Both cases the user only saw the new state after manually re-running
+    `skillslab start <slug>`. Now the CLI checks etag on every command
+    that reads cached state and surfaces a clear refresh hint when stale.
+
+    Cheap query: SHA over (step.id, step.position, step.exercise_type,
+    step.learner_surface, sha256(step.content || ''), sha256(step.demo_data
+    || ''), sha256(step.validation || '')) for every step in the course.
+    Plus the course title / subtitle (so renames also invalidate).
+    """
+    import hashlib
+    import json as _json
+    course_row = (await db.execute(
+        select(Course).where(Course.id == course_id)
+    )).scalars().first()
+    if not course_row:
+        raise HTTPException(404, "Course not found")
+
+    # All steps in course-order
+    steps = (await db.execute(
+        select(Step.id, Step.position, Step.exercise_type, Step.learner_surface,
+               Step.content, Step.demo_data, Step.validation, Module.position.label("m_pos"))
+        .join(Module, Step.module_id == Module.id)
+        .where(Module.course_id == course_id)
+        .order_by(Module.position, Step.position)
+    )).all()
+
+    h = hashlib.sha256()
+    h.update((course_row.title or "").encode())
+    h.update(b"|")
+    h.update((course_row.subtitle or "").encode())
+    h.update(b"|")
+    for s in steps:
+        h.update(f"{s.id}|{s.m_pos}|{s.position}|{s.exercise_type}|{s.learner_surface}|".encode())
+        for fld in (s.content, s.demo_data, s.validation):
+            sub = hashlib.sha256()
+            sub.update((str(fld) if fld else "").encode())
+            h.update(sub.hexdigest().encode())
+            h.update(b"|")
+
+    return {
+        "course_id": course_id,
+        "etag": h.hexdigest()[:16],
+        "step_count": len(steps),
+    }
+
+
 @app.get("/api/courses/{course_id}/modules/{module_id}")
 async def get_module(course_id: str, module_id: int, db: AsyncSession = Depends(get_db)):
     result = await db.execute(
