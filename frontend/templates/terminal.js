@@ -61,16 +61,29 @@
 
   function renderDeps(list, deps) {
     list.innerHTML = '';
+    // 2026-04-25 — vendor-neutrality fix: added Aider/Moonshot/OpenRouter/Java
+    // labels so non-Anthropic BYO-key courses (Kimi, future Aider courses)
+    // render the right install hint per-dep without leaking Claude Code branding.
     const humanLabel = {
       anthropic_api_key: 'Anthropic API key (get one at console.anthropic.com)',
       claude_cli: 'Claude Code installed (`brew install anthropic-ai/claude/claude`)',
       claude_code: 'Claude Code installed (`brew install anthropic-ai/claude/claude`)',
+      // Vendor-neutral alternatives
+      openrouter_api_key: 'OpenRouter API key (free tier OK; openrouter.ai/keys)',
+      moonshot_api_key: 'Moonshot API key (platform.moonshot.ai)',
+      openai_api_key: 'API key for your provider (OpenRouter / Moonshot / OpenAI; exported as `OPENAI_API_KEY`)',
+      aider_cli: 'Aider installed (`uv tool install aider-chat` or `pipx install aider-chat`)',
+      // Other tooling
       docker: 'Docker running locally',
       git: 'git',
       git_clone: 'Local clone of the course starter repo',
       python: 'Python 3.11+',
       nodejs: 'Node.js 20+',
       node: 'Node.js 20+',
+      java: 'Java 21+ (Temurin recommended)',
+      maven: 'Maven 3.9+',
+      gradle: 'Gradle 8+',
+      uv: 'uv (`pip install uv`)',
       github_account: 'GitHub account + ability to push to a public fork',
       github_pat: 'GitHub Personal Access Token (read-only Actions scope)',
     };
@@ -125,8 +138,22 @@
     if (bootstrap) {
       const root = container.querySelector('[data-role="bootstrap"]');
       const codeEl = container.querySelector('[data-role="bootstrap-code"]');
+      const footEl = container.querySelector('[data-role="bootstrap-foot"]');
       if (root && codeEl) {
         codeEl.textContent = bootstrap;
+        // 2026-04-25 — vendor-neutral foot text. Was hard-coded "opens Claude
+        // Code" which leaked into the Kimi course. Now infers from byo_provider
+        // / dependencies what tool the bootstrap opens.
+        if (footEl) {
+          const deps = (data.dependencies || []).map(d => (typeof d === 'string') ? d : (d && d.kind) || '');
+          let tool = 'your AI coding tool';
+          if (data.byo_provider === 'claude_code' || deps.includes('claude_cli') || deps.includes('claude_code')) {
+            tool = 'Claude Code';
+          } else if (data.byo_provider === 'aider_kimi' || data.byo_provider === 'aider_generic' || deps.includes('aider_cli')) {
+            tool = 'Aider';
+          }
+          footEl.textContent = `One paste sets up your repo + branch + shell prompt + opens ${tool}.`;
+        }
         root.style.display = '';
         const copyBtn = container.querySelector('[data-action="copy-bootstrap"]');
         if (copyBtn) {
@@ -159,10 +186,45 @@
       }
     }
 
-    // BYO-key info panel
+    // BYO-key info panel — vendor-neutral.
+    // 2026-04-25: Kimi beginner reviewer flagged that the BYO panel + paste
+    // placeholder hard-coded "claude /login" + "$ claude --version" even on
+    // the Kimi (Aider+Moonshot) course. Now driven by data.byo_provider:
+    //   "claude_code"   → Claude Code via `claude /login` / ANTHROPIC_API_KEY
+    //   "aider_kimi"    → Aider via OPENAI_API_KEY (OpenRouter or Moonshot)
+    //   "aider_generic" → Aider against any OpenAI-compatible endpoint
+    //   "generic"       → "configure your tool per its docs" — vendor-blank
+    // If demo_data.byo_provider is missing, we infer from data.dependencies:
+    //   has anthropic_api_key OR claude_cli → claude_code
+    //   has openrouter_api_key OR moonshot_api_key OR aider_cli → aider_kimi
+    //   else generic
     if (data.byo_key_notice) {
       const info = container.querySelector('[data-role="byo-info"]');
-      if (info) info.style.display = '';
+      if (info) {
+        const deps = (data.dependencies || []).map(d => (typeof d === 'string') ? d : (d && d.kind) || '');
+        let provider = data.byo_provider || '';
+        if (!provider) {
+          if (deps.includes('anthropic_api_key') || deps.includes('claude_cli') || deps.includes('claude_code')) {
+            provider = 'claude_code';
+          } else if (deps.includes('openrouter_api_key') || deps.includes('moonshot_api_key') || deps.includes('aider_cli') || deps.includes('openai_api_key')) {
+            provider = 'aider_kimi';
+          } else {
+            provider = 'generic';
+          }
+        }
+        const copy = ({
+          claude_code: '<strong>Your key stays on your machine.</strong> Configure Claude Code with <code>claude /login</code> (or set <code>ANTHROPIC_API_KEY</code> in your shell). This page will never ask for your key.',
+          aider_kimi: '<strong>Your key stays on your machine.</strong> Configure Aider by exporting <code>OPENAI_API_KEY</code> in your shell — your OpenRouter (<code>sk-or-...</code>) or Moonshot (<code>sk-...</code>) key. This page will never ask for your key.',
+          aider_generic: '<strong>Your key stays on your machine.</strong> Configure Aider by exporting <code>OPENAI_API_KEY</code> for your provider (set <code>--openai-api-base</code> on the aider invocation). This page will never ask for your key.',
+          generic: '<strong>Your key stays on your machine.</strong> Configure your AI coding tool per its docs. This page will never ask for your key.',
+        })[provider] || ({
+          claude_code: 'Configure Claude Code with `claude /login`',
+        })['claude_code'];
+        // Replace the SECOND span (the prose) — keep the lock icon
+        const proseSpan = info.querySelectorAll('span');
+        if (proseSpan.length >= 2) proseSpan[1].innerHTML = copy;
+        info.style.display = '';
+      }
     }
 
     // Instructions

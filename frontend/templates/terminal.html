@@ -32,7 +32,7 @@
       <button type="button" class="tmpl-btn tmpl-btn-ghost tmpl-btn-compact" data-action="copy-bootstrap">Copy</button>
     </div>
     <pre class="tmpl-bootstrap-code" data-role="bootstrap-code"></pre>
-    <div class="tmpl-bootstrap-foot">One paste sets up your repo + branch + shell prompt + opens Claude Code.</div>
+    <div class="tmpl-bootstrap-foot" data-role="bootstrap-foot">One paste sets up your repo + branch + shell prompt + opens your AI coding tool.</div>
   </div>
 
   <!-- v8.6.1 SWITCHING: dependencies panel (what they need running) -->
@@ -67,10 +67,8 @@
       </div>
       <textarea class="tmpl-paste" data-role="paste" spellcheck="false"
                 autocomplete="off" autocorrect="off" autocapitalize="off"
-                placeholder="$ claude --version
-claude-code 1.x.x
-
-... full output goes here ..."></textarea>
+                placeholder="$ <run the command from the instructions above>
+<paste the full terminal output here ...>"></textarea>
     </div>
     <!-- STRUCTURED SLOTS: populated by JS when paste_slots provided -->
     <div data-role="paste-slots-container" style="display:none;"></div>

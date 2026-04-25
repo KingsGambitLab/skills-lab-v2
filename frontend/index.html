@@ -18,11 +18,11 @@
 <link rel="stylesheet" href="/templates/drag_drop.css?v=1.1.2">
 <link rel="stylesheet" href="/templates/code.css?v=1.1.2">
 <link rel="stylesheet" href="/templates/project.css?v=1.1.3">
-<link rel="stylesheet" href="/templates/terminal.css?v=1.1.2">
+<link rel="stylesheet" href="/templates/terminal.css?v=1.1.5">
 <script src="/templates/drag_drop.js?v=1.1.2" defer></script>
 <script src="/templates/code.js?v=1.1.2" defer></script>
 <script src="/templates/project.js?v=1.1.3" defer></script>
-<script src="/templates/terminal.js?v=1.1.2" defer></script>
+<script src="/templates/terminal.js?v=1.1.5" defer></script>
 <style>
 /* ===== CSS Variables ===== */
 :root {
@@ -4109,7 +4109,7 @@ window._sllTemplateHtmlCache = window._sllTemplateHtmlCache || {};
   // SllTemplateTerminal registers on boot. Prior version shipped terminal.html
   // in the HTML cache but never loaded the JS → dispatch fell through to the
   // narrative fallback (agent blocker P0.4 2026-04-24).
-  const TPL_VERSION = '1.1.4';
+  const TPL_VERSION = '1.1.5';
   names.forEach(n => {
     fetch(`/templates/${n}.html?v=${TPL_VERSION}`, {cache: 'force-cache'})
       .then(r => r.ok ? r.text() : Promise.reject(`HTTP ${r.status}`))
