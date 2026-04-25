@@ -440,7 +440,13 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
                         f"# Then run:  skillslab sync && skillslab next"))
         return actions
 
-    # Terminal-native step
+    # Terminal-native step. Three sub-paths depending on (a) whether the
+    # module has a repo, (b) whether cwd is inside that repo's clone.
+    # User-filed (2026-04-25): the previous catch-all branch told learners
+    # to "Edit work files in /work" for EVERY terminal_exercise without a
+    # module repo — but smoke-tests / BYO-key setup / preflight steps
+    # don't have files to edit. The flow is: read briefing → run shell
+    # commands → paste output. Differentiating now.
     if repo_url:
         if _cwd_is_clone_of(repo_url):
             # Already inside the clone — straight to work
@@ -455,13 +461,25 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
             actions.append(("Or just clone (no push)",
                             f"skillslab clone           # read-only practice"))
     else:
-        # Pure concept / no repo
+        # No module repo. Decide between:
+        #   (a) pure concept / browser-companion → just read + advance
+        #   (b) terminal_exercise that needs SHELL WORK (run commands, paste output)
+        #       e.g. M0.S2 smoke-test, M0.S1 BYO-key setup, status-check steps
+        #   (c) terminal_exercise with a `code` field (editable scratchpad)
         if step.get("exercise_type") in (None, "concept"):
             actions.append(("Read briefing", f"skillslab spec"))
             actions.append(("Advance",       f"skillslab next"))
-        else:
+        elif step.get("code"):
+            # Scratchpad-style: starter snippet shipped in the step itself
             actions.append(("Read briefing", f"skillslab spec"))
-            actions.append(("Edit work files in /work and grade",
+            actions.append(("Edit the snippet (it's printed in spec) and run locally", f"# vim / save your version"))
+            actions.append(("Paste output to grade", f"skillslab check"))
+        else:
+            # Smoke-test / setup / shell-only: no files to edit
+            actions.append(("Read briefing", f"skillslab spec"))
+            actions.append(("Run the commands shown in the briefing",
+                            f"# aider --version  /  claude --version  /  whatever the step asks"))
+            actions.append(("Paste output to grade",
                             f"skillslab check"))
     return actions
 
