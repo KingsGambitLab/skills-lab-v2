@@ -78,3 +78,62 @@ Lesson validated: **"Contrastive exemplars are ~5 tokens of counter-signal again
 ### Side win: language-agnostic reshape recovery
 
 The malformed-JSON regex recovery (`_unstringify` in `_reshape_flat_code_exercise`) is GENERIC — works for any language because the field names (`hidden_tests`, `solution_code`, `must_contain`, `requirements`, `hint`, `language`) are language-agnostic. Future LLM truncation / escape-bugs in any language's code_exercise will benefit.
+
+---
+
+## 2026-04-25 — surface classification (web vs terminal)
+
+### Brief
+
+Concept-shaped step (Kimi M0.S1, id=85138) with `<style>` + `<script>`
+widget content classified as `learner_surface=terminal` in DB. CLI then
+routed the learner into a paste-flow for a step that's purely a browser
+widget. Old classifier checked only `<script>`; resolver honored declared
+LLM value over the classifier for non-structural exercise types.
+
+### Question to Opus
+
+Three options:
+- (A) run the renderer's stripper, classify by what survives
+- (B) renderer manifest of supported features, mechanically derive
+- (C) ban free-form HTML in concept content, force registered slide types
+- (4th) don't store surface at all, derive on read
+
+### Verdict
+
+Opus: **A's mechanism + 4th's framing**. Run the stripper (single source
+of truth), make surface DERIVED from `(exercise_type, content)` rather
+than stored/declared. C is v9 north-star (too disruptive now). B is the
+right invariant; A is the right implementation per §EXECUTION IS GROUND
+TRUTH (don't enumerate, observe).
+
+### What landed
+
+- Created `backend/markdown_strip.py` — canonical browser-only stripper.
+- Updated `_resolve_learner_surface` to drop "honor declared values" path.
+- v4 classifier briefly used the renderer-derived approach.
+- **User overrode v4 with a much simpler rule (v5)**: `terminal_exercise`
+  → terminal, `system_build`+GHA → terminal, else → web. The user's
+  insight: surface follows GRADING SHAPE, not look-and-feel.
+- Backfilled all 85,166 steps with the v5 rule. 15 transitioned terminal
+  → web (concept widgets that were misclassified).
+- Step 85138 now correctly = web.
+
+### Adopted from Opus
+
+- The "stop trusting LLM-declared surface; the runtime is the source of
+  truth" framing.
+- The shared `markdown_strip.py` module — kept for the renderer's own
+  use even though v5 doesn't consult it for classification.
+- §EXECUTION IS GROUND TRUTH discipline: run, don't enumerate.
+
+### Net
+
+Buddy-Opus consult was useful for framing (drop declared, use runtime
+truth) but the user's directive simplified the implementation
+substantially. The renderer-derived approach was correct in principle
+but flapped on minor styling drift. The v5 grading-shape rule is robust
+because it depends only on shapes the system explicitly emits
+(exercise_type + validation keys), not on prose-content the LLM
+generates freely.
+

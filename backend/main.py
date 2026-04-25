@@ -8410,22 +8410,29 @@ with 15 user interviews" — completely different assignment):
 UNIVERSAL FIELD — add to EVERY JSON object you emit, regardless of exercise type:
   "learner_surface": "web"  OR  "terminal"
 
-Rules:
-  - Interactive widgets (drag-drop, simulators, voice/text mock interviews, click-the-bug,
-    multi-choice, drag-to-reorder, scenario-branch, adaptive-roleplay) → "web" — these
-    require browser execution.
-  - Code-writing on a CLI-eligible course (kimi-k2/aider, claude-code AIE, java spring-boot,
-    or any course where the learner uses `claude`/`aider`/`mvn`/`pytest`/`git` directly)
-    → "terminal" — covers terminal_exercise, system_build, code_exercise, code_read.
-  - Pure text concept (no <script> widget) on a CLI-eligible course → "terminal".
-  - All concepts on a non-CLI-eligible course → "web".
-  - When in doubt, "web". A web declaration is always safe; a wrong "terminal" declaration
-    sends the learner to a CLI they don't have.
+Rules (2026-04-25 v5 — three-line rule per user directive):
 
-This field declares which surface owns the END-TO-END learner experience for this step.
-The browser hides terminal-native steps behind a "open your terminal" pointer; the CLI
-hides web-native steps behind a "open in browser" pointer. Steps NEVER fragment across
-surfaces — pick ONE surface that completes the full assignment.
+  1. exercise_type == "terminal_exercise" → "terminal"
+     (cli_commands runner — multi-file work in a real repo)
+
+  2. exercise_type == "system_build" AND validation contains gha_workflow_check
+     → "terminal" (multi-file capstone graded by GitHub Actions)
+
+  3. EVERYTHING ELSE → "web"
+     This includes: concept (with or without <script>/<style>/<svg> widgets),
+     mcq, categorization, ordering, parsons, sjt, scenario_branch, code_review,
+     code_read, code_exercise (with Docker hidden_tests — single-file → web),
+     fill_in_blank, adaptive_roleplay, voice_mock_interview, simulator_loop,
+     incident_console, system_build with endpoint_check or rubric.
+
+The runtime resolver (_resolve_learner_surface) ENFORCES this rule structurally:
+your declared value is logged but NOT trusted if it disagrees with the rule.
+Match the rule or expect a WARNING in the gen log. Match the rule, the field is
+emitted as a sanity declaration; the rule is the source of truth either way.
+
+Why this matters: the browser hides terminal-native steps behind a "open your
+terminal" pointer; the CLI hides web-native steps behind a "open in browser"
+pointer. Wrong surface = learner is sent to the wrong UI for grading.
 
 Generate ONLY JSON (no fences):
 """

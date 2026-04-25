@@ -232,13 +232,26 @@ Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, e
        FAIL on any advertised flag with no consumer.
        (v3 caught `--paste <run-url>` advertised but not wired to GHA runner.)
 
-### VIII. Surface immutability (DB scan)
+### VIII. Surface drift (DB scan against the v5 simple rule)
 
-**VIII1.** Scan ALL steps in {course_id}: assert `learner_surface` is
-        consistent with exercise_type per `backend/learner_surface.py`'s
-        ALWAYS_WEB / ALWAYS_TERMINAL sets. Any mismatch is a structural bug.
-       (v3 caught the M0.S3 scenario_branch=terminal bug; the immutable rule
-       fix was added; this invariant ensures it stays enforced.)
+**VIII1.** Scan ALL steps in {course_id}: for each step, compute the
+        derived surface using the v5 rule (verbatim from
+        `backend/learner_surface.py:classify_step` 2026-04-25 v5):
+          - `terminal_exercise` → terminal (if course CLI-eligible)
+          - `system_build` with validation.gha_workflow_check present → terminal
+          - everything else → web
+        Compare derived value to `step.learner_surface` stored in DB. ANY
+        mismatch is a P0 — ship script would have routed the learner to
+        the wrong UI for grading.
+        (v3 caught M0.S3 scenario_branch=terminal; v4 caught style-widget
+        concept=terminal; v5 simple-rule kills the whole class.)
+
+**VIII2.** Cross-check the resolver code path. Confirm
+        `backend/main.py:_resolve_learner_surface` does NOT consult any
+        declared/LLM value for the final result (it should only LOG when
+        declared disagrees). FAIL if you see `return declared_norm` or
+        equivalent — the renderer/classifier is the source of truth, not
+        the LLM emission.
 
 ### IX. Static smoke: cli_runners imports + no syntax errors
 
