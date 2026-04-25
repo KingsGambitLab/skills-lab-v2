@@ -4109,7 +4109,7 @@ window._sllTemplateHtmlCache = window._sllTemplateHtmlCache || {};
   // SllTemplateTerminal registers on boot. Prior version shipped terminal.html
   // in the HTML cache but never loaded the JS → dispatch fell through to the
   // narrative fallback (agent blocker P0.4 2026-04-24).
-  const TPL_VERSION = '1.1.6';
+  const TPL_VERSION = '1.1.7';
   names.forEach(n => {
     fetch(`/templates/${n}.html?v=${TPL_VERSION}`, {cache: 'force-cache'})
       .then(r => r.ok ? r.text() : Promise.reject(`HTTP ${r.status}`))
@@ -4225,6 +4225,27 @@ function stepToTemplateData(step, type) {
     data.bootstrap_command = dd.bootstrap_command || '';
     data.dependencies = Array.isArray(dd.dependencies) ? dd.dependencies : [];
     data.paste_slots = Array.isArray(dd.paste_slots) ? dd.paste_slots : [];
+    // 2026-04-25 — byo_provider title heuristic. The terminal template uses
+    // byo_provider to render the right BYO-key copy ("Configure Aider via
+    // OPENAI_API_KEY" vs "Configure Claude Code via claude /login"). Creator
+    // doesn't always emit byo_provider on demo_data + dependencies are also
+    // often empty, so the template's dependency-driven inference falls
+    // through to vendor-blank "generic" copy. Layer a TITLE heuristic on top:
+    // course title / subtitle drives the provider when the step has neither
+    // explicit field. Generic — applies to any future Kimi/Aider/Claude course
+    // without needing per-step Creator emission.
+    data.byo_provider = dd.byo_provider || '';
+    if (!data.byo_provider) {
+      try {
+        const titleBlob = ((state.currentCourse && state.currentCourse.title) || '').toLowerCase()
+          + ' ' + ((state.currentCourse && state.currentCourse.subtitle) || '').toLowerCase();
+        if (/\b(kimi|aider|moonshot|open-source ai coding)\b/.test(titleBlob)) {
+          data.byo_provider = 'aider_kimi';
+        } else if (/\b(claude code|ai-augmented engineering|claude-code)\b/.test(titleBlob)) {
+          data.byo_provider = 'claude_code';
+        }
+      } catch (_) {}
+    }
     // step_slug defaults to "M<modIdx>.S<stepIdx>" if Creator didn't set one
     if (!dd.step_slug) {
       try {
