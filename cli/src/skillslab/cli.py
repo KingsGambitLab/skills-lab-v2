@@ -346,6 +346,14 @@ def start(slug: str):
                 # CLI-walk v1 caught the panel rendering "module:    type: ..."
                 # with empty module name.
                 "module_title": m_title,
+                # 2026-04-25 v3 — capture module_id so _browser_url can build
+                # a STEP-PRECISE deeplink (#courseId/moduleId/stepIdx). User
+                # caught a live bug: clicking the URL on M1.S1 (Why context
+                # is oxygen…) sent them to M0.S1 ("What this course IS…")
+                # because the URL only had #courseId, and the frontend's
+                # cursor was elsewhere. Frontend's parseHash supports the
+                # 3-part form; we just weren't building it.
+                "module_id": m.get("id"),
                 # Phase 3 (2026-04-25) — surface-aware split. Captured at
                 # `start` time so status/spec/check can dispatch by surface
                 # without refetching the step. NULL → 'web' default (legacy
@@ -578,17 +586,31 @@ def _print_next_actions(actions: list[tuple[str, str]]) -> None:
 
 
 def _browser_url(course_id: str, step: dict) -> str:
-    """Build the dashboard deeplink for a step. The web frontend's hash
-    router accepts `#<courseId>` and the active step is restored from the
-    last visited cursor — for a more precise link we'd want a step-id-based
-    deep route, but that lives in a separate router change.
+    """Build the dashboard deeplink for a step.
+
+    Frontend hash-router (frontend/index.html:parseHash) accepts:
+        #<courseId>                                  — open at last cursor
+        #<courseId>/<moduleId>                       — open at module first step
+        #<courseId>/<moduleId>/<stepIdx>             — open AT this step (0-indexed)
+
+    2026-04-25 v3 — User caught a live bug: clicking the printed URL while
+    on Kimi M1.S1 ("Why context is oxygen…") landed them on M0.S1 ("What
+    this course IS…") because we only emitted `#<courseId>`, and the
+    frontend restored from a stale cursor. Now we build the 3-part form
+    when we have module_id + step_pos in the cursor entry. Falls back to
+    the 1-part form for legacy state where module_id wasn't captured.
 
     Uses state.web_url() (NOT api_url()) because `host.docker.internal` only
     resolves inside the container; the learner's host browser needs
-    `localhost:8001` (dev) or the prod FQDN. See state.web_url() docstring
-    for the auto-derivation + override path.
+    `localhost:8001` (dev) or the prod FQDN.
     """
     base = state.web_url().rstrip("/")
+    module_id = step.get("module_id")
+    step_pos = step.get("step_pos")
+    if module_id is not None and step_pos is not None:
+        return f"{base}/#{course_id}/{module_id}/{step_pos}"
+    if module_id is not None:
+        return f"{base}/#{course_id}/{module_id}"
     return f"{base}/#{course_id}"
 
 
@@ -615,7 +637,7 @@ def _print_web_pointer(step: dict, course_id: str, action_verb: str = "see") -> 
         f"  [bold cyan][link={url}]{url}[/link][/bold cyan]\n\n"
         f"Navigate to [bold]{label} — {step.get('title','')[:60]}[/bold] in the dashboard.\n"
         f"When you finish, run [bold]skillslab progress[/bold] to refresh, "
-        f"then [bold]skillslab next[/bold] to advance to the next terminal step.",
+        f"then [bold]skillslab next[/bold] to advance to the next step.",
         title=f"WEB step  ·  {label}", border_style="magenta", box=box.ROUNDED,
     ))
 
@@ -1106,11 +1128,12 @@ def check(ctx, course, paste, cwd, verbose):
                           "+ grader response[/dim]")
 
 
-@cli.command(name="sync")
-@click.option("--course", default=None)
-@click.pass_context
-def sync_cmd(ctx, course):
-    """Sync progress from the LMS (in case you completed steps elsewhere)."""
+def _do_sync(ctx, course):
+    """Body shared by `sync` and `progress` commands. Extracted as a helper
+    so the two surface names (both used widely in user-facing prompts) can
+    share one implementation. 2026-04-25 v3 — user caught a live bug:
+    `skillslab progress` was an unknown command despite our pointer panel
+    telling learners to run it. Both names now resolve here."""
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta = state.read_meta(slug)
     if not meta:
@@ -1130,6 +1153,24 @@ def sync_cmd(ctx, course):
     console.print(f"[green]✓ Synced[/green] — {pct}% complete on the server")
     if mine.get("last_activity_at"):
         console.print(f"  last activity (any surface): [dim]{mine['last_activity_at']}[/dim]")
+
+
+@cli.command(name="sync")
+@click.option("--course", default=None)
+@click.pass_context
+def sync_cmd(ctx, course):
+    """Sync progress from the LMS (in case you completed steps elsewhere)."""
+    _do_sync(ctx, course)
+
+
+@cli.command(name="progress")
+@click.option("--course", default=None)
+@click.pass_context
+def progress_cmd(ctx, course):
+    """Sync progress from the LMS — alias for `sync`. Both names work; the
+    user-facing prompts (web-pointer panel, status messages) refer to
+    `skillslab progress` because that's the more learner-natural verb."""
+    _do_sync(ctx, course)
 
 
 @cli.command()
