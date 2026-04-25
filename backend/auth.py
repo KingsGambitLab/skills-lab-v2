@@ -377,12 +377,32 @@ async def my_drafts(request: Request, db: AsyncSession = Depends(get_db)):
 
 @router.get("/creator/courses/{course_id}/enrolled-learners")
 async def enrolled_learners(course_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """Return enrolled learners + per-module progress breakdown.
+
+    2026-04-25 — extended to include per-module step-completion counts so the
+    creator dashboard can show "M0 3/3 · M1 2/4 · M2 0/5 · …" per learner. The
+    caller authenticates via session cookie (creator/admin role required).
+    """
     user = await require_role("creator", "admin")(request)
     course = (await db.execute(select(Course).where(Course.id == course_id))).scalar_one_or_none()
     if course is None:
         raise HTTPException(404, "Course not found")
     if user.role != "admin" and course.creator_user_id != user.id:
         raise HTTPException(403, "You are not the creator of this course")
+
+    # Pull modules + step ids in one shot (course-wide).
+    from backend.database import Module, Step, UserProgress
+    modules = (await db.execute(
+        select(Module).where(Module.course_id == course_id).order_by(Module.position)
+    )).scalars().all()
+    module_steps: dict[int, list[int]] = {}
+    for m in modules:
+        sids = (await db.execute(
+            select(Step.id).where(Step.module_id == m.id).order_by(Step.position)
+        )).scalars().all()
+        module_steps[m.id] = list(sids)
+    total_steps = sum(len(v) for v in module_steps.values())
+
     enrollments = (await db.execute(
         select(Enrollment).where(Enrollment.course_id == course_id)
     )).scalars().all()
@@ -391,12 +411,41 @@ async def enrolled_learners(course_id: str, request: Request, db: AsyncSession =
         u = (await db.execute(select(User).where(User.id == e.user_id))).scalar_one_or_none()
         if u is None:
             continue
+        # Per-module completion count
+        progress_rows = (await db.execute(
+            select(UserProgress).where(
+                UserProgress.user_id == str(u.id),
+                UserProgress.completed == True,  # noqa: E712
+            )
+        )).scalars().all()
+        completed_step_ids = {p.step_id for p in progress_rows}
+        per_module = []
+        completed_total = 0
+        for m in modules:
+            sids = module_steps.get(m.id, [])
+            done = sum(1 for sid in sids if sid in completed_step_ids)
+            completed_total += done
+            per_module.append({
+                "module_id": m.id,
+                "position": m.position,
+                "title": m.title,
+                "completed": done,
+                "total": len(sids),
+            })
+        # Computed progress (in case enrollment.progress_percent is stale)
+        computed_pct = int(round(completed_total / total_steps * 100)) if total_steps else 0
         out.append({
             "user_id": u.id,
+            "email": u.email,
             "display_name": u.display_name or u.email,
-            "progress_percent": e.progress_percent,
+            "role": u.role,
+            "progress_percent": e.progress_percent or computed_pct,
+            "computed_progress_percent": computed_pct,
+            "completed_steps": completed_total,
+            "total_steps": total_steps,
+            "per_module": per_module,
             "enrolled_at": e.enrolled_at.isoformat() if e.enrolled_at else None,
             "last_active_at": e.last_active_at.isoformat() if e.last_active_at else None,
             "completed_at": e.completed_at.isoformat() if e.completed_at else None,
         })
-    return {"course_id": course_id, "learners": out}
+    return {"course_id": course_id, "course_title": course.title, "total_steps": total_steps, "learners": out}

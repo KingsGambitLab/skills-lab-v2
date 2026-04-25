@@ -1775,8 +1775,10 @@ def _collect_explanations(exercise_type: str, validation: dict) -> list[str] | N
 # ── Progress tracking ────────────────────────────────────────────────────
 
 @app.get("/api/progress/{course_id}", response_model=ProgressOut)
-async def get_progress(course_id: str, db: AsyncSession = Depends(get_db)):
-    user_id = "default"
+async def get_progress(course_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    # 2026-04-25 — same soft-auth pattern as /api/progress/complete
+    auth_user = getattr(request.state, "user", None)
+    user_id = str(auth_user.id) if auth_user else "default"
 
     # Get all modules + steps for this course
     mod_result = await db.execute(
@@ -1846,6 +1848,7 @@ async def get_progress(course_id: str, db: AsyncSession = Depends(get_db)):
 @app.post("/api/progress/complete")
 async def mark_step_complete(
     body: dict,
+    request: Request,
     db: AsyncSession = Depends(get_db),
 ):
     step_id = body.get("step_id")
@@ -1854,7 +1857,11 @@ async def mark_step_complete(
 
     score = body.get("score")
     response_data = body.get("response_data")
-    user_id = "default"
+    # 2026-04-25 — attribute progress to the logged-in user when possible.
+    # Soft auth: anonymous learners (no session cookie) still get tracked
+    # under "default" — back-compat with review agents + headless smoke tests.
+    auth_user = getattr(request.state, "user", None)
+    user_id = str(auth_user.id) if auth_user else "default"
 
     # Check step exists
     step_result = await db.execute(select(Step).where(Step.id == step_id))
@@ -1917,6 +1924,27 @@ async def mark_step_complete(
         )
         completed_count = len(prog_result.scalars().all())
 
+        # 2026-04-25 — keep Enrollment.progress_percent + last_active_at in
+        # sync with UserProgress so the creator-reports endpoint surfaces
+        # accurate per-learner progress without a heavy join. Only updates
+        # when an authenticated user (not anonymous "default") completes a
+        # step they're enrolled in.
+        if auth_user is not None:
+            from backend.database import Enrollment as _Enrollment
+            enrollment = (await db.execute(
+                select(_Enrollment).where(
+                    _Enrollment.user_id == auth_user.id,
+                    _Enrollment.course_id == course_id,
+                )
+            )).scalar_one_or_none()
+            if enrollment is not None:
+                new_pct = int(round(completed_count / total_steps * 100)) if total_steps else 0
+                enrollment.progress_percent = new_pct
+                enrollment.last_active_at = datetime.now()
+                if completed_count >= total_steps and enrollment.completed_at is None:
+                    enrollment.completed_at = datetime.now()
+                await db.flush()
+
         if completed_count >= total_steps:
             # Check if certificate already exists
             existing_cert = await db.execute(
@@ -1962,9 +1990,10 @@ async def mark_step_complete(
 
 
 @app.get("/api/certificates/{course_id}")
-async def get_certificate(course_id: str, db: AsyncSession = Depends(get_db)):
+async def get_certificate(course_id: str, request: Request, db: AsyncSession = Depends(get_db)):
     """Get certificate for a course if it exists."""
-    user_id = "default"
+    auth_user = getattr(request.state, "user", None)
+    user_id = str(auth_user.id) if auth_user else "default"
     result = await db.execute(
         select(Certificate).where(
             Certificate.user_id == user_id,
