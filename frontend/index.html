@@ -4482,6 +4482,95 @@ function createTemplateHandlers(step, index) {
 }
 
 
+// 2026-04-25 — Module-level repo banner.
+// User complaint: on Kimi M6.S4 (a code_review widget) there's no visible
+// link to the GitHub repo to fork. The fork URL only lives in
+// `demo_data.starter_repo` on M6.S2 (the "Fork module-6-capstone" step).
+// A learner on S4 has to remember/scroll back to S2.
+//
+// Per CLAUDE.md "RENDERING LAYER OWNS TYPOGRAPHY — NOT THE CREATOR":
+// the module-context banner is a rendering concern, not a Creator concern.
+// We scan every step in the current module for repo metadata; if found,
+// we render a sticky context banner above the step header on EVERY step
+// in the module so the learner can always see where the work happens.
+//
+// Discovery order (most-canonical first):
+//   1. step.demo_data.starter_repo  — structured (per CLAUDE.md F26)
+//      Shape: {url, ref?, description?}
+//   2. step.demo_data.bootstrap_command — extracts the repo + branch
+//   3. github URL grep on demo_data.instructions / step.content
+//      (legacy fallback for older course content)
+function _findModuleRepoMeta(steps) {
+  if (!Array.isArray(steps) || !steps.length) return null;
+  for (const s of steps) {
+    const dd = s.demo_data || {};
+    if (dd.starter_repo && typeof dd.starter_repo === 'object' && dd.starter_repo.url) {
+      return {
+        url: dd.starter_repo.url,
+        ref: dd.starter_repo.ref || null,
+        description: dd.starter_repo.description || null,
+        source_step_id: s.id,
+        source_step_title: s.title || '',
+      };
+    }
+  }
+  // Bootstrap command fallback: `git clone <url> ... [git checkout <branch>]`
+  for (const s of steps) {
+    const cmd = (s.demo_data && s.demo_data.bootstrap_command) || '';
+    const m = String(cmd).match(/git\s+clone\s+(\S+\.git)/);
+    if (m) {
+      const branchM = String(cmd).match(/git\s+checkout\s+([\w\-/]+)/);
+      return {
+        url: m[1].replace(/\.git$/, ''),
+        ref: branchM ? branchM[1] : null,
+        description: null,
+        source_step_id: s.id,
+        source_step_title: s.title || '',
+      };
+    }
+  }
+  // HTML grep fallback (legacy content):
+  for (const s of steps) {
+    const text = String((s.demo_data && s.demo_data.instructions) || '') + ' ' +
+                 String(s.content || '');
+    const m = text.match(/https?:\/\/github\.com\/([\w\-]+\/[\w\-]+)(?:\.git)?(?=[\s"'<>)]|$)/);
+    if (m) {
+      return {
+        url: 'https://github.com/' + m[1],
+        ref: null,
+        description: null,
+        source_step_id: s.id,
+        source_step_title: s.title || '',
+      };
+    }
+  }
+  return null;
+}
+
+function _renderModuleRepoBanner(repo) {
+  if (!repo || !repo.url) return '';
+  // Strip trailing .git if any leaked through, normalize display
+  const displayUrl = repo.url.replace(/\.git$/, '');
+  const repoSlug = displayUrl.replace(/^https?:\/\/github\.com\//, '');
+  const branch = repo.ref ? `<span style="margin-left:10px; padding:2px 8px; background:rgba(74,124,255,0.15); border:1px solid rgba(74,124,255,0.3); border-radius:4px; font-size:0.78rem; color:#a3c8ff;">branch: ${esc(repo.ref)}</span>` : '';
+  return `
+    <div style="background:#15203a; border:1px solid #2a3a5a; border-radius:8px; padding:10px 14px; margin-bottom:18px; display:flex; align-items:center; gap:12px; flex-wrap:wrap; font-size:0.9rem;">
+      <span style="font-size:1.05rem;">📦</span>
+      <span style="color:#8892a8; font-size:0.78rem; text-transform:uppercase; letter-spacing:0.5px; white-space:nowrap;">Module repo</span>
+      <a href="${esc(displayUrl)}" target="_blank" rel="noopener noreferrer"
+         style="color:#a3c8ff; text-decoration:none; font-family:var(--font-mono); font-size:0.88rem; flex:1; min-width:0; overflow:hidden; text-overflow:ellipsis; white-space:nowrap;">
+        ${esc(repoSlug)}
+      </a>
+      ${branch}
+      <button onclick="navigator.clipboard.writeText('${esc(displayUrl)}'); this.textContent='Copied ✓'; setTimeout(()=>this.textContent='Copy URL', 1500); return false;"
+              style="background:transparent; border:1px solid #2a3a5a; color:#8892a8; padding:3px 10px; border-radius:4px; cursor:pointer; font-size:0.78rem; white-space:nowrap;">
+        Copy URL
+      </button>
+    </div>
+  `;
+}
+
+
 // Phase 3 (2026-04-25) — surface-aware split. Render a pointer panel for
 // terminal-native steps so the browser doesn't try to half-baked a CLI
 // experience. Maps each course's slug to the per-course wrapper command
@@ -4537,8 +4626,15 @@ function renderTerminalNativePanel(rawStep, index) {
     ? rawStep.content
     : '';
 
+  // 2026-04-25 — also show module-level repo banner on terminal-native
+  // steps. Same context for capstone-module learners regardless of surface.
+  const _modSteps = (state.currentModuleData && state.currentModuleData.steps) || [];
+  const _modRepo = _findModuleRepoMeta(_modSteps);
+  const _repoBanner = _modRepo ? _renderModuleRepoBanner(_modRepo) : '';
+
   return `
     <div class="step-content">
+      ${_repoBanner}
       <div class="step-header">
         <div class="step-banner" style="background:#0f3460; color:#a3d8ff; padding:6px 12px; border-radius:6px; display:inline-block; font-size:13px; font-weight:600;">
           🖥  TERMINAL-NATIVE STEP
@@ -4626,6 +4722,19 @@ function renderStep(rawStep, index) {
   const courseId = state.currentCourse ? state.currentCourse.id : null;
 
   let html = '<div class="step-content">';
+
+  // 2026-04-25 — module-level repo banner. Persistent context: if any step
+  // in the current module declares a starter_repo (M.S2 "Fork ..." typically),
+  // surface it above the step header on EVERY step so the learner always
+  // knows where the work happens. Closes the user complaint where they were
+  // on M6.S4 (code_review) and couldn't see the fork URL without scrolling
+  // back to M6.S2.
+  const _moduleSteps = (state.currentModuleData && state.currentModuleData.steps) || [];
+  const _moduleRepo = _findModuleRepoMeta(_moduleSteps);
+  if (_moduleRepo) {
+    html += _renderModuleRepoBanner(_moduleRepo);
+  }
+
   html += `<div class="step-header">`;
   html += renderBanner(type);
   if (courseId) html += renderExpertiseHint(courseId);
