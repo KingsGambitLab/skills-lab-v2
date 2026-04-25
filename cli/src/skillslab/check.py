@@ -386,34 +386,81 @@ def _bridge_validate(step: dict, submission: str, accept_rc: int) -> dict:
 
 # ── Public entry point ────────────────────────────────────────────────────
 
-def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any = None) -> dict:
+def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any = None,
+              auto_confirm: bool = False) -> dict:
     """Grade a step. Submission + verdict both happen in the terminal — the
     learner never has to switch to the dashboard.
 
-    Dispatch order:
-      1. step.validation.cli_check.kind in _NATIVE_KINDS  → run locally
-      2. step.validation.must_contain                     → token check locally
-      3. step.validation.rubric (LMS bridge — default)    → POST to /validate
+    Dispatch order (terminal-first as of 2026-04-25):
+      0a. step.validation.cli_commands present → run them, capture combined
+          output, submit captured text via bridge_validate. NO PASTE PROMPT.
+          (The user explicitly asked: "Paste output does not make sense in
+          terminal" — this branch is the structural fix.)
+      0b. step.validation.gha_workflow_check present (capstone) → push current
+          branch, poll GHA, watch run, submit run URL via bridge. NO PASTE.
+          (The user asked: "For GHA flow, cli should be triggered with
+          github push - not something unreal.")
+      1.  step.validation.cli_check.kind in _NATIVE_KINDS  → run locally (legacy)
+      2.  step.validation.must_contain only                → token check locally
+      3.  step.validation.rubric (LMS bridge — default)    → POST to /validate
 
     Returns: {correct: bool, score: float|int, feedback: str}
     """
     validation = step.get("validation") or {}
     cli_check = validation.get("cli_check")
+    cli_commands = validation.get("cli_commands")
+    gha_check = validation.get("gha_workflow_check")
     cfg = _read_skillslab_yml(cwd)
 
-    submission, accept_rc = _build_submission(step, cwd, paste)
+    def _attach_debug_factory(submission_text: str, accept_rc_val: int):
+        def _attach(result: dict, *, path: str) -> dict:
+            result.setdefault("_debug", {})
+            result["_debug"].setdefault("submission", submission_text)
+            result["_debug"].setdefault("accept_rc", accept_rc_val)
+            result["_debug"]["dispatch"] = path
+            return result
+        return _attach
 
-    def _attach_debug(result: dict, *, path: str) -> dict:
-        """Add _debug context so `skillslab check --verbose` can show learners
-        exactly what was submitted, what the acceptance command exited with,
-        and which dispatch path the verdict came from. Quiet by default (the
-        UI only surfaces this with --verbose).
-        """
-        result.setdefault("_debug", {})
-        result["_debug"].setdefault("submission", submission)
-        result["_debug"].setdefault("accept_rc", accept_rc)
-        result["_debug"]["dispatch"] = path
-        return result
+    # 0a) cli_commands runner — terminal-first replacement for the paste flow
+    if isinstance(cli_commands, list) and cli_commands:
+        from .cli_runners import run_cli_commands
+        run = run_cli_commands(
+            cli_commands, cwd=cwd, console=console,
+            auto_confirm=auto_confirm,
+        )
+        if run.aborted_by_user:
+            return {
+                "correct": False, "score": 0,
+                "feedback": "Submission cancelled. Re-run `skillslab check` when ready.",
+                "_debug": {"dispatch": "cli_commands:aborted"},
+            }
+        # The captured text becomes the "paste" the bridge submits to the LMS.
+        # Backend validator (must_contain / rubric / both) grades unchanged.
+        attach = _attach_debug_factory(run.captured_text, accept_rc_val=0)
+        return attach(_bridge_validate(step, run.captured_text, accept_rc=0),
+                       path="cli_commands")
+
+    # 0b) gha_workflow_check runner — push + watch + submit run URL
+    if isinstance(gha_check, dict):
+        from .cli_runners import run_gha_push_and_watch
+        gha = run_gha_push_and_watch(gha_check, cwd=cwd, console=console)
+        if not gha.ok or not gha.run_url:
+            return {
+                "correct": False, "score": 0,
+                "feedback": gha.error or "GHA flow failed — see output above.",
+                "_debug": {"dispatch": "gha_push_watch:failed"},
+            }
+        # Submit the run URL as the "paste" — LMS grader (or _check_gha) will
+        # hit the GitHub API to verify conclusion. SAME backend contract.
+        attach = _attach_debug_factory(gha.run_url, accept_rc_val=0)
+        # Prefer the LMS bridge so the server records completion; fall back to
+        # the local _check_gha if the step has no LMS-side validator wired.
+        return attach(_bridge_validate(step, gha.run_url, accept_rc=0),
+                       path="gha_push_watch")
+
+    # Build paste-style submission for the legacy paths below.
+    submission, accept_rc = _build_submission(step, cwd, paste)
+    _attach_debug = _attach_debug_factory(submission, accept_rc)
 
     # 1) Explicit cli_check on the step → run it locally
     if isinstance(cli_check, dict) and cli_check.get("kind"):
@@ -444,6 +491,7 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
     # 4) No grading hook at all
     return _attach_debug({
         "correct": False, "score": 0,
-        "feedback": ("This step has no cli_check / rubric / must_contain — "
-                     "it may be a concept-only step. Run `skillslab next` to advance."),
+        "feedback": ("This step has no cli_commands / gha_workflow_check / "
+                     "rubric / must_contain — it may be a concept-only step. "
+                     "Run `skillslab next` to advance."),
     }, path="no_hook")

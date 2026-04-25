@@ -16,6 +16,11 @@ dependencies = [
 skillslab = "skillslab.cli:main"
 # Per-course wrappers — thin scripts that call the base CLI with --course=<slug>
 kimi-course = "skillslab.cli:_wrapper_kimi"
+# 2026-04-25 v3 — primary entry-point for the Claude Code course is now
+# `claude-code-course`. `aie-course` stays as a deprecated alias so anyone
+# who installed it pre-rename keeps working; both auto-canonicalize to the
+# claude-code slug inside the wrappers.
+claude-code-course = "skillslab.cli:_wrapper_claude_code"
 aie-course = "skillslab.cli:_wrapper_aie"
 jspring-course = "skillslab.cli:_wrapper_jspring"
 

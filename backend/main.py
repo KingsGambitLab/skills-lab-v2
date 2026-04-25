@@ -570,29 +570,53 @@ def _resolve_learner_surface(
 ) -> str:
     """Resolve a step's `learner_surface` value at persist time.
 
-    Order of precedence:
-      1. `declared` — value the LLM (or seed dict) emitted. If it normalizes
-         to 'web' / 'terminal', use it verbatim.
-      2. Heuristic from `learner_surface.classify_step()` — same heuristic the
-         backfill script uses, so a Creator that forgets the field falls back
-         to a sensible default rather than NULL.
+    2026-04-25 v3 — IMMUTABLE RULES OVERRIDE declared values. User caught a
+    live bug where Kimi M0.S3 (scenario_branch — interactive browser widget)
+    was tagged surface=terminal because the LLM hallucinated `learner_surface:
+    "terminal"` and we trusted it verbatim. The CLI then routed the learner
+    into a "run commands + paste output" flow for a step that has no
+    commands and only renders in the browser.
 
-    Always returns a valid value ('web' or 'terminal') — never None on the
-    persist path. NULL only exists in the DB for legacy rows pre-backfill.
+    Resolution order:
+      1. **Immutable rules** — for exercise types that are STRUCTURALLY
+         browser-only (scenario_branch, mcq, categorization, etc.) or
+         STRUCTURALLY terminal-only (terminal_exercise, system_build), the
+         classifier's mandate WINS over any declared value. The LLM does
+         not get to override structural facts.
+      2. `declared` — when the exercise type allows either surface
+         (concept, code_exercise, code_read), trust the LLM's declaration.
+      3. Classifier heuristic — same fallback as before.
 
-    Buddy-Opus pushed back on having any heuristic at runtime, but this is
-    the persist path — a one-time decision when the row is born. The
-    runtime read path (API responses) consults the declared value only.
+    Always returns a valid value. The contract is:
+      - Caller emitting a value that conflicts with structural rules: silently
+        corrected (logged at WARNING). The LLM doesn't see an error;
+        downstream consumers always see the right value.
     """
-    from .learner_surface import classify_step, is_cli_eligible_course, normalize
+    from .learner_surface import (
+        classify_step, is_cli_eligible_course, normalize,
+        _ALWAYS_WEB, _ALWAYS_TERMINAL,
+    )
     declared_norm = normalize(declared)
-    if declared_norm:
-        return declared_norm
-    return classify_step(
+    classified = classify_step(
         exercise_type=ex_type,
         content=content,
         course_cli_eligible=is_cli_eligible_course(course_title=course_title),
     )
+    # Immutable: structural exercise types pin their surface regardless
+    # of what the LLM declared.
+    is_structural = (ex_type in _ALWAYS_WEB) or (ex_type in _ALWAYS_TERMINAL)
+    if is_structural:
+        if declared_norm and declared_norm != classified:
+            logger.warning(
+                "learner_surface: declared %r conflicts with structural rule for "
+                "exercise_type=%r; forcing %r (the only valid surface for this type).",
+                declared_norm, ex_type, classified,
+            )
+        return classified
+    # Non-structural (course-dependent) types may honor the declared value.
+    if declared_norm:
+        return declared_norm
+    return classified
 
 
 def _sanitize_step_for_learner(step_dict: dict) -> dict:
@@ -8768,35 +8792,46 @@ ENGINEERING-CAPSTONE GENRE LOCK (non-negotiable):
 - If the course title has words like "Product", "Operations", "Strategy" — the capstone is STILL a coding deliverable. Those words describe the DOMAIN; the capstone is the CODE that ships.
 - Scenario consistency: use the SHARED SCENARIO (see === SHARED ... SCENARIO === block above) — company name, feature, stack — verbatim. Do not invent alternative names here."""
     elif step_type == "terminal_exercise":
-        # BYO-execution: learner runs commands in their OWN terminal, pastes output.
-        # We grade via LLM-rubric on the paste. Used for courses where the skill
-        # lives on the learner's workstation (Claude Code, kubectl, git, etc.).
+        # 2026-04-25 v2 — TERMINAL-FIRST. Learner runs the skillslab CLI; the
+        # CLI auto-runs the declared commands and submits captured output.
+        # NO copy-paste from terminal to browser. The web frontend renders a
+        # "open your skillslab CLI" pointer for these steps (no paste textarea).
         # SECURITY RULE (CLAUDE.md §HARD RULE): we NEVER collect or see API keys.
         prompt += """{
-  "content": "<HTML briefing, 150-300 words. Explain WHAT this exercise teaches + WHY it matters for real-world use of this tool. NO terminal commands in the briefing — those go in `demo_data.instructions`. Use styled cards (background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px;). Include a 'what you'll see' preview — one or two sentences on what success looks like. If Module 1 Step 1, include a compelling hook (the single coolest thing this tool does) so the learner feels urgency to install + try.>",
+  "content": "<HTML briefing, 150-300 words. Explain WHAT this exercise teaches + WHY it matters for real-world use of this tool. NO terminal commands in the briefing — those go in `demo_data.instructions` (for the learner to read) AND `validation.cli_commands` (for the CLI to auto-run). Use styled cards (background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px;). Include a 'what you'll see' preview — one or two sentences on what success looks like. If Module 1 Step 1, include a compelling hook so the learner feels urgency to install + try. CRITICAL: do NOT use the words 'paste' / 'copy and paste' / 'copy the output' anywhere — `skillslab check` runs the commands and submits captured output automatically. Use 'run `skillslab check`' instead.>",
   "demo_data": {
-    "instructions": "<HTML block with the EXACT commands the learner must run on their own machine. Use <pre><code>$ command here</code></pre> for every command. ALWAYS include: (1) what the command does, (2) what output they should expect, (3) common error + fix below each command. Example structure:\\n<h3>Step 1: Install</h3>\\n<pre><code>$ curl -fsSL https://claude.ai/install.sh | bash</code></pre>\\n<p>Expected: 'Claude Code installed. Run claude --version to verify.'</p>\\n<details><summary>Got EACCES error?</summary>Try <code>sudo -E curl ...</code></details>\\n<h3>Step 2: Verify</h3>\\n<pre><code>$ claude --version</code></pre>. PLATFORM-AWARE: if install varies by OS, use tab-like sections: <h4>macOS</h4>...<h4>Linux</h4>...<h4>Windows/WSL</h4>... Each with its own command block.>",
+    "instructions": "<HTML block describing what the learner is about to run, in human terms. Use <pre><code>$ command here</code></pre> for every command. ALWAYS include: (1) what each command does, (2) what output they should expect, (3) common error + fix below each command in <details>. PLATFORM-AWARE: if install varies by OS, use tab-like sections: <h4>macOS</h4>...<h4>Linux</h4>...<h4>Windows/WSL</h4>... Each with its own command block. The CLI uses `validation.cli_commands` (below) to actually execute — `instructions` is the human-readable teaching, `cli_commands` is the machine spec.>",
     "byo_key_notice": true,
-    "asciinema_url": "<OPTIONAL: path to a pre-recorded .cast file demo for this step. Omit unless a recording exists.>"
+    "asciinema_url": "<OPTIONAL: path to a pre-recorded .cast file demo. Omit unless a recording exists.>"
   },
   "validation": {
     "hint": "<One-line hint for stuck learners. E.g. 'If brew isn't installed, try the curl | bash path instead.'>",
-    "rubric": "<Grader rubric, 60-150 words. PLAIN ENGLISH describing what a CORRECT pasted output contains. Example for a `claude --version` step: 'The paste should show a version string like `claude-code 0.x.y`. Accept any version >=0.5. Partial credit (0.5) if the paste shows Claude Code successfully installed but no version command run. 0 if paste shows a different tool or an error.' The backend sends this rubric + paste to Claude, which returns 0-1 score. Be specific enough that an LLM can grade deterministically.>",
-    "must_contain": ["<LIST of substrings that MUST appear in the paste for it to count — the cheap first-pass check. For `claude --version`: [\\"claude\\"]. For `echo hi`: [\\"hi\\"]. Empty list = skip must_contain check. 1-3 items typical.>"]
+    "cli_commands": [
+      {
+        "cmd": "<EXACT shell command the CLI will execute on the learner's machine. Must be runnable AS-IS in the container's /work dir (or wherever the learner is). Example: 'aider --version' or 'claude --version' or 'aider --model openrouter/moonshotai/kimi-k2-0905 --message \"Say hi\" --no-stream'>",
+        "expect": "<OPTIONAL regex matched against stdout+stderr to confirm success. Use raw form, no anchors needed. Example: 'Aider v\\\\d+\\\\.\\\\d+' or 'Python 3\\\\.1[0-9]'>",
+        "label": "<OPTIONAL section header shown to the learner, e.g. 'Aider version smoke'>"
+      }
+    ],
+    "rubric": "<Grader rubric, 60-150 words. PLAIN ENGLISH describing what CORRECT captured output looks like. The CLI submits the combined stdout/stderr from cli_commands; this rubric grades that text. Example for a `claude --version` step: 'The output should show a version string like claude-code 0.x.y. Accept any version >=0.5. Partial credit (0.5) if Claude Code is installed but version differs. 0 if paste shows a different tool or an error.'>",
+    "must_contain": ["<LIST of substrings that MUST appear in captured output — cheap first-pass check on top of the CLI's `expect` regex. For `claude --version`: [\\"claude\\"]. 1-3 items typical.>"]
   }
 }
 
 ### TERMINAL_EXERCISE AUTHORING RULES (MANDATORY)
 
-1. **Commands ALWAYS in `demo_data.instructions`, never in content briefing.** Briefing = WHY, instructions = HOW.
-2. **Every command needs**: the command, expected output (1-line), top-1 error + fix. Wrapped in a collapsible <details> for the error.
-3. **Platform-aware** for installs: show macOS / Linux / Windows+WSL variants side-by-side with <h4> sections.
-4. **NEVER** ask for API keys in the instructions. The `byo_key_notice: true` flag renders our fixed informational panel. Key handling is ENTIRELY on the learner's machine (`claude /login` or env var). No exceptions.
-5. **Rubric writes like a grader's cheat-sheet**. Must be prescriptive enough that an LLM grading the paste can say "this meets the bar" or "this doesn't." Include what 1.0 / 0.5 / 0 look like.
-6. **must_contain is the cheap gate** — 1-3 substrings that prove the learner actually ran something, not pasted arbitrary text. Keep it forgiving (substring only, not regex).
-7. **Briefing content must excite + orient**. For Module 1, answer "what's the wow moment?" within the first sentence. For later modules, assume they've completed prior steps and jump into the new concept.
-8. **hint** is a single sentence. A stuck beginner should unblock within 10 seconds of reading it.
-9. **NEVER invent CLI commands, flags, or tool subcommands.** v8.6.1 (2026-04-24) fix for `claude auth` hallucination: the Creator previously invented `claude auth` in an M0 hint — Claude Code has NO such subcommand. Real commands are `claude /login` (interactive) or `ANTHROPIC_API_KEY` env-var (headless). For every CLI invocation in `instructions` / `hint` / `rubric`, either (a) quote it from the runtime-deps brief / source_material verbatim, (b) use a command you KNOW exists in the tool's public docs, or (c) replace with generic phrasing ("configure your credentials per the tool's `/login` flow"). If unsure whether a flag or subcommand exists, OMIT the specific syntax and describe the intent. Invented CLI syntax is the single most common trust-breaker on a learner's first CLI touch."""
+1. **Commands ALWAYS in `validation.cli_commands` (machine-readable).** Briefing = WHY, instructions = HOW (human prose), cli_commands = WHAT (CLI executes). The CLI runs cli_commands, captures output, submits — learners do NOT paste anything. The web frontend shows a "open your CLI" pointer instead of a paste textarea for these steps.
+2. **NEVER use the word 'paste' / 'copy and paste' / 'copy the output' in content / instructions / rubric.** The flow is: learner runs `skillslab check`, CLI executes cli_commands, output streams to terminal, learner confirms submission, score returns inline. No browser round-trip exists.
+3. **Each cli_commands entry has cmd + optional expect regex + optional label.** Make `cmd` runnable as-is; assume only the tools listed in the runtime-deps brief are on PATH. If the command would be platform-specific, offer ALTERNATIVES inside `instructions` HTML, but cli_commands itself should be ONE invocation per logical check.
+4. **Every command needs**: in `instructions`, the command shown + expected output 1-line + top-1 error + fix in <details>. Not in cli_commands itself (that's machine-only).
+5. **Platform-aware install steps**: show macOS / Linux / Windows+WSL variants in `instructions` HTML with <h4> sections. cli_commands runs in the container — point it at the cross-platform path.
+6. **NEVER** ask for API keys in instructions. The `byo_key_notice: true` flag renders our fixed informational panel. Key handling is on the learner's machine (`claude /login`, OPENROUTER_API_KEY env var). No exceptions.
+7. **Rubric writes like a grader's cheat-sheet**. The CLI submits captured output; rubric grades that text. Be prescriptive enough that an LLM scoring 0-1 can decide deterministically. Include what 1.0 / 0.5 / 0 look like.
+8. **must_contain is the cheap gate** — 1-3 substrings that prove the learner actually ran something. The CLI's `expect` regex is the FIRST gate; must_contain is BACKUP. Keep both forgiving.
+9. **Briefing must excite + orient**. M1.S1 answers "what's the wow moment?" in the first sentence. Later modules assume prior progress and jump straight to the new concept.
+10. **hint** is a single sentence. A stuck beginner should unblock within 10 seconds of reading it.
+11. **NEVER invent CLI commands, flags, or subcommands.** Every cmd in cli_commands MUST be (a) quoted from the runtime-deps brief / source_material verbatim, OR (b) a command you KNOW exists in the tool's public docs. If unsure whether a flag or subcommand exists, OMIT it. Invented CLI syntax is the single most common trust-breaker on a first-CLI-touch.
+12. **For Aider courses (BYO via OpenRouter): the model arg ALWAYS uses the openrouter/ provider prefix.** The bare `moonshotai/kimi-k2` is the OpenRouter SLUG, NOT the aider --model ARG — litellm rejects it at runtime. Canonical form for course content: `openrouter/moonshotai/kimi-k2-0905` (date-stamped, stable). NEVER emit a bare `aider --model moonshotai/kimi-k2 ...` invocation."""
     elif step_type == "adaptive_roleplay":
         prompt += """{
   "content": "<HTML setup (30-80 words) — framing for the roleplay. Kept short because the live chat does the teaching.>",

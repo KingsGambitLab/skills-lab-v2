@@ -102,12 +102,18 @@ register_schema(TechSchema(
     ),
 
     allowed_model_id_patterns=(
-        r"^openrouter/[a-z]+/[a-z][a-z0-9\-]*$",  # canonical OpenRouter
-        r"^moonshotai/kimi-k2$",                   # canonical bare
-        r"^moonshot/kimi-k2[\-0-9a-z]*$",          # Moonshot direct
-        r"^anthropic/[a-z][a-z0-9\-]*$",           # Anthropic via OpenRouter
-        r"^claude-(sonnet|opus|haiku)[\-0-9]*$",   # Anthropic direct
-        r"^(sonnet|opus|haiku)$",                  # Aliases
+        # 2026-04-25 — Aider runs through litellm, which REQUIRES a provider
+        # prefix on the --model arg. The bare OpenRouter slug
+        # (`moonshotai/kimi-k2`) IS the slug on OpenRouter, but is NOT a
+        # valid --model arg. Removed the bare-form pattern; only allow the
+        # prefixed forms that actually work at runtime.
+        r"^openrouter/[a-z][a-z0-9_]*/[a-z][a-z0-9_\-.]*$",  # OpenRouter
+        r"^moonshot/kimi-k2[\-0-9a-z.]*$",                    # Moonshot direct
+        r"^anthropic/[a-z][a-z0-9\-]*$",                      # Anthropic SDK direct
+        r"^claude-(sonnet|opus|haiku)[\-0-9]*$",              # Anthropic Claude
+        r"^(sonnet|opus|haiku)$",                             # Anthropic aliases
+        r"^groq/[a-z][a-z0-9_\-/.]*$",                        # Groq
+        r"^vertex_ai/[a-z][a-z0-9_\-/.]*$",                   # Vertex AI
     ),
 
     forbidden_examples=(
@@ -122,12 +128,17 @@ register_schema(TechSchema(
          "no such CLI flag — use the env var"),
         ("--subagent ", "no equivalent in Aider",
          "subagents are a Claude Code concept, not Aider"),
-        ("kimi-k2-0905", "moonshotai/kimi-k2",
-         "date-stamped slug; canonical OpenRouter slug is moonshotai/kimi-k2"),
-        ("kimi-k2-latest", "moonshotai/kimi-k2",
-         "date-stamped alias may rotate; use the unversioned slug"),
-        ("kimi-k2-0711", "moonshotai/kimi-k2",
-         "date-stamped slug; use the unversioned form"),
+        # 2026-04-25 — REMOVED entries that flagged date-stamped forms
+        # (kimi-k2-0905, kimi-k2-0711, kimi-k2-latest) as wrong. Those are
+        # FINE in `openrouter/moonshotai/kimi-k2-0905` form. The actual
+        # error pattern is the BARE form below — what learners hit at
+        # runtime as litellm.BadRequestError "LLM Provider NOT provided".
+        ("aider --model moonshotai/", "aider --model openrouter/moonshotai/kimi-k2-0905",
+         "BARE 'moonshotai/kimi-k2' as --model arg fails at runtime — litellm requires a provider prefix. The bare form is the OpenRouter SLUG, not the aider --model ARG."),
+        ("--model moonshotai/kimi-k2 ", "--model openrouter/moonshotai/kimi-k2-0905 ",
+         "litellm rejects model args without provider prefix; use openrouter/moonshotai/kimi-k2-0905"),
+        ("--model moonshotai/kimi-k2\n", "--model openrouter/moonshotai/kimi-k2-0905\n",
+         "litellm rejects model args without provider prefix"),
         ("/read prompts/", "/read-only prompts/<file>",
          "Aider has /read-only (with hyphen), not /read"),
         ("aider --apply ", "interactive 'y' to accept the diff",
@@ -148,6 +159,15 @@ register_schema(TechSchema(
          True, "kimi-M0.S3", "Kimi expert pass 1+2"),
         (r"aider\s+0\.4[0-9]\b|aider\s+0\.5[0-9]\b", "pins stale Aider version (0.4x/0.5x); current is 0.86+",
          True, "kimi-M0.S0", "Kimi expert pass 1"),
+        # 2026-04-25 — ROOT CAUSE for the aider runtime bug user filed live.
+        # The Creator was emitting `aider --model moonshotai/kimi-k2 ...` per
+        # the previous (incorrect) verified-facts block; litellm rejects that
+        # form with `LLM Provider NOT provided` because it has no provider
+        # prefix. Catch every form (with --message, with --no-stream, with
+        # quotes, etc.) by anchoring on the bare `moonshotai/kimi-k2` slug
+        # right after `--model `.
+        (r"--model\s+moonshotai/kimi-k2(?![\w\-/.])", "BARE 'moonshotai/kimi-k2' is the OpenRouter SLUG, not a valid --model arg. Litellm rejects it at runtime. Use 'openrouter/moonshotai/kimi-k2-0905'.",
+         False, "kimi-M0.S2", "Live user run 2026-04-25"),
     ),
 
     exercise_invariants=(

@@ -35,6 +35,7 @@ from rich import box
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
+from rich.rule import Rule
 from rich.table import Table
 
 from . import api, state, __version__
@@ -46,9 +47,14 @@ console = Console()
 # ── Utility helpers ────────────────────────────────────────────────────────
 
 def _resolve_course(slug_or_id: str | None) -> tuple[str, str]:
-    """Normalize a slug ('kimi', 'aie', 'jspring') OR a course_id ('created-…')
-    into (slug, course_id). The mapping is recorded under `~/.skillslab/<slug>/meta.json`
-    after the first `start`. For the bootstrap path we also accept course_id directly.
+    """Normalize a slug ('kimi', 'claude-code', 'jspring') OR a course_id
+    ('created-…') into (slug, course_id). The mapping is recorded under
+    `~/.skillslab/<slug>/meta.json` after the first `start`. For the
+    bootstrap path we also accept course_id directly.
+
+    2026-04-25 v3 — slug aliases: deprecated 'aie' is canonicalized to
+    'claude-code' so cached state under `~/.skillslab/aie/` keeps working
+    after the rename.
     """
     if not slug_or_id:
         # Pick the most recently active course from cached metadata
@@ -69,6 +75,22 @@ def _resolve_course(slug_or_id: str | None) -> tuple[str, str]:
             console.print("[red]No active course. Run `skillslab start <course-slug>` first.[/red]")
             sys.exit(2)
         return latest[0], latest[1].get("course_id") or ""
+    # Canonicalize aliased slugs FIRST, so the rest of the resolution path
+    # operates on the post-alias name. (`_canonicalize_slug` is defined
+    # below, near _SLUG_HINTS — module-level lookup, no cycle.)
+    canonical = _canonicalize_slug(slug_or_id)
+    if canonical != slug_or_id:
+        # If a state dir exists under EITHER the new or old slug, prefer
+        # whichever has a meta.json. New takes priority.
+        for candidate in (canonical, slug_or_id):
+            mp = state.home() / candidate / "meta.json"
+            if mp.exists():
+                try:
+                    m = json.loads(mp.read_text())
+                    return candidate, m.get("course_id") or canonical
+                except Exception:
+                    pass
+        return canonical, canonical
     # If it looks like an existing slug under HOME, use its meta.json
     cdir = state.home() / slug_or_id
     meta_path = cdir / "meta.json"
@@ -80,6 +102,12 @@ def _resolve_course(slug_or_id: str | None) -> tuple[str, str]:
             pass
     # Else assume it's a course_id directly OR a slug to be resolved server-side
     return slug_or_id, slug_or_id
+
+
+# Forward-declarations — `_canonicalize_slug` and `_SLUG_ALIASES` are
+# defined later in this file (near `_SLUG_HINTS`). Python module-level
+# resolution handles this fine because `_resolve_course` is only CALLED
+# from command handlers that fire at runtime.
 
 
 def _get_course_id_or_die(slug: str) -> str:
@@ -184,9 +212,28 @@ def courses():
 
 _SLUG_HINTS = [
     ("kimi", ["kimi", "moonshot", "open-source ai coding", "aider"]),
-    ("aie", ["ai-augmented engineering", "claude code + api", "claude code + mcp"]),
+    # 2026-04-25 v3 — renamed AIE → claude-code per user directive. The course
+    # is structurally about Claude Code (CLAUDE.md / hooks / subagents / MCP);
+    # "AI-Augmented Engineering" was a confusing umbrella label. The hints
+    # below match BOTH the old and new titles so cached state on disk and
+    # any pre-rename DB entries still resolve.
+    ("claude-code", [
+        "claude code in production",      # new canonical title
+        "claude code mastery",            # alt
+        "ai-augmented engineering",       # legacy title (still accepted)
+        "claude code + api",              # legacy subtitle
+        "claude code + mcp",              # legacy
+    ]),
     ("jspring", ["spring boot", "java"]),
 ]
+
+# Slug aliases — old → new mappings. Used by `_resolve_course` so an
+# existing `~/.skillslab/aie/` state directory keeps working after the
+# rename. The canonical slug ALWAYS wins for new state.
+_SLUG_ALIASES = {
+    "aie": "claude-code",
+}
+
 
 def _slug_for_course_title(title: str) -> str:
     t = (title or "").lower()
@@ -194,6 +241,11 @@ def _slug_for_course_title(title: str) -> str:
         if any(h in t for h in hints):
             return slug
     return "—"
+
+
+def _canonicalize_slug(slug: str) -> str:
+    """Map deprecated slugs to their canonical form."""
+    return _SLUG_ALIASES.get((slug or "").lower(), slug)
 
 
 @cli.command()
@@ -436,8 +488,18 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
     label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}"
 
     if surface == "web":
-        actions.append(("Open in browser",
-                        f"# Then run:  skillslab sync && skillslab next"))
+        # 2026-04-25 v3 — was emitting just `# Then run: skillslab sync && skillslab next`
+        # with NO URL — the learner had nothing to actually click. User caught
+        # this live: "Link missing". Now emit the dashboard URL as the primary
+        # action (Rich [link=...] markup → clickable on modern terminals) and
+        # the sync/next as a secondary follow-up.
+        course_id = (meta or {}).get("course_id") or ""
+        if course_id:
+            url = f"{state.web_url().rstrip('/')}/#{course_id}"
+            actions.append(("Open in browser (Cmd/Ctrl-click)",
+                            f"[link={url}]{url}[/link]"))
+        actions.append(("After completing in the browser",
+                        f"skillslab sync && skillslab next"))
         return actions
 
     # Terminal-native step. Three sub-paths depending on (a) whether the
@@ -463,8 +525,8 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
     else:
         # No module repo. Decide between:
         #   (a) pure concept / browser-companion → just read + advance
-        #   (b) terminal_exercise that needs SHELL WORK (run commands, paste output)
-        #       e.g. M0.S2 smoke-test, M0.S1 BYO-key setup, status-check steps
+        #   (b) terminal_exercise: skillslab check auto-runs cli_commands +
+        #       submits captured output. NO PASTE language.
         #   (c) terminal_exercise with a `code` field (editable scratchpad)
         if step.get("exercise_type") in (None, "concept"):
             actions.append(("Read briefing", f"skillslab spec"))
@@ -472,14 +534,13 @@ def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, st
         elif step.get("code"):
             # Scratchpad-style: starter snippet shipped in the step itself
             actions.append(("Read briefing", f"skillslab spec"))
-            actions.append(("Edit the snippet (it's printed in spec) and run locally", f"# vim / save your version"))
-            actions.append(("Paste output to grade", f"skillslab check"))
+            actions.append(("Edit the snippet (printed in spec) + run locally", f"# vim / save your version"))
+            actions.append(("Grade",         f"skillslab check"))
         else:
-            # Smoke-test / setup / shell-only: no files to edit
+            # Terminal-first (2026-04-25 v3): the CLI auto-runs declared
+            # cli_commands + submits captured output. No paste language.
             actions.append(("Read briefing", f"skillslab spec"))
-            actions.append(("Run the commands shown in the briefing",
-                            f"# aider --version  /  claude --version  /  whatever the step asks"))
-            actions.append(("Paste output to grade",
+            actions.append(("Run + grade (CLI auto-runs the declared commands)",
                             f"skillslab check"))
     return actions
 
@@ -533,9 +594,16 @@ def _browser_url(course_id: str, step: dict) -> str:
 
 def _print_web_pointer(step: dict, course_id: str, action_verb: str = "see") -> None:
     """Render the cross-surface pointer panel for a `web` step. The CLI
-    can't render or grade browser widgets — print a clean copy-paste URL +
+    can't render or grade browser widgets — print a clean clickable URL +
     instructions. Per Opus's headless-context note, we do NOT call
-    webbrowser.open (silently fails in Codespaces / SSH / Docker)."""
+    webbrowser.open (silently fails in Codespaces / SSH / Docker).
+
+    2026-04-25 v3 — URL is wrapped in Rich's [link=URL] markup, which emits
+    OSC 8 escape sequences. Modern terminals (iTerm2, macOS Terminal,
+    VSCode terminal, GNOME Terminal, Windows Terminal) render that as a
+    clickable link. Older terminals fall back to plain text — same UX as
+    before, never worse.
+    """
     url = _browser_url(course_id, step)
     label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}"
     console.print()
@@ -543,8 +611,8 @@ def _print_web_pointer(step: dict, course_id: str, action_verb: str = "see") -> 
         f"This step is a [bold]browser-native widget[/bold] "
         f"([yellow]{step.get('exercise_type','?')}[/yellow]) — "
         f"the CLI can't {action_verb} it from the terminal.\n\n"
-        f"Open in your browser:\n"
-        f"  [bold cyan]{url}[/bold cyan]\n\n"
+        f"Open in your browser ([dim]Cmd/Ctrl-click to open[/dim]):\n"
+        f"  [bold cyan][link={url}]{url}[/link][/bold cyan]\n\n"
         f"Navigate to [bold]{label} — {step.get('title','')[:60]}[/bold] in the dashboard.\n"
         f"When you finish, run [bold]skillslab progress[/bold] to refresh, "
         f"then [bold]skillslab next[/bold] to advance to the next terminal step.",
@@ -755,15 +823,26 @@ def next_cmd(ctx, course):
     state.write_meta(slug, meta)
     s = steps[cur + 1]
     label = f"M{s['module_pos']-1}.S{s['step_pos']}"
-    console.print(f"\n[green]→[/green] [bold cyan]{label}[/bold cyan] — [bold]{s['title']}[/bold]")
+    surface = _step_surface(s)
+    surface_color = "magenta" if surface == "web" else "green"
+    # 2026-04-25 v3 — visual separator so learners can SEE where the next
+    # assignment starts in their scrollback. User-filed live walk request:
+    # "let's add line breaks where needed... after every skillslab next
+    # command, let's add linebreaks and formatting to make it easy to
+    # understand where next assignment started".
+    console.print()
+    console.print(Rule(f"[bold cyan]{label}[/bold cyan] — {s['title']}",
+                       style="cyan"))
+    console.print()
+    console.print(
+        f"[dim]surface:[/dim] [{surface_color}]{surface.upper()}[/]    "
+        f"[dim]type:[/dim] [yellow]{s.get('exercise_type','concept')}[/yellow]    "
+        f"[dim]step id:[/dim] [cyan]{s.get('id') or s.get('step_id')}[/cyan]"
+    )
     # 2026-04-25 — replaced the dim-grey hint with a highlighted CTA panel.
-    # User-filed issue: "skillslab spec being the next step should be more
-    # highlighted". A passive [dim] line below the cursor advance was easy
-    # to miss; learners reported running blind. Same pattern as the WEB
-    # step pointer panel — use a Rich Panel + bold cyan command so the
-    # next move is unmissable.
     actions = _next_action(slug, meta, s)
     _print_next_actions(actions)
+    console.print()
 
 
 @cli.command(name="prev")
@@ -1067,8 +1146,10 @@ def dashboard(ctx, course):
     # in dev; learner's browser can't resolve that. CLI-walk v1 caught this
     # exact regression — same bug class as _print_web_pointer's, just in
     # this command. Both must use web_url().
+    # 2026-04-25 v3 — wrap URL in Rich [link=...] markup so modern terminals
+    # render it as Cmd/Ctrl-clickable. User-filed live walk request.
     url = f"{state.web_url()}/#{cid}"
-    console.print(f"  {url}")
+    console.print(f"  [link={url}]{url}[/link]   [dim](Cmd/Ctrl-click to open)[/dim]")
 
 
 # ── Entry points ───────────────────────────────────────────────────────────
@@ -1089,8 +1170,17 @@ def _wrapper_kimi():
 
 
 def _wrapper_aie():
+    """Deprecated wrapper kept for back-compat with anyone who installed
+    `aie-course` as their alias. Auto-canonicalizes to claude-code.
+    """
     sys.argv.insert(1, "--course")
-    sys.argv.insert(2, "aie")
+    sys.argv.insert(2, "claude-code")
+    main()
+
+
+def _wrapper_claude_code():
+    sys.argv.insert(1, "--course")
+    sys.argv.insert(2, "claude-code")
     main()
 
 

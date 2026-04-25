@@ -351,17 +351,27 @@ register_assignment(AssignmentType(
     id="terminal_exercise",
     description=(
         "Learner runs commands in their OWN terminal (BYO-key: their own "
-        "Anthropic key / local tools) and pastes the output back. Graded "
-        "on LLM-rubric of pasted output + optional must_contain substrings. "
-        "Used for courses where the skill lives on the learner's workstation "
-        "(e.g. Claude Code, kubectl, git workflows, local build tools). "
-        "Zero platform LLM cost to execute the exercise — we only pay for "
-        "the grading rubric call (~500 tokens)."
+        "Anthropic / OpenRouter key + local tools) and the skillslab CLI "
+        "captures + submits the output. NO copy-paste from terminal to "
+        "browser. The CLI reads `validation.cli_commands` (declarative list "
+        "of {cmd, expect, label}), runs each, captures stdout/stderr, "
+        "checks the `expect` regex, and submits the combined output to the "
+        "LMS via /api/exercises/validate where the existing rubric / "
+        "must_contain grade the captured text. Zero platform LLM cost to "
+        "execute the exercise itself — we only pay the rubric grader (~500 "
+        "tokens). 2026-04-25 v2: TERMINAL-FIRST. The web frontend renders "
+        "a 'open your skillslab CLI' pointer for terminal_exercise steps "
+        "instead of a paste textarea — paste-from-browser was the artifact "
+        "of a browser-only history we no longer have."
     ),
     grade_primitives=["llm_rubric", "must_contain"],
     grade_weights={"llm_rubric": 0.8, "must_contain": 0.2},
     required_demo_data=["instructions"],  # the command(s) learner should run
-    required_validation=["any_of:rubric,must_contain"],
+    # Terminal-first: cli_commands is REQUIRED (declarative list of what the
+    # CLI runs + grades against). rubric / must_contain remain optional and
+    # grade the captured output text. Legacy steps without cli_commands are
+    # accepted but flagged for re-regen.
+    required_validation=["cli_commands", "any_of:rubric,must_contain"],
     runtime=None,  # runs on learner's machine, not ours
     interaction_mode="byo_execution",
     reality_score="real",

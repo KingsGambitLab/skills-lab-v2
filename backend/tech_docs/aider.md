@@ -211,8 +211,17 @@ OpenRouter (preferred for Kimi K2):
 ```
 --model openrouter/<provider>/<model>
 # OPENROUTER_API_KEY=<key>
-# Example: --model openrouter/moonshotai/kimi-k2
+# Examples:
+#   --model openrouter/moonshotai/kimi-k2-0905    (specific date-stamped, stable)
+#   --model openrouter/moonshotai/kimi-k2         (rolling alias — may rotate)
+#   --model openrouter/anthropic/claude-3-5-sonnet
 ```
+
+The `openrouter/` prefix is REQUIRED. Aider runs through litellm, and
+litellm refuses any model arg without a provider prefix
+(`litellm.BadRequestError: LLM Provider NOT provided`). Don't pass the
+bare OpenRouter slug as the model — it's the slug ON OpenRouter, not the
+arg ON aider.
 
 Anthropic direct:
 ```
@@ -234,9 +243,36 @@ LiteLLM passthrough (non-canonical, works but not documented):
 # OPENAI_API_KEY=<openrouter-key>
 ```
 
-Canonical Kimi K2 slug on OpenRouter is `moonshotai/kimi-k2` (no date suffix).
-Date-stamped variants `kimi-k2-0905`, `kimi-k2-0711`, `kimi-k2-latest` are
-release-date labels that may rotate; use the unversioned slug for stability.
+## Kimi K2 model arg — canonical forms (--model)
+
+For BYO-OpenRouter (the immersive course's standard path):
+- `openrouter/moonshotai/kimi-k2-0905` — date-stamped, pinned to a specific
+  release. PREFERRED for course content because the model behavior won't
+  shift under a learner mid-walk.
+- `openrouter/moonshotai/kimi-k2` — rolling alias to the latest k2. Fine
+  for casual use; risky for course step rubrics that depend on specific
+  output shape.
+
+NEVER use bare `moonshotai/kimi-k2` (without the `openrouter/` prefix)
+as the --model arg. It looks right (it IS the OpenRouter slug), but
+litellm has no way to know which provider you mean and rejects it at
+runtime. Course content authored against the bare form ships broken.
+
+For Moonshot direct (no OpenRouter intermediary):
+- `moonshot/kimi-k2-0905` — single-slash provider prefix (different from
+  the openrouter variant which is double-slash). Requires
+  `MOONSHOT_API_KEY` instead of `OPENROUTER_API_KEY`.
+
+## Anthropic models on aider
+
+For BYO-OpenRouter:
+- `openrouter/anthropic/claude-3-5-sonnet`
+- `openrouter/anthropic/claude-3-5-haiku`
+- `openrouter/anthropic/claude-3-opus-20240229`
+
+For Anthropic direct:
+- `claude-sonnet-4-5-20250929` — specific
+- `sonnet` / `opus` / `haiku` — aliases (latest of each tier)
 
 ## File system conventions
 

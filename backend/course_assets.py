@@ -242,11 +242,16 @@ register_course_assets(CourseAsset(
 
 
 register_course_assets(CourseAsset(
-    slug="aie",
-    title_hint="AI-Augmented Engineering",
-    # v8.6.1 (2026-04-24) — hosted on tusharbisht pending skills-lab-demos
-    # org setup. When the org exists, move both repos over + update here +
-    # re-run backfill to regenerate bootstrap commands.
+    # 2026-04-25 v3 — renamed from "aie" → "claude-code" per user directive.
+    # The course's actual subject is Claude Code (CLAUDE.md / hooks /
+    # subagents / MCP); "AI-Augmented Engineering" was a confusing umbrella
+    # label. The course_repo URL stays at `aie-course-repo` for now (the
+    # GitHub repo + module branches are unchanged); migrating the GitHub
+    # org+repo name is a separate piece of work that requires the existing
+    # learners' forks to be re-targeted. Slug rename is enough to fix the
+    # learner-facing surface.
+    slug="claude-code",
+    title_hint="Claude Code in Production",
     course_repo="https://github.com/tusharbisht/aie-course-repo",
     # v8.6.1 (2026-04-24) — ORDER MATCHES THE GENERATED COURSE. Python 3.7+
     # dicts preserve insertion order, and the backfill maps position 0 →
