@@ -7166,6 +7166,42 @@ template, with `$ARGUMENTS` interpolated at invocation time.
 """
 
 
+_NEGATION_MARKERS = (
+    " not ", "n't ", " avoid", " don't", " never ", "deprecated",
+    "stale", "wrong", "incorrect", "invented", "fictional",
+    "outdated", "old slug", "old form", "do not use", "don't use",
+    " no longer ",
+)
+
+
+def _drift_match_excluding_negation(pattern: str, haystack: str, *, ignore_case: bool = False) -> bool:
+    """Return True if `pattern` matches in `haystack` AT LEAST ONCE in
+    POSITIVE-teaching context (not preceded by a negation marker within ~80
+    chars). False if every occurrence is in a "don't use this" / "not X"
+    context — that's pedagogically correct.
+
+    `ignore_case` defaults to False so case-sensitive caller patterns (e.g.
+    `claude code` in lowercase to distinguish from product name "Claude Code")
+    are preserved. Caller flips to True for slug/regex patterns where case
+    doesn't matter (e.g. Kimi K2 model id matching).
+
+    Phase 3 of the v8.7 drift gate (2026-04-25). Without this, the gate
+    flagged Kimi M2.S2 because the content correctly said "use moonshotai/
+    kimi-k2 (not a dated slug like kimi-k2-0905)" — a negative example
+    teaching the right thing. The gate must distinguish.
+    """
+    import re
+    flags = re.IGNORECASE if ignore_case else 0
+    flat = haystack.lower().replace("\n", " ")
+    for m in re.finditer(pattern, haystack, flags):
+        start_lower = m.start()
+        window = flat[max(0, start_lower - 80):start_lower]
+        if any(neg in window for neg in _NEGATION_MARKERS):
+            continue
+        return True
+    return False
+
+
 def _check_verified_facts_drift(
     *,
     content_obj: dict,
@@ -7246,7 +7282,9 @@ def _check_verified_facts_drift(
         for pat, msg in cc_drifts:
             # Case-sensitive against haystack_orig — Title Case product
             # name "Claude Code" must not trigger the shell-subcommand drift.
-            if re.search(pat, haystack_orig):
+            # Also skip negative-example occurrences ("don't use claude code"
+            # IS pedagogically correct; only positive teaching is drift).
+            if _drift_match_excluding_negation(pat, haystack_orig, ignore_case=False):
                 violations.append(f"CLAUDE_CODE_DRIFT: {msg}")
         # Hook example uses `exit 1` to "block" — context-dependent, only
         # flag if the same chunk teaches blocking. Catches both shell
@@ -7280,7 +7318,9 @@ def _check_verified_facts_drift(
              "pins to a stale Aider version (0.4x / 0.5x). Use 'Aider 0.86+' or 'any recent Aider' instead."),
         ]
         for pat, msg in aider_drifts:
-            if re.search(pat, haystack_orig, re.IGNORECASE):
+            # Slug + invented-syntax patterns can ignore case (kimi-k2 vs Kimi-K2)
+            # without losing meaning.
+            if _drift_match_excluding_negation(pat, haystack_orig, ignore_case=True):
                 violations.append(f"AIDER_DRIFT: {msg}")
 
     return violations
@@ -8961,14 +9001,17 @@ IMPORTANT for incident_console:
                     _cc_desc = str(course_context.get("description") or "")
                     _cc_src = str(course_context.get("source_material") or "")
                 _cc_title = _cc_title or (step_title or "")
-                if _course_has_claude_code_scope(_cc_title, _cc_desc, _cc_src):
-                    prompt += "\n\n" + _claude_code_reference_facts() + "\n"
-                # 2026-04-25 v8.7 — Aider verified-facts block. Mirrors the
-                # claude_code injection. Added after Kimi+Aider course expert
-                # review caught fictional `/load <prompt>` syntax + invented
-                # `.aider/commands/` directory + wrong model id `kimi-k2-0905`.
-                if _course_has_aider_scope(_cc_title, _cc_desc, _cc_src):
-                    prompt += "\n\n" + _aider_reference_facts() + "\n"
+                # v8.7 (2026-04-25) — registry-driven facts injection. Each
+                # tech (claude_code, aider, future kubernetes/terraform/etc.)
+                # registers via backend/verified_facts_data.py. The registry
+                # iterates every in-scope tech for THIS course and concatenates
+                # all matching facts blocks. Adding a new tech = ONE
+                # register_tech(...) call there; no edits here.
+                from . import verified_facts as _vf
+                from . import verified_facts_data as _vfd  # noqa: F401  (registers on import)
+                _facts_blob = _vf.assemble_facts_blocks(_cc_title, _cc_desc, _cc_src)
+                if _facts_blob:
+                    prompt += "\n\n" + _facts_blob + "\n"
             except Exception as _cc_err:
                 logging.warning("Verified-facts injection failed (non-fatal): %s", _cc_err)
             # v8.6 (2026-04-24) LANGUAGE LOCK — domain-expert review of TS v12
@@ -10489,15 +10532,14 @@ async def _creator_generate_impl(
                     # Gate bug must NOT hard-fail generation; log + continue.
                     logging.warning("ontology gate error (soft-pass): %s", _onto_err)
 
-                # 2026-04-25 v8.7 — VERIFIED-FACTS DRIFT GATE.
-                # The _claude_code_reference_facts() / _aider_reference_facts()
-                # blocks are injected into the Creator prompt for in-scope
-                # courses. Despite that, the LLM occasionally paraphrases or
-                # reverts to stale training data — caught by the AIE + Kimi
-                # expert reviews (2026-04-25). This gate scans the produced
-                # content for known-bad strings and rejects → forces retry
-                # with the violations captured into _last_invariant_reason.
+                # 2026-04-25 v8.7 — VERIFIED-FACTS DRIFT GATE (registry-driven).
+                # Iterates every in-scope tech registered in verified_facts_data
+                # and runs each tech's drift_patterns against the produced
+                # content. Adding a new tech's drift coverage = ONE
+                # register_tech(...) call there; no edits here.
                 try:
+                    from . import verified_facts as _vf
+                    from . import verified_facts_data as _vfd  # noqa: F401
                     _vf_title = ""
                     _vf_desc = ""
                     _vf_src = ""
@@ -10506,25 +10548,26 @@ async def _creator_generate_impl(
                         _vf_desc = str(course_context.get("description") or "")
                         _vf_src = str(course_context.get("source_material") or "")
                     _vf_title = _vf_title or (step_outline.title or "")
-                    _has_cc = _course_has_claude_code_scope(_vf_title, _vf_desc, _vf_src)
-                    _has_aider = _course_has_aider_scope(_vf_title, _vf_desc, _vf_src)
-                    if _has_cc or _has_aider:
-                        _violations = _check_verified_facts_drift(
-                            content_obj=content_obj,
-                            course_has_claude_code=_has_cc,
-                            course_has_aider=_has_aider,
+                    _violations = _vf.check_drift(
+                        content=content_obj.get("content") or "",
+                        code=content_obj.get("code") or "",
+                        validation=content_obj.get("validation") or {},
+                        demo_data=content_obj.get("demo_data") or {},
+                        course_title=_vf_title,
+                        course_description=_vf_desc,
+                        source_material=_vf_src,
+                    )
+                    if _violations:
+                        logging.warning(
+                            "VERIFIED-FACTS DRIFT step=%r ex_type=%s n_violations=%d:\n  - %s",
+                            getattr(step_outline, "title", "?"), ex_type,
+                            len(_violations), "\n  - ".join(_violations[:5]),
                         )
-                        if _violations:
-                            logging.warning(
-                                "VERIFIED-FACTS DRIFT step=%r ex_type=%s n_violations=%d:\n  - %s",
-                                getattr(step_outline, "title", "?"), ex_type,
-                                len(_violations), "\n  - ".join(_violations[:5]),
-                            )
-                            _last_invariant_reason[0] = (
-                                "Verified-facts drift — fix THESE specific issues from the prior attempt:\n"
-                                + "\n".join(f"  - {v}" for v in _violations[:8])
-                            )[-1500:]
-                            return False
+                        _last_invariant_reason[0] = (
+                            "Verified-facts drift — fix THESE specific issues from the prior attempt:\n"
+                            + "\n".join(f"  - {v}" for v in _violations[:8])
+                        )[-1500:]
+                        return False
                 except Exception as _vf_err:
                     logging.warning("verified-facts drift gate error (soft-pass): %s", _vf_err)
                 # Reject any concept/roleplay content that is self-referential filler — text that
