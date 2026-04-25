@@ -1,0 +1,50 @@
+# skillslab — drop into the toolchain container with your course-repo + state
+# mounted from the host. Three usage modes:
+#
+#   1) Interactive: `docker compose run --rm skillslab`
+#      Drops you into bash inside /work with skillslab on PATH. Run
+#      `skillslab login`, `skillslab start aie`, etc.
+#
+#   2) Single command:
+#         docker compose run --rm skillslab skillslab login
+#         docker compose run --rm skillslab skillslab check
+#
+#   3) Per-course wrapper:
+#         docker compose run --rm skillslab kimi-course status
+#
+# Mounts:
+#   - $PWD                  → /work    (your course-repo; CLI runs `pytest`,
+#                                       `git diff`, `mvn test` here)
+#   - ~/.skillslab          → /root/.skillslab  (token + cursor + step files
+#                                                survive container restarts)
+#   - $HOME/.claude         → /root/.claude     (claude CLI auth + settings)
+#   - $HOME/.aider          → /root/.aider      (aider CLI history)
+#
+# Env passthrough: ANTHROPIC_API_KEY / OPENROUTER_API_KEY / GITHUB_TOKEN
+# from your shell so BYO-key flows work without re-auth inside the container.
+
+services:
+  skillslab:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: skillslab:latest
+    container_name: skillslab
+    working_dir: /work
+    stdin_open: true
+    tty: true
+    environment:
+      - SKILLSLAB_API_URL=${SKILLSLAB_API_URL:-http://host.docker.internal:8001}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - GITHUB_TOKEN=${GITHUB_TOKEN:-}
+      - GH_TOKEN=${GH_TOKEN:-}
+    extra_hosts:
+      # So the in-container CLI can reach the host's LMS at localhost:8001
+      - "host.docker.internal:host-gateway"
+    volumes:
+      - ${PWD}:/work
+      - ${HOME}/.skillslab:/root/.skillslab
+      - ${HOME}/.claude:/root/.claude
+      - ${HOME}/.aider:/root/.aider
+    command: /bin/bash

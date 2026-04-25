@@ -44,11 +44,11 @@ def html_to_markdown(html: str) -> str:
         body = _INLINE_CODE_RE.sub(lambda mm: mm.group(1), body)
         body = _TAG_RE.sub("", body)
         body = html_mod.unescape(body).strip("\n")
-        # Detect language from common tokens; default empty
+        # Detect language from common tokens; default empty.
+        # Order matters — more-specific dialects (Java/JS/etc.) BEFORE Python,
+        # because Python's `@`/`class` heuristic is lax + would otherwise win.
         lang = ""
-        if any(t in body for t in ("def ", "import ", "class ", "from ", "@")) and "function" not in body:
-            lang = "python"
-        elif any(t in body for t in ("@RestController", "public class", "package ", "import java")):
+        if any(t in body for t in ("@RestController", "public class", "package ", "import java", "@SpringBoot", "@Service", "@Repository")):
             lang = "java"
         elif body.lstrip().startswith(("$ ", "#!/", "git ", "mvn", "pip", "npm", "aider ", "claude ", "docker ", "pytest")):
             lang = "bash"
@@ -56,6 +56,8 @@ def html_to_markdown(html: str) -> str:
             lang = "json"
         elif "<?xml" in body or body.lstrip().startswith("<"):
             lang = "xml"
+        elif any(t in body for t in ("def ", "import ", "class ", "from ")) and "function" not in body:
+            lang = "python"
         return f"\n\n```{lang}\n{body}\n```\n\n"
 
     s = _CODE_BLOCK_RE.sub(_pre_to_fence, s)

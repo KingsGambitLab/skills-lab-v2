@@ -1,0 +1,48 @@
+# .skillslab.yml — per-module CLI grading contract.
+#
+# Lives at the ROOT of a course-repo's module branch (e.g. the root of
+# `module-1-bearer-auth`). The skillslab CLI reads this file on every
+# `skillslab check` and uses it to:
+#   1. Run an acceptance command (tests, lint, build) and capture output
+#   2. Append specific files to the submission so the grader sees context
+#   3. Decide whether to capture working-tree `git diff` or `--staged`
+#   4. Optionally pin which model the local-LLM rubric uses
+
+# ── 1. Acceptance command (REQUIRED for code-heavy modules) ───────────────
+# Runs in cwd. stdout + stderr + exit code go into the submission. The
+# grader sees them; partial credit is awarded based on which tests passed.
+#
+# Examples:
+#   acceptance_command: pytest -q
+#   acceptance_command: pytest tests/test_cli_token.py -v
+#   acceptance_command: mvn -q test
+#   acceptance_command: npm test -- --silent
+#   acceptance_command: cargo test --quiet
+#   acceptance_command: pytest && mypy --strict src/
+acceptance_command: pytest tests/test_cli_token.py tests/test_cookie_auth_regression.py -v
+
+# ── 2. Files to include verbatim in the submission ────────────────────────
+# Useful when the `git diff` is small but the grader needs to see the
+# full file (e.g. a NEW file the learner created — the diff alone has no
+# context). Paths are relative to cwd.
+paste_includes:
+  - auth.py
+  - tests/test_cli_token.py
+  - tests/test_cookie_auth_regression.py
+
+# ── 3. git diff capture mode ──────────────────────────────────────────────
+# yes     → `git diff` (working tree changes)
+# staged  → `git diff --staged` (changes already staged)
+# no      → skip diff (use only paste_includes + paste)
+git_diff: yes
+
+# ── 4. Local-LLM rubric model override (optional) ─────────────────────────
+# When the step has a rubric-only validation (no native cli_check) AND the
+# learner's machine has `claude` or `aider` on PATH, the CLI grades
+# locally. This pins which model handles it.
+#
+# Examples:
+#   rubric_model: sonnet                        # default for claude
+#   rubric_model: claude-3-5-sonnet-20241022    # explicit version
+#   rubric_model: openrouter/moonshotai/kimi-k2  # for aider
+rubric_model: sonnet
