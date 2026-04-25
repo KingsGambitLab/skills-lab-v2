@@ -160,11 +160,28 @@ def _clear_session_cookie(response: Response) -> None:
 # ── Middleware: load session into request.state ───────────────────────────
 
 async def session_middleware(request: Request, call_next):
-    """Attach request.state.user + request.state.session if the incoming
-    sll_session cookie points to a valid live session. Else leave as None."""
+    """Attach request.state.user + request.state.session.
+
+    Two auth paths supported:
+      1. `sll_session` cookie (browser flow) — existing
+      2. `Authorization: Bearer <token>` header (CLI flow) — added 2026-04-25
+
+    Both resolve through the same `auth_sessions` table; bearer tokens
+    just live in the same store. CLI tokens are issued via
+    POST /api/auth/cli_token and are long-lived (90 days) so a
+    `skillslab login` lasts across many work sessions.
+    """
     request.state.user = None
     request.state.session = None
+
+    # 1) Cookie flow (browser)
     token = request.cookies.get(COOKIE_NAME)
+    # 2) Bearer flow (CLI)
+    if not token:
+        auth_hdr = request.headers.get("authorization") or request.headers.get("Authorization") or ""
+        if auth_hdr.lower().startswith("bearer "):
+            token = auth_hdr.split(None, 1)[1].strip()
+
     if token:
         try:
             from backend.database import async_session_factory
@@ -275,6 +292,63 @@ async def me(request: Request):
     if u is None:
         return None
     return _user_to_out(u)
+
+
+# ── CLI token (bearer, long-lived) ────────────────────────────────────────
+# 2026-04-25 — issued via the existing logged-in session OR password.
+# The CLI runs `skillslab login` which (a) opens the user's browser to
+# /cli-login (a small page that POSTs to this endpoint with the user's
+# session cookie + a label), or (b) accepts email+password directly for
+# headless flows. Either way it returns a bearer token the CLI stores at
+# `~/.skillslab/token`. session_middleware accepts the same token via
+# Authorization: Bearer.
+
+class CliTokenRequest(BaseModel):
+    label: str = Field(default="cli", min_length=1, max_length=80)
+    # Optional credentials for headless / first-time flows where the
+    # user has no browser session. If both are provided, validates them
+    # and issues regardless of cookie state.
+    email: str | None = None
+    password: str | None = None
+    ttl_days: int = Field(default=90, ge=1, le=365)
+
+
+class CliTokenResponse(BaseModel):
+    token: str
+    user_id: int
+    email: str
+    expires_at: str
+    label: str
+
+
+@router.post("/cli_token", response_model=CliTokenResponse)
+async def issue_cli_token(
+    body: CliTokenRequest,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    user: User | None = getattr(request.state, "user", None)
+    if user is None:
+        # Fall back to email+password validation for headless flows
+        if not (body.email and body.password):
+            raise HTTPException(401, "Sign in via cookie session OR provide email+password")
+        u = (await db.execute(select(User).where(User.email == body.email))).scalar_one_or_none()
+        if u is None or u.disabled_at is not None:
+            raise HTTPException(401, "Invalid credentials")
+        if not verify_password(body.password, u.password_hash):
+            raise HTTPException(401, "Invalid credentials")
+        user = u
+    sess = AuthSession.new_for_user(user.id, ttl_hours=body.ttl_days * 24)
+    sess.user_agent = f"skillslab-cli/{body.label}"
+    db.add(sess)
+    await db.commit()
+    return CliTokenResponse(
+        token=sess.id,
+        user_id=user.id,
+        email=user.email,
+        expires_at=sess.expires_at.isoformat(),
+        label=body.label,
+    )
 
 
 # ── Enrollment ────────────────────────────────────────────────────────────
