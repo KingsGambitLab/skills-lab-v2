@@ -129,11 +129,93 @@ def html_to_markdown(html: str) -> str:
     return s.strip() + "\n"
 
 
-def step_to_markdown(step: dict, course_title: str = "", module_title: str = "") -> str:
+_GITHUB_URL_RE = re.compile(r"https?://github\.com/[\w\-]+/[\w\-]+(?:\.git)?")
+_GIT_CLONE_RE = re.compile(r"git\s+clone\s+(\S+\.git)")
+# Loose `git clone https://github.com/owner/repo` (no .git suffix required) —
+# matches what the LLM emits inside `<pre>` blocks in concept/instruction HTML.
+_GIT_CLONE_LOOSE_RE = re.compile(r"git\s+clone\s+(https?://github\.com/[\w\-]+/[\w\-\.]+?)(?=[\s)\"'<]|$)")
+_GIT_CHECKOUT_RE = re.compile(r"git\s+checkout\s+([\w\-/]+)")
+# Tight discovery — only treat a github URL as the module repo when it
+# appears within ~80 chars of a fork/clone/checkout keyword (signal
+# that it's the action target, not an example/library reference).
+_FORK_CONTEXT_RE = re.compile(
+    r"(?:\bfork\b|\bclone\b|\bcheckout\b|git\s+clone|git\s+checkout)"
+    r".{0,80}?"
+    r"(https?://github\.com/[\w\-]+/[\w\-\.]+?)(?=[\s)\"'<]|$)",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def find_module_repo(steps: list[dict]) -> dict | None:
+    """Discover the module's starter repo by scanning sibling steps.
+
+    Mirrors the browser's `_findModuleRepoMeta` (frontend/index.html). Same
+    discovery layers, in the same order, so terminal + browser show the
+    same answer. Per CLAUDE.md "rendering layer owns presentation" — we
+    don't ask the LLM to copy-paste the URL into every step.
+
+    Layers (most-canonical first):
+      1. step.demo_data.starter_repo  (structured per CLAUDE.md F26)
+      2. step.demo_data.bootstrap_command — `git clone <url> ... [git checkout <branch>]`
+      3. github URL grep on demo_data.instructions / step.content (legacy)
+    Returns: {"url": str, "ref": str|None, "source_step_id": int} or None.
+    """
+    if not steps:
+        return None
+    # 1. Structured starter_repo
+    for s in steps:
+        sr = (s.get("demo_data") or {}).get("starter_repo")
+        if isinstance(sr, dict) and sr.get("url"):
+            return {
+                "url": sr["url"].rstrip("/").rstrip(".git") + (".git" if sr["url"].endswith(".git") else ""),
+                "ref": sr.get("ref"),
+                "source_step_id": s.get("id"),
+            }
+    # 2. bootstrap_command — matches both `.git` URL and bare HTTPS URL
+    for s in steps:
+        cmd = (s.get("demo_data") or {}).get("bootstrap_command") or ""
+        m = _GIT_CLONE_RE.search(cmd) or _GIT_CLONE_LOOSE_RE.search(cmd)
+        if m:
+            bm = _GIT_CHECKOUT_RE.search(cmd)
+            return {
+                "url": m.group(1).rstrip(".git"),
+                "ref": bm.group(1) if bm else None,
+                "source_step_id": s.get("id"),
+            }
+    # 3. Tight prose discovery: github URL within fork/clone keyword context.
+    # Critical: prevents picking up example/library URLs that happen to be in
+    # the same content (the user-walk caught us listing 5 module repos when
+    # only M6 actually had a fork target — the rest were prose mentions).
+    candidates: list[tuple[str, int | None]] = []
+    for s in steps:
+        text = ((s.get("demo_data") or {}).get("instructions") or "") + " " + (s.get("content") or "")
+        for m in _FORK_CONTEXT_RE.finditer(text):
+            candidates.append((m.group(1).rstrip(".git"), s.get("id")))
+    if candidates:
+        # Prefer URLs that show up across MULTIPLE steps (canonical = repeated).
+        from collections import Counter
+        counts = Counter(url for url, _ in candidates)
+        # Pick the most-frequent; tiebreak: first appearance order
+        best_url = max(counts.keys(), key=lambda u: (counts[u], -candidates.index((u, next(sid for url, sid in candidates if url == u)))))
+        first_sid = next(sid for url, sid in candidates if url == best_url)
+        return {"url": best_url, "ref": None, "source_step_id": first_sid}
+    return None
+
+
+def step_to_markdown(
+    step: dict,
+    course_title: str = "",
+    module_title: str = "",
+    module_repo: dict | None = None,
+) -> str:
     """Build a self-contained markdown file for a step. Stamps minimal
     front-matter with step metadata so the CLI can re-parse later if
     needed. Body is the converted HTML content + a SUBMIT section so the
     learner knows the shape of the acceptance check.
+
+    `module_repo` (if provided) is rendered as a "Module repo" callout
+    near the top, so every step in the module shows the same fork/clone
+    target — same UX as the browser's module-repo banner.
     """
     sid = step.get("id")
     title = step.get("title", "(untitled)")
@@ -144,19 +226,46 @@ def step_to_markdown(step: dict, course_title: str = "", module_title: str = "")
 
     body = html_to_markdown(content_html)
 
-    parts = [
+    # Front-matter: module_repo flows in as structured fields so other
+    # commands (status / spec / check) can read it without re-parsing prose.
+    fm = [
         "---",
         f"step_id: {sid}",
         f"exercise_type: {etype}",
         f"title: {json.dumps(title)}",
         f"course: {json.dumps(course_title)}",
         f"module: {json.dumps(module_title)}",
-        "---",
+    ]
+    if module_repo and module_repo.get("url"):
+        fm.append(f"module_repo_url: {json.dumps(module_repo['url'])}")
+        if module_repo.get("ref"):
+            fm.append(f"module_repo_ref: {json.dumps(module_repo['ref'])}")
+    fm.append("---")
+
+    # Module-repo callout right after the title so it's visible in
+    # `skillslab spec` regardless of where the step's own content lives.
+    # Same UX intent as the browser's module-repo banner — every step in
+    # the module shows the same fork/clone target.
+    repo_block: list[str] = []
+    if module_repo and module_repo.get("url"):
+        repo_url = module_repo["url"]
+        ref = module_repo.get("ref")
+        repo_block = [
+            "",
+            "> **📦 Module repo:** [" + repo_url + "](" + repo_url + ")"
+            + (f"  (branch: `{ref}`)" if ref else ""),
+            ">",
+            f"> Clone:  `git clone {repo_url}.git`"
+            + (f" && cd && `git checkout {ref}`" if ref else ""),
+            "",
+        ]
+
+    parts = fm + [
         "",
         f"# {title}",
         "",
         f"_module:_ {module_title}    _type:_ `{etype}`    _step id:_ `{sid}`",
-        "",
+    ] + repo_block + [
         "---",
         "",
         body or "_(no briefing provided)_",

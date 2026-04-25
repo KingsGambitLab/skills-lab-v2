@@ -256,14 +256,25 @@ def start(slug: str):
     for f in (cdir / "steps").glob("*.md"):
         f.unlink()  # fresh start
 
+    # 2026-04-25 — discover each module's starter repo ONCE (mirror of the
+    # browser's _findModuleRepoMeta) so every step's md gets the URL in its
+    # front-matter, AND meta.json carries it per-step. Same data the
+    # learner sees in the browser banner; now also surfaced in `skillslab
+    # status` and inside each step's spec.
+    from .render import find_module_repo
     cursor_steps = []
     written = 0
+    module_repos: dict[int, dict] = {}  # module_pos → repo dict (or None)
     for m in modules:
         m_pos = m.get("position", 0)
         m_title = m.get("title", "")
+        repo = find_module_repo(m.get("steps", []) or [])
+        if repo:
+            module_repos[m_pos] = repo
         for s in m.get("steps", []):
             s_pos = s.get("position", 0)
-            md = step_to_markdown(s, course_title=title, module_title=m_title)
+            md = step_to_markdown(s, course_title=title, module_title=m_title,
+                                   module_repo=repo)
             p = state.step_path(slug, m_pos, s_pos, s.get("title", "step"))
             p.write_text(md)
             written += 1
@@ -278,6 +289,8 @@ def start(slug: str):
                 # without refetching the step. NULL → 'web' default (legacy
                 # course pre-backfill).
                 "learner_surface": s.get("learner_surface") or "web",
+                "module_repo_url": (repo or {}).get("url"),
+                "module_repo_ref": (repo or {}).get("ref"),
                 "filename": p.name,
             })
 
@@ -294,10 +307,18 @@ def start(slug: str):
 
     console.print(f"[green]✓ Wrote {written} step files to[/green] {cdir / 'steps'}")
     console.print(f"[dim]ls {cdir / 'steps'}[/dim]")
+    # Don't dump every module's discovered repo here — earlier iteration did,
+    # but the legacy HTML-grep fallback picked up prose-referenced URLs (and
+    # in some courses, LLM-hallucinated org names) → noisy list of 5
+    # different "repos" most of which aren't actual fork targets. Per
+    # CLAUDE.md "rendering layer owns presentation, surface data WHEN it's
+    # actionable": the per-step `status` command shows the CURRENT module's
+    # repo when the learner reaches a step that needs it. start just
+    # confirms what landed.
     console.print()
     console.print("[bold]Next:[/bold]")
-    console.print(f"  skillslab status      # see where you are")
-    console.print(f"  skillslab spec        # read the current step")
+    console.print(f"  skillslab status      # current step + its module repo (if any)")
+    console.print(f"  skillslab spec        # read the current step's briefing")
 
 
 def _load_cursor(slug: str) -> tuple[dict, int, dict]:
@@ -391,6 +412,12 @@ def status(ctx, course):
         console.print(f"\n▸ [bold cyan]{label}[/bold cyan] — {step.get('title','')}")
         console.print(f"  type: [yellow]{step.get('exercise_type')}[/yellow]    "
                       f"surface: [{'magenta' if surface == 'web' else 'green'}]{surface.upper()}[/]")
+        # Module-repo context (same data the browser banner shows). Captured
+        # at start time + cached in meta.json's per-step entries.
+        if step.get("module_repo_url"):
+            ref = step.get("module_repo_ref")
+            ref_str = f"  (branch: [yellow]{ref}[/yellow])" if ref else ""
+            console.print(f"  📦 module repo: [cyan]{step['module_repo_url']}[/cyan]{ref_str}")
         console.print(f"  file: [dim]{state.course_dir(slug) / 'steps' / step.get('filename','')}[/dim]")
         if surface == "web":
             _print_web_pointer(step, meta.get("course_id", ""), action_verb="render")
