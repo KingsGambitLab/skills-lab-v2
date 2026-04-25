@@ -34,3 +34,11 @@ dump.rdb
 
 # Celery control-exchange files (runtime artifact)
 control/
+
+# Learner course-repo clones inside cli/ — happens when someone runs
+# `docker compose run` from cli/ itself (the bind mount makes /work == cli/).
+# The fix is the bin/skillslab launcher + SKILLSLAB_WORK_DIR override; this
+# rule keeps the historical mistake out of the repo.
+cli/kimi-eng-course-repo/
+cli/aie-course-repo/
+cli/jspring-course-repo/

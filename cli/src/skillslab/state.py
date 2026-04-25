@@ -4,7 +4,9 @@ EVERYTHING is files. Paths are stable + readable from any text editor:
 
     ~/.skillslab/
     ├── token                     # one bearer token per host
-    ├── api_url                   # which LMS server to talk to (defaults http://localhost:8001)
+    ├── api_url                   # which LMS server the CLI talks to (defaults http://localhost:8001)
+    ├── web_url                   # which URL the LEARNER opens in their browser (auto-derived from api_url
+    │                              # — `host.docker.internal` → `localhost` — but overridable for prod/staging)
     └── <course-slug>/
         ├── meta.json             # course id, modules, current step pointer, last sync
         ├── progress.json         # mirror of /api/auth/my-courses for this slug
@@ -21,6 +23,24 @@ Design choices:
   - Files first; JSON only where structure helps (meta + progress)
   - Step markdown is human-grep-able + editor-openable + offline-readable
   - The CLI never invents data; everything mirrors the LMS API
+
+API URL vs Web URL — TWO separate addresses, ONE config knob each
+-----------------------------------------------------------------
+Inside the Docker container, the CLI talks to the LMS via SKILLSLAB_API_URL
+(default `http://host.docker.internal:8001` in dev compose; `https://lms.example.com`
+in prod). That URL is correct *from inside the container*.
+
+But when a `web` step asks the learner to "Open in your browser:", the URL
+must be the one the LEARNER's host browser can reach. `host.docker.internal`
+only resolves inside Docker — outside, the host browser needs `localhost:8001`
+in dev, or `https://lms.example.com` in prod.
+
+Resolution order for `web_url()`:
+  1. SKILLSLAB_WEB_URL env var (explicit override)
+  2. ~/.skillslab/web_url file (set via `skillslab config web-url <url>`)
+  3. Auto-derived from api_url(): swap `//host.docker.internal` → `//localhost`
+     (covers the dev-Docker case for free; prod where api == web is also fine
+     because no host.docker.internal is involved)
 """
 from __future__ import annotations
 
@@ -58,6 +78,38 @@ def api_url() -> str:
 
 def set_api_url(url: str) -> None:
     (home() / "api_url").write_text(url.rstrip("/"))
+
+
+def web_url() -> str:
+    """URL the LEARNER opens in their browser (a `web` step's dashboard link).
+
+    Distinct from api_url() because of the Docker case: `host.docker.internal`
+    only resolves *inside* a container; from the host browser it doesn't resolve
+    at all. Resolution order:
+
+      1. SKILLSLAB_WEB_URL env var (explicit override — set in prod/staging)
+      2. ~/.skillslab/web_url file (set via `skillslab config web-url <url>`)
+      3. Auto-derive from api_url(): swap host.docker.internal → localhost
+
+    For prod where API and web share an FQDN (e.g. `https://lms.example.com`),
+    just point SKILLSLAB_API_URL there and (3) returns it untouched.
+    """
+    if "SKILLSLAB_WEB_URL" in os.environ:
+        return os.environ["SKILLSLAB_WEB_URL"].rstrip("/")
+    p = home() / "web_url"
+    if p.exists():
+        v = p.read_text().strip()
+        if v:
+            return v.rstrip("/")
+    api = api_url().rstrip("/")
+    # The only known auto-derivation: dev-Docker → host browser.
+    # Don't try to be clever about other hostnames; if api_url is exotic, the
+    # user should set SKILLSLAB_WEB_URL explicitly.
+    return api.replace("//host.docker.internal", "//localhost")
+
+
+def set_web_url(url: str) -> None:
+    (home() / "web_url").write_text(url.rstrip("/"))
 
 
 def get_token() -> str | None:

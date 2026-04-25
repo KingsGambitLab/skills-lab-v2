@@ -1,24 +1,37 @@
 # skillslab — drop into the toolchain container with your course-repo + state
-# mounted from the host. Three usage modes:
+# mounted from the host.
 #
+# Three usage modes:
 #   1) Interactive: `docker compose run --rm skillslab`
-#      Drops you into bash inside /work with skillslab on PATH. Run
-#      `skillslab login`, `skillslab start aie`, etc.
-#
+#      Drops you into bash inside /work with skillslab on PATH.
 #   2) Single command:
 #         docker compose run --rm skillslab skillslab login
 #         docker compose run --rm skillslab skillslab check
+#   3) Wrapper script (recommended — `bin/skillslab` in this repo):
+#         skillslab                 # runs from any directory, $PWD becomes /work
+#         skillslab status / spec / check / ...
 #
-#   3) Per-course wrapper:
-#         docker compose run --rm skillslab kimi-course status
+# What gets mounted into /work
+# ----------------------------
+# /work is the learner's course-repo: where `git clone`, `pytest`, `mvn test`,
+# `aider`, `claude` all run. It MUST be a clean dir containing only the
+# learner's course repo — NOT the cli source.
 #
-# Mounts:
-#   - $PWD                  → /work    (your course-repo; CLI runs `pytest`,
-#                                       `git diff`, `mvn test` here)
-#   - ~/.skillslab          → /root/.skillslab  (token + cursor + step files
-#                                                survive container restarts)
-#   - $HOME/.claude         → /root/.claude     (claude CLI auth + settings)
-#   - $HOME/.aider          → /root/.aider      (aider CLI history)
+# Resolution order (so this works whether the user runs `docker compose`
+# directly OR via the `bin/skillslab` wrapper):
+#   1. SKILLSLAB_WORK_DIR env var (the wrapper sets this to the user's $PWD)
+#   2. $PWD (the directory `docker compose` was invoked from)
+# 2026-04-25: a learner ran `docker compose run` from `cli/` itself and
+# saw cli source files (Dockerfile, src/, tests/) shadow their kimi repo
+# in /work. Adding SKILLSLAB_WORK_DIR lets `bin/skillslab` mount the
+# learner's REAL working dir regardless of where the compose file lives.
+#
+# Other mounts (always present):
+#   - ~/.skillslab    → /root/.skillslab    (token + cursor + step files)
+#   - ~/.claude       → /root/.claude       (Claude Code auth + settings)
+#   - ~/.aider        → /root/.aider        (Aider history)
+#   - ./:/skillslab-cli                     (cli/ source, for live updates;
+#                                            relative path = always cli/)
 #
 # Env passthrough: ANTHROPIC_API_KEY / OPENROUTER_API_KEY / GITHUB_TOKEN
 # from your shell so BYO-key flows work without re-auth inside the container.
@@ -35,6 +48,11 @@ services:
     tty: true
     environment:
       - SKILLSLAB_API_URL=${SKILLSLAB_API_URL:-http://host.docker.internal:8001}
+      # SKILLSLAB_WEB_URL: the URL the LEARNER opens in their browser. Distinct
+      # from API_URL because host.docker.internal only resolves INSIDE Docker.
+      # Default: empty → CLI auto-derives from API_URL (host.docker.internal →
+      # localhost). Override in prod/staging where API and web share an FQDN.
+      - SKILLSLAB_WEB_URL=${SKILLSLAB_WEB_URL:-}
       - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
@@ -43,17 +61,17 @@ services:
       # So the in-container CLI can reach the host's LMS at localhost:8001
       - "host.docker.internal:host-gateway"
     volumes:
-      - ${PWD}:/work
+      # /work — the learner's course-repo (clean dir). Wrapper script sets
+      # SKILLSLAB_WORK_DIR; direct compose use falls back to $PWD.
+      - ${SKILLSLAB_WORK_DIR:-${PWD}}:/work
       - ${HOME}/.skillslab:/root/.skillslab
       - ${HOME}/.claude:/root/.claude
       - ${HOME}/.aider:/root/.aider
       # 2026-04-25 — bind-mount the cli source over the build-time COPY so
       # `git pull` on the host instantly updates the in-container `skillslab`
-      # binary (because pip installed it editable to /skillslab-cli at build
-      # time). Without this, every cli code change required `docker compose
-      # build` to take effect — confusing user filed a stale image with
-      # missing surface badge + module repo line that had been shipped
-      # weeks earlier. The mount points at THIS docker-compose.yml's parent
-      # dir (= cli/) so it works whether the user runs from any cwd.
+      # binary (pip-installed editable to /skillslab-cli at build time).
+      # Without this, every cli code change required `docker compose build` to
+      # take effect.  The path is RELATIVE to this docker-compose.yml so it
+      # always resolves to cli/, regardless of where compose was invoked.
       - ./:/skillslab-cli
     command: /bin/bash

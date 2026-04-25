@@ -14486,15 +14486,29 @@ def _validate_scenario_branch(validation: dict, response: dict, step: Step) -> d
         if isinstance(explicit, dict):
             correct_choices = {str(k): v for k, v in explicit.items()}
 
-    # User sent: {choices: {0: 2, 1: 0, ...}} — keys are step indices, values are option indices
-    user_choices_raw = response.get("choices", response.get("steps", {}))
-    user_choices = {}
+    # User sent one of THREE shapes (frontend uses dict; agents/tests sometimes
+    # send list; AIE pass-4 expert review caught the picks=[0,0,0] case
+    # silently scoring 0.0 because the validator only looked at `choices`):
+    #   choices: {"0": 2, "1": 0, ...}     ← canonical (frontend renders this)
+    #   steps:   {"0": 2, "1": 0, ...}     ← legacy
+    #   picks:   [2, 0, 1, ...]            ← list-positional (some agents)
+    user_choices_raw = response.get("choices",
+                          response.get("steps",
+                            response.get("picks", {})))
+    user_choices: dict[str, int] = {}
     if isinstance(user_choices_raw, dict):
         for k, v in user_choices_raw.items():
             try:
                 user_choices[str(k)] = int(v) if v is not None else None
             except (ValueError, TypeError):
                 user_choices[str(k)] = v
+    elif isinstance(user_choices_raw, list):
+        # Convert positional list to keyed dict: picks[i] = option_index
+        for i, v in enumerate(user_choices_raw):
+            try:
+                user_choices[str(i)] = int(v) if v is not None else None
+            except (ValueError, TypeError):
+                user_choices[str(i)] = v
 
     if not correct_choices:
         return {"correct": False, "score": 0.0, "feedback": "No scenario answer key defined."}

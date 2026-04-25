@@ -1,0 +1,50 @@
+#!/usr/bin/env bash
+#
+# skillslab — host-side launcher.
+#
+# Run from ANY directory. $PWD becomes /work inside the container, so
+# `git clone`, `pytest`, `aider`, `claude` etc all see your real working
+# dir without the cli source files shadowing it.
+#
+# Install:
+#     mkdir -p ~/.local/bin
+#     ln -sf "$(pwd)/cli/bin/skillslab" ~/.local/bin/skillslab
+#     # ensure ~/.local/bin is on PATH (most shells already include it)
+#     skillslab --help
+#
+# Usage:
+#     cd ~/where/you/want/to/work     # any clean dir
+#     skillslab                       # interactive shell inside container
+#     skillslab status                # one-shot subcommand (no shell)
+#     skillslab login
+#     skillslab clone --fork
+#     skillslab spec
+#     skillslab check
+#
+# Auto-detects the repo root by following the symlink → cli/ → repo root.
+# Override with SKILLSLAB_REPO if your install layout is non-standard.
+set -euo pipefail
+
+# Resolve the real path of this script (handles symlinks). repo_root = parent of cli/.
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
+_cli_dir="$(dirname "$(dirname "$_self")")"
+SKILLSLAB_REPO="${SKILLSLAB_REPO:-$(dirname "$_cli_dir")}"
+
+if [[ ! -f "$SKILLSLAB_REPO/cli/docker-compose.yml" ]]; then
+  echo "skillslab launcher: cannot find docker-compose.yml at $SKILLSLAB_REPO/cli/" >&2
+  echo "Set SKILLSLAB_REPO=/path/to/skills-lab-v2 and re-run." >&2
+  exit 2
+fi
+
+# /work mounts $PWD by default. Wrapper makes that explicit so the user can
+# run from any directory without thinking about it.
+export SKILLSLAB_WORK_DIR="${SKILLSLAB_WORK_DIR:-$PWD}"
+
+# Fast path: no args = interactive bash. With args, run skillslab subcommand
+# headlessly (no extra shell layer).
+if [[ $# -eq 0 ]]; then
+  exec docker compose -f "$SKILLSLAB_REPO/cli/docker-compose.yml" run --rm skillslab
+else
+  exec docker compose -f "$SKILLSLAB_REPO/cli/docker-compose.yml" run --rm skillslab \
+    skillslab "$@"
+fi

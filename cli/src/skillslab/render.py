@@ -228,18 +228,24 @@ def step_to_markdown(
 
     # Front-matter: module_repo flows in as structured fields so other
     # commands (status / spec / check) can read it without re-parsing prose.
+    # `ensure_ascii=False` so unicode characters (em dash —, en dash, smart
+    # quotes etc.) pass through verbatim instead of becoming `—` raw
+    # escapes. User-filed (2026-04-25): the frontmatter rendered as
+    # "M6 — Capstone" which looked like garbled output.
+    def _q(s: str) -> str:
+        return json.dumps(s, ensure_ascii=False)
     fm = [
         "---",
         f"step_id: {sid}",
         f"exercise_type: {etype}",
-        f"title: {json.dumps(title)}",
-        f"course: {json.dumps(course_title)}",
-        f"module: {json.dumps(module_title)}",
+        f"title: {_q(title)}",
+        f"course: {_q(course_title)}",
+        f"module: {_q(module_title)}",
     ]
     if module_repo and module_repo.get("url"):
-        fm.append(f"module_repo_url: {json.dumps(module_repo['url'])}")
+        fm.append(f"module_repo_url: {_q(module_repo['url'])}")
         if module_repo.get("ref"):
-            fm.append(f"module_repo_ref: {json.dumps(module_repo['ref'])}")
+            fm.append(f"module_repo_ref: {_q(module_repo['ref'])}")
     fm.append("---")
 
     # Module-repo callout right after the title so it's visible in
@@ -271,6 +277,32 @@ def step_to_markdown(
         body or "_(no briefing provided)_",
     ]
 
+    # 2026-04-25 — user-filed: "Problem statement not found anywhere". The
+    # Creator's HTML body usually has narrative ("The Final Checkpoint",
+    # "Why This Matters") but the explicit ACTION list lives in
+    # demo_data.instructions for terminal_exercise. Surface it as a
+    # "## What to do" section so learners always know the steps to perform.
+    demo = step.get("demo_data") or {}
+    instructions = demo.get("instructions") if isinstance(demo, dict) else None
+    if instructions:
+        parts += ["", "## What to do", ""]
+        if isinstance(instructions, list):
+            for i, instr in enumerate(instructions, 1):
+                if isinstance(instr, dict):
+                    label = instr.get("label") or instr.get("title") or f"Step {i}"
+                    body_txt = instr.get("body") or instr.get("description") or instr.get("text") or ""
+                    cmd = instr.get("command") or instr.get("cmd") or ""
+                    parts.append(f"{i}. **{label}**")
+                    if body_txt:
+                        parts.append(f"   {body_txt}")
+                    if cmd:
+                        parts += [f"   ```", f"   {cmd}", f"   ```"]
+                else:
+                    parts.append(f"{i}. {instr}")
+        elif isinstance(instructions, str):
+            parts.append(instructions)
+        parts.append("")
+
     # If the step has a `code` field (starter snippet), surface it too
     if code and code.strip():
         parts += ["", "## Starter / Reference", "", "```", code.rstrip(), "```", ""]
@@ -298,7 +330,21 @@ def step_to_markdown(
             if rubric:
                 parts += ["**Rubric criteria:**", "", _rubric_to_text(rubric), ""]
             if must_contain:
-                parts += ["**Must contain (tokens):**", ""] + [f"- `{t}`" for t in must_contain] + [""]
+                # 2026-04-25 — user-filed: terse `must_contain` bullets
+                # like `github.com / passed / test_orders_endpoint.py`
+                # carry no context. Add a one-line preface explaining
+                # what these tokens are + a heuristic description per
+                # token so learners know WHY each must appear in their
+                # paste.
+                parts += [
+                    "**Evidence tokens (auto-detected in your `skillslab check` paste):**",
+                    "",
+                    "_Your submission must include each of these strings as_ "
+                    "_proof you ran the work. The rubric above explains why._",
+                    "",
+                ]
+                parts += [f"- `{t}` — {_describe_must_contain_token(t)}" for t in must_contain]
+                parts += [""]
 
     parts += [
         "",
@@ -334,3 +380,67 @@ def _rubric_to_text(rubric) -> str:
         # or {scoring: {...}, hints: [...]}. YAML-dump for legibility.
         return _yaml_dump(rubric)
     return str(rubric).strip()
+
+
+def _describe_must_contain_token(token: str) -> str:
+    """Heuristic: produce a 3-8 word description of what a `must_contain`
+    token is checking for. Used to expand terse evidence-token bullets
+    (`- github.com`) into self-explaining lines (`- github.com — your fork URL`).
+
+    Pattern matches the most common token shapes the Creator emits:
+      - URLs / hostnames        → "GitHub fork URL", "API endpoint", etc.
+      - File paths              → "the file you ran"
+      - Pytest output markers   → "pytest passed indicator"
+      - GHA workflow markers    → "GitHub Actions output"
+      - mvn / gradle markers    → "Maven build success"
+    Falls back to "evidence string" so we always emit SOMETHING.
+
+    User-filed (2026-04-25): bare must_contain bullets carry no context;
+    learners don't know whether 'passed' means a Java test or pytest.
+    """
+    t = (token or "").strip()
+    tl = t.lower()
+    # URLs first
+    if "github.com" in tl:
+        if "/actions/runs/" in tl:
+            return "GitHub Actions run URL"
+        return "GitHub fork URL"
+    if tl.startswith(("http://", "https://")):
+        return "URL evidence"
+    if "://" in tl:
+        return "endpoint URL"
+    # File paths / file names
+    file_exts = (".py", ".java", ".kt", ".ts", ".tsx", ".js", ".go", ".rs",
+                 ".sql", ".yml", ".yaml", ".toml", ".md", ".sh")
+    if any(tl.endswith(ext) for ext in file_exts):
+        return f"the {tl.rsplit('.', 1)[-1]} file you worked on"
+    if "/" in t and not t.startswith("/"):
+        return "file path"
+    # Test / build framework output markers
+    if tl in ("passed", "pass", "ok", "success", "succeeded"):
+        return "test/run success indicator"
+    if tl in ("failed", "fail", "error"):
+        return "failure marker (for negative-case proofs)"
+    if tl.startswith("build success"):
+        return "Maven/Gradle build success"
+    if "tests passed" in tl or "tests ran" in tl:
+        return "test runner output"
+    if tl.startswith("pytest") or "py::" in tl:
+        return "pytest output line"
+    if tl.startswith("mvn ") or "[info]" in tl or "build success" in tl:
+        return "Maven build output"
+    if "gradle" in tl:
+        return "Gradle build output"
+    if "junit" in tl:
+        return "JUnit output"
+    if tl.startswith("gh run") or tl.startswith("workflow_dispatch"):
+        return "GitHub Actions output"
+    if "completed successfully" in tl or "conclusion: success" in tl:
+        return "GHA conclusion line"
+    # Common keywords
+    if tl in ("commit", "merge", "branch", "main", "master"):
+        return "git output marker"
+    if tl in ("docker", "container", "image"):
+        return "Docker output marker"
+    # Generic fallback — better than nothing
+    return "evidence string (must appear in your paste)"

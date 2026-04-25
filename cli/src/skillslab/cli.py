@@ -340,12 +340,166 @@ def _step_surface(step: dict) -> str:
     return (step.get("learner_surface") or "web").lower()
 
 
+def _strip_frontmatter(md: str) -> str:
+    """Strip the leading YAML frontmatter (between two `---` lines) from
+    a step's markdown so terminal renders don't show the raw YAML wall.
+
+    The frontmatter exists in the file for tooling (other commands re-parse
+    it for step_id / module_repo_url etc.), but it's not human-readable —
+    user-filed (2026-04-25): it appeared as a one-line wrap with raw
+    `\\u2014` em-dash escapes, looking like a parser error.
+
+    We replace the visible frontmatter with a Rich-rendered header in the
+    spec command itself (so the structured info is still surfaced, just
+    nicely formatted)."""
+    lines = md.splitlines()
+    if not lines or lines[0].strip() != "---":
+        return md
+    end = None
+    for i in range(1, min(len(lines), 50)):  # cap scan; frontmatter is small
+        if lines[i].strip() == "---":
+            end = i
+            break
+    if end is None:
+        return md
+    return "\n".join(lines[end + 1:]).lstrip("\n")
+
+
+def _cwd_is_clone_of(repo_url: str) -> bool:
+    """Heuristic: is the current working directory a git clone of `repo_url`?
+    Used by _next_action() to decide whether to suggest `clone` vs jump
+    straight to `spec`/edit-code/`check`. Tolerates fork URLs (your fork's
+    origin might be different from the upstream). Matches by repo NAME +
+    owner — if either matches the upstream owner OR the upstream repo
+    name, we treat cwd as the right place to work.
+    """
+    import subprocess
+    try:
+        r = subprocess.run(
+            ["git", "config", "--get", "remote.origin.url"],
+            cwd=os.getcwd(), capture_output=True, text=True, timeout=3,
+        )
+        if r.returncode != 0:
+            return False
+        origin = (r.stdout or "").strip().rstrip(".git").rstrip("/")
+        upstream = (repo_url or "").strip().rstrip(".git").rstrip("/")
+        if not origin or not upstream:
+            return False
+        # Match by full repo (owner/repo) OR just repo name (handles forks)
+        origin_name = origin.rsplit("/", 1)[-1].lower()
+        upstream_name = upstream.rsplit("/", 1)[-1].lower()
+        return origin == upstream or origin_name == upstream_name
+    except Exception:
+        return False
+
+
+def _next_action(slug: str, meta: dict, step: dict | None) -> list[tuple[str, str]]:
+    """Return a list of `(verb, command)` tuples the learner should run next.
+    Always called from status/start/check/clone — keeps "what now?" omnipresent.
+
+    State tree:
+      - no token → skillslab login
+      - no course meta → skillslab courses && skillslab start <slug>
+      - cursor past last step → 🎉 course complete
+      - current step is web → open browser + sync + next
+      - current step is terminal:
+         - has module_repo + cwd not the clone → skillslab clone [--fork]
+         - has module_repo + cwd IS the clone → spec / edit / check
+         - no module_repo (concept-only) → spec / next
+    """
+    actions: list[tuple[str, str]] = []
+    if not state.get_token():
+        actions.append(("Sign in",
+                        "skillslab login"))
+        return actions
+    if not meta:
+        actions.append(("Pick a course",
+                        f"skillslab courses && skillslab start {slug or '<slug>'}"))
+        return actions
+    if not step:
+        actions.append(("Course complete 🎉",
+                        f"skillslab courses    # see other courses"))
+        return actions
+
+    surface = _step_surface(step)
+    repo_url = step.get("module_repo_url")
+    label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}"
+
+    if surface == "web":
+        actions.append(("Open in browser",
+                        f"# Then run:  skillslab sync && skillslab next"))
+        return actions
+
+    # Terminal-native step
+    if repo_url:
+        if _cwd_is_clone_of(repo_url):
+            # Already inside the clone — straight to work
+            actions.append(("Read briefing",   f"skillslab spec"))
+            actions.append(("Edit code",       f"# claude  /  aider --model openrouter/moonshotai/kimi-k2  /  vim ..."))
+            actions.append(("Test locally",    f"# pytest -q   /   mvn -q test   /   ./gradlew test"))
+            actions.append(("Grade + advance", f"skillslab check"))
+        else:
+            # Need to clone first
+            actions.append(("Clone the module repo",
+                            f"skillslab clone --fork    # forks to your account, clones to /work/<repo>"))
+            actions.append(("Or just clone (no push)",
+                            f"skillslab clone           # read-only practice"))
+    else:
+        # Pure concept / no repo
+        if step.get("exercise_type") in (None, "concept"):
+            actions.append(("Read briefing", f"skillslab spec"))
+            actions.append(("Advance",       f"skillslab next"))
+        else:
+            actions.append(("Read briefing", f"skillslab spec"))
+            actions.append(("Edit work files in /work and grade",
+                            f"skillslab check"))
+    return actions
+
+
+def _print_next_actions(actions: list[tuple[str, str]]) -> None:
+    """Render the (verb, command) list as a HIGHLIGHTED 'Next' panel.
+
+    The first action is the primary CTA — bold + cyan + boxed. Secondary
+    actions follow as dimmer hints. Pattern matches `_print_web_pointer`'s
+    panel treatment so learners learn one visual vocabulary: a panel ALWAYS
+    means "this is what to do now."
+
+    User-filed (2026-04-25): "skillslab spec being the next step should be
+    more highlighted". The previous flat indent + dim text version blended
+    into the rest of the output and learners ran blind.
+    """
+    if not actions:
+        return
+    # Primary action: boxed panel with bold command (cannot be missed).
+    primary_verb, primary_cmd = actions[0]
+    body_lines = [f"[bold cyan]{primary_cmd}[/bold cyan]"]
+    if len(actions) > 1:
+        body_lines.append("")
+        body_lines.append("[dim]then:[/dim]")
+        for verb, cmd in actions[1:]:
+            body_lines.append(f"  [cyan]{verb}[/cyan]   [dim]{cmd}[/dim]")
+    console.print()
+    console.print(Panel(
+        "\n".join(body_lines),
+        title=f"▶ Next: {primary_verb}",
+        border_style="green",
+        box=box.ROUNDED,
+        padding=(0, 2),
+    ))
+
+
 def _browser_url(course_id: str, step: dict) -> str:
     """Build the dashboard deeplink for a step. The web frontend's hash
     router accepts `#<courseId>` and the active step is restored from the
     last visited cursor — for a more precise link we'd want a step-id-based
-    deep route, but that lives in a separate router change."""
-    base = state.api_url().rstrip("/")
+    deep route, but that lives in a separate router change.
+
+    Uses state.web_url() (NOT api_url()) because `host.docker.internal` only
+    resolves inside the container; the learner's host browser needs
+    `localhost:8001` (dev) or the prod FQDN. See state.web_url() docstring
+    for the auto-derivation + override path.
+    """
+    base = state.web_url().rstrip("/")
     return f"{base}/#{course_id}"
 
 
@@ -447,32 +601,50 @@ def spec(ctx, course, no_pager):
         sys.exit(2)
     md = p.read_text()
 
+    # Strip YAML frontmatter from the visible render. User-filed (2026-04-25):
+    # the frontmatter was being printed as plain prose ("step_id: 85163
+    # exercise_type: terminal_exercise title: ..." all on one wrapped line)
+    # which looked like a parser error. The structured metadata is still in
+    # the file (so other tools can re-parse it), but for human reading we
+    # surface a tidy header from `step` instead.
+    md_body = _strip_frontmatter(md)
+
+    # Build the styled header (replaces the YAML wall of escapes).
+    m_pos = step.get("module_pos", 0)
+    s_pos = step.get("step_pos", 0)
+    label = f"M{m_pos - 1}.S{s_pos}"
+    repo_url = step.get("module_repo_url")
+    repo_ref = step.get("module_repo_ref")
+    header_lines = [
+        f"[bold cyan]{label}[/bold cyan] — [bold]{step.get('title','')}[/bold]",
+        f"[dim]module:[/dim] {step.get('module_title','')}    "
+        f"[dim]type:[/dim] [yellow]{step.get('exercise_type','concept')}[/yellow]    "
+        f"[dim]step id:[/dim] [cyan]{step.get('id')}[/cyan]",
+    ]
+    if repo_url:
+        ref_str = f"  (branch: [yellow]{repo_ref}[/yellow])" if repo_ref else ""
+        header_lines.append(
+            f"[dim]📦 Module repo:[/dim] [cyan]{repo_url}[/cyan]{ref_str}\n"
+            f"[dim]Clone:[/dim]  [bold]git clone {repo_url}.git[/bold]"
+        )
+    console.print()
+    console.print(Panel(
+        "\n".join(header_lines),
+        border_style="cyan", box=box.ROUNDED, padding=(0, 1),
+    ))
+
     if surface == "web":
-        # Print the YAML front-matter + first heading + first paragraph
-        # of the briefing only, then the browser pointer. The full
-        # interactive widget content lives on the web surface — there's
-        # no value in dumping the whole markdown here.
-        head_lines = []
-        in_fm = False
-        body_started = False
+        # For web steps, only show first heading + first paragraph (the
+        # full widget renders in the browser). Skip the full markdown dump.
+        body_lines = []
         body_paragraphs = 0
-        for line in md.splitlines():
-            if line.startswith("---") and not in_fm:
-                in_fm = True
-                continue
-            if line.startswith("---") and in_fm:
-                in_fm = False
-                continue
-            if in_fm:
-                continue
-            head_lines.append(line)
-            if line.strip() and not line.startswith("#") and not line.startswith("_"):
-                body_started = True
-            if body_started and line.strip() == "":
+        for line in md_body.splitlines():
+            body_lines.append(line)
+            if line.strip() == "" and any(l.strip() for l in body_lines[:-1]):
                 body_paragraphs += 1
                 if body_paragraphs >= 2:
                     break
-        summary = "\n".join(head_lines).strip()
+        summary = "\n".join(body_lines).strip()
         if no_pager:
             click.echo(summary)
         else:
@@ -480,11 +652,52 @@ def spec(ctx, course, no_pager):
         _print_web_pointer(step, meta.get("course_id", ""), action_verb="render")
         return
 
-    # Terminal step: render full briefing
+    # Terminal step: render full briefing (frontmatter already stripped).
     if no_pager:
-        click.echo(md)
+        click.echo(md_body)
     else:
-        console.print(Markdown(md))
+        console.print(Markdown(md_body))
+
+    # Always end with the next-action hint so learners know what's coming.
+    actions = _next_action(slug, meta, step)
+    _print_next_actions(actions)
+
+
+@cli.command(name="now")
+@click.option("--course", default=None)
+@click.pass_context
+def now_cmd(ctx, course):
+    """Show what to do RIGHT NOW for the current course/step.
+
+    User-filed (2026-04-25): "Add a cli helper command to show next step at
+    all times". This is the omnipresent guidance — runnable any time, gives
+    a one-glance answer to 'where am I, what's next?'. Pulls the same
+    next-action state tree status/spec/check use, plus a one-line cursor
+    summary, into one tight panel.
+
+    Usage:
+        skillslab now             # default course
+        skillslab now --course kimi
+    """
+    slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
+    meta, cur, step = _load_cursor(slug)
+    total = len(meta.get("steps", []))
+    label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}" if step else "—"
+    surface = _step_surface(step) if step else "?"
+    surface_color = "magenta" if surface == "web" else "green"
+    title_line = (
+        f"[bold]{meta.get('course_title','')}[/bold]\n"
+        f"[dim]cursor:[/dim] step [bold]{cur + 1}[/bold] of {total}    "
+        f"[dim]current:[/dim] [bold cyan]{label}[/bold cyan] "
+        f"([{surface_color}]{surface.upper()}[/])\n"
+        f"[bold]{step.get('title','—')}[/bold]"
+    )
+    if step.get("module_repo_url"):
+        title_line += f"\n[dim]📦 module repo:[/dim] [cyan]{step['module_repo_url']}[/cyan]"
+    console.print()
+    console.print(Panel(title_line, border_style="cyan", box=box.ROUNDED, padding=(0, 1)))
+    actions = _next_action(slug, meta, step)
+    _print_next_actions(actions)
 
 
 @cli.command(name="next")
@@ -505,8 +718,16 @@ def next_cmd(ctx, course):
     meta["last_active_at"] = _now_iso()
     state.write_meta(slug, meta)
     s = steps[cur + 1]
-    console.print(f"[green]→[/green] M{s['module_pos']-1}.S{s['step_pos']} — {s['title']}")
-    console.print("[dim]skillslab spec[/dim]")
+    label = f"M{s['module_pos']-1}.S{s['step_pos']}"
+    console.print(f"\n[green]→[/green] [bold cyan]{label}[/bold cyan] — [bold]{s['title']}[/bold]")
+    # 2026-04-25 — replaced the dim-grey hint with a highlighted CTA panel.
+    # User-filed issue: "skillslab spec being the next step should be more
+    # highlighted". A passive [dim] line below the cursor advance was easy
+    # to miss; learners reported running blind. Same pattern as the WEB
+    # step pointer panel — use a Rich Panel + bold cyan command so the
+    # next move is unmissable.
+    actions = _next_action(slug, meta, s)
+    _print_next_actions(actions)
 
 
 @cli.command(name="prev")
@@ -548,6 +769,97 @@ def goto(ctx, label, course):
             return
     console.print(f"[red]No step labeled {target}.[/red] Run `skillslab status` to see options.")
     sys.exit(2)
+
+
+@cli.command()
+@click.option("--course", default=None)
+@click.option("--fork/--no-fork", default=False,
+              help="Fork the upstream repo to your account first (requires gh CLI authed).")
+@click.option("--dir", "target_dir", default=None,
+              help="Where to clone (default: /work/<repo-name>).")
+@click.pass_context
+def clone(ctx, course, fork, target_dir):
+    """Clone the current module's starter repo into your toolchain workspace.
+
+    Designed to run INSIDE the toolchain container — keeps learners
+    immersive without ever exiting to the host. Reads the current
+    cursor's `module_repo_url` (cached at `start` time), optionally
+    forks via `gh` CLI, clones into `/work/<repo-name>`, then prints
+    the cd command to enter it.
+
+    With --fork: requires `gh` (GitHub CLI) on PATH and `gh auth status`
+    showing logged-in. Forks the upstream to your account, clones THAT,
+    and sets the upstream remote so `git pull` against the original
+    branch still works.
+
+    Without --fork: clones the upstream directly (read-only practice).
+    For capstone steps that ask you to PUSH back, use --fork.
+    """
+    import shutil, subprocess, os
+    slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
+    meta, cur, step = _load_cursor(slug)
+    repo_url = step.get("module_repo_url")
+    repo_ref = step.get("module_repo_ref")
+    if not repo_url:
+        console.print("[yellow]Current module has no discoverable starter repo.[/yellow]")
+        console.print("[dim]Run `skillslab status` — module_repo line is shown if any.[/dim]")
+        sys.exit(1)
+
+    # Derive repo name from URL: tusharbisht/kimi-eng-course-repo → kimi-eng-course-repo
+    repo_name = repo_url.rstrip("/").rstrip(".git").rsplit("/", 1)[-1]
+    dest = Path(target_dir) if target_dir else Path("/work") / repo_name
+    if dest.exists():
+        console.print(f"[yellow]{dest}[/yellow] already exists — skipping clone.")
+        console.print(f"  cd {dest}")
+        return
+
+    if fork:
+        if not shutil.which("gh"):
+            console.print("[red]`gh` CLI not on PATH.[/red] Install gh inside the container "
+                          "(it ships with the latest skillslab image — rebuild via "
+                          "`docker compose build`).")
+            sys.exit(1)
+        # Verify auth
+        rc = subprocess.run(["gh", "auth", "status"], capture_output=True, text=True)
+        if rc.returncode != 0:
+            console.print("[red]`gh` not authenticated.[/red] Run `gh auth login` "
+                          "(or set GITHUB_TOKEN env) before --fork.")
+            sys.exit(1)
+        console.print(f"[cyan]Forking[/cyan] {repo_url} to your account…")
+        # gh repo fork accepts the upstream URL; --clone clones the fork
+        gh_args = ["gh", "repo", "fork", repo_url, "--clone", "--remote", "--default-branch-only=false"]
+        if str(dest) != str(Path.cwd() / repo_name):
+            # gh fork doesn't take an explicit dest; clone to cwd then move
+            tmp_parent = dest.parent
+            tmp_parent.mkdir(parents=True, exist_ok=True)
+            os.chdir(tmp_parent)
+        r = subprocess.run(gh_args, text=True)
+        if r.returncode != 0:
+            console.print("[red]Fork failed.[/red] Try forking via the GitHub web UI then "
+                          "re-running `skillslab clone` (no --fork).")
+            sys.exit(1)
+        # gh clones to cwd/<repo-name> by default — that's our `dest`.
+    else:
+        dest.parent.mkdir(parents=True, exist_ok=True)
+        clone_url = repo_url if repo_url.endswith(".git") else repo_url + ".git"
+        r = subprocess.run(["git", "clone", clone_url, str(dest)], text=True)
+        if r.returncode != 0:
+            console.print(f"[red]git clone failed (rc={r.returncode}).[/red]")
+            sys.exit(1)
+
+    # If module specifies a branch, check it out
+    if repo_ref:
+        console.print(f"[cyan]Checking out branch[/cyan] {repo_ref}…")
+        subprocess.run(["git", "-C", str(dest), "fetch", "origin"], text=True)
+        subprocess.run(["git", "-C", str(dest), "checkout", repo_ref], text=True)
+
+    console.print(f"\n[green]✓ Ready[/green] at [bold]{dest}[/bold]")
+    console.print()
+    console.print("[bold]Next:[/bold]")
+    console.print(f"  cd {dest}")
+    console.print(f"  skillslab spec        # read the briefing")
+    console.print(f"  # ...edit code with claude / aider...")
+    console.print(f"  skillslab check       # grade + advance")
 
 
 @cli.command()

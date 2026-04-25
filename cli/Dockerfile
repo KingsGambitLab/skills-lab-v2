@@ -34,7 +34,21 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates curl wget gnupg2 git jq less openssh-client \
         build-essential pkg-config \
         default-jdk-headless \
+        vim nano \
     && rm -rf /var/lib/apt/lists/*
+
+# GitHub CLI — `gh repo fork --clone` is the immersive fork path so the
+# learner never has to leave the container to set up a fork. Installed
+# from the official cli/cli apt repo.
+RUN curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        | dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/* \
+    && gh --version
 
 # JAVA_HOME resolves dynamically (different on amd64 vs arm64). Set it
 # from the actual link target so `mvn`, `javac` etc. find their JDK.
@@ -96,14 +110,18 @@ echo ""
 echo "  ┌─────────────────────────────────────────────────────────────┐"
 echo "  │  skillslab — AI-augmented engineering, in your terminal     │"
 echo "  ├─────────────────────────────────────────────────────────────┤"
-echo "  │  skillslab login                  — sign in (BYO bearer)    │"
-echo "  │  skillslab start <kimi|aie|jspring> — pull a course locally │"
-echo "  │  skillslab status / spec / check / next                     │"
+echo "  │  Immersive flow (everything stays in this container):       │"
 echo "  │                                                             │"
-echo "  │  toolchain in this image:                                   │"
-echo "  │    python  $(python3 --version 2>&1 | awk '{print $2}')                  $(claude --version 2>&1 | head -1 | awk '{print $1, $2}')   │"
-echo "  │    java    $(java --version 2>&1 | head -1 | awk '{print $2}')                       $(aider --version 2>&1 | awk '{print $1,$2}')   │"
-echo "  │    node    $(node --version 2>&1 | tr -d 'v')                            mvn $(mvn -v 2>&1 | head -1 | awk '{print $3}')         │"
+echo "  │    skillslab login              — sign in (BYO bearer)      │"
+echo "  │    skillslab start <kimi|aie|jspring>                       │"
+echo "  │    skillslab status             — current step + repo URL   │"
+echo "  │    skillslab clone --fork       — fork & clone into /work   │"
+echo "  │    skillslab spec               — read the step briefing    │"
+echo "  │    # ...edit code with claude / aider...                    │"
+echo "  │    skillslab check              — grade + advance on pass   │"
+echo "  │                                                             │"
+echo "  │  Toolchain inside this image:                               │"
+echo "  │    python java node | claude aider mvn pytest gh git vim    │"
 echo "  └─────────────────────────────────────────────────────────────┘"
 echo ""
 EOF
