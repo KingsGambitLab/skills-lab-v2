@@ -7115,7 +7115,301 @@ template, with `$ARGUMENTS` interpolated at invocation time.
 - `claude /mcp list`               ← NOT VALID; do not concatenate. Either you're
                                      at the shell (`claude mcp list`) OR inside
                                      Claude (`/mcp`).
+
+=== One-shot prompts vs REPL (catches a common hallucination) ===
+- Bare `claude` with NO args opens an interactive REPL session.
+- One-shot mode (the form courses usually want for verification): `claude -p "<prompt>"`.
+- DO NOT teach `claude '<prompt>'` (no `-p`, prompt as positional arg) — that
+  is NOT a valid one-shot form; without `-p` the prompt is ignored and the
+  REPL opens. Verification rubrics that paste the output of `claude '...'`
+  WITHOUT `-p` will never match because no output is produced.
+- `claude --print "<prompt>"` is a long-form alias for `-p`. Both work.
+
+=== `claude code` is NOT a subcommand ===
+- The CLI binary is `claude`. There is no `claude code` subcommand.
+- DO NOT write `$ claude code` in instructions. Use `$ claude` (REPL) or
+  `$ claude -p "..."` (one-shot).
+- "Claude Code" is the PRODUCT NAME for the `claude` CLI, not an invocation.
+
+=== Claude Code is a CLI, NOT a desktop application ===
+- DO NOT call it "Claude Code Desktop", "Claude Code (Desktop)", or link to
+  `claude.ai/download` as the install URL.
+- Real install paths:
+    npm:  `npm install -g @anthropic-ai/claude-code`
+    curl: `curl -fsSL https://claude.ai/install.sh | bash`
+- "Claude Desktop" is a SEPARATE Anthropic product (a chat app for Claude.ai);
+  it is NOT Claude Code. Do not conflate.
+
+=== Hooks are SHELL SCRIPTS, not Python functions ===
+- A hook is a process that reads stdin JSON and exits with a status code.
+- It can be ANY executable (bash, python, node, go binary). What makes it a
+  "hook" is the stdin/stdout/exit-code contract, NOT a function signature.
+- DO NOT teach hooks as `def validate_db_operations(tool_name, args) -> dict`
+  returning `{"block": True, "reason": "..."}`. That is fictional. Hooks
+  communicate via:
+    - stdin: JSON with `tool_name` + `tool_input.*`
+    - stderr: human-readable reason text (shown to the model on block)
+    - exit: 0 = allow, 2 = block, 1/other = warn
+- A Python hook is a SCRIPT (run via shebang or `python3 .claude/hooks/x.py`);
+  inside, it does `import sys, json; data = json.load(sys.stdin); ...; sys.exit(2)`.
+  NOT a function imported into Claude Code.
+
+=== `claude mcp add` does NOT take URLs ===
+- `claude mcp add` takes a NAME + COMMAND/PATH, not an HTTPS URL:
+    GOOD: `claude mcp add team-tickets python -m team_tickets_mcp --transport stdio`
+    GOOD: `claude mcp add team-tickets /abs/path/server.py --transport stdio`
+    BAD:  `claude mcp add https://github.com/owner/repo`     ← invalid
+    BAD:  `claude mcp install <github-url>`                  ← no `install` subcommand
+- For HTTP-transport MCPs, use `--transport http <url>`, but the BASE form
+  is still `claude mcp add <name> <url> --transport http`. The URL goes
+  AFTER the name; it's never the SOLE argument.
 """
+
+
+def _check_verified_facts_drift(
+    *,
+    content_obj: dict,
+    course_has_claude_code: bool,
+    course_has_aider: bool,
+) -> list[str]:
+    """Scan a generated step's content + code + validation + demo_data for
+    known-bad strings that violate the verified-facts blocks. Returns a list
+    of human-readable violation messages — empty list = clean.
+
+    Used by `_is_complete()` to reject + retry generations that drift past
+    the injected facts. The violation list is captured into
+    `_last_invariant_reason` so the next retry's prompt sees the EXACT
+    failures from the prior attempt. Per CLAUDE.md "Always pass on last
+    failure reasons in future calls."
+
+    Phase 2 of the v8.7 root-cause fix (2026-04-25). Without this gate,
+    the verified-facts blocks were paraphrased or ignored on ~30% of
+    generations even when injected.
+    """
+    import re  # local import — module avoids global `re` (uses aliases elsewhere)
+    violations: list[str] = []
+
+    # Concatenate every learner-visible text field into one haystack to
+    # search. We include validation + demo_data because rubrics + must_contain
+    # frequently leak invented syntax (e.g. AIE M4.S0 widget had wrong MCP
+    # add form in the concept HTML).
+    parts: list[str] = []
+    for k in ("content", "code", "expected_output"):
+        v = content_obj.get(k)
+        if isinstance(v, str):
+            parts.append(v)
+    for k in ("validation", "demo_data"):
+        v = content_obj.get(k)
+        if v:
+            try:
+                parts.append(json.dumps(v))
+            except Exception:
+                parts.append(str(v))
+    haystack = "\n".join(parts).lower()
+    haystack_orig = "\n".join(parts)  # case-preserving for some checks
+
+    if course_has_claude_code:
+        # Drifts the AIE expert review caught (2026-04-25). Each entry is
+        # (regex-or-substring, violation message). All checks against
+        # case-preserving haystack_orig — `Claude Code` (Title Case) is the
+        # PRODUCT NAME and must NOT trigger; only lowercase `claude code` in
+        # a shell-command context is the drift we care about.
+        cc_drifts = [
+            # Shell drift: `$ claude code` / `> claude code` / `<code>claude code</code>`
+            # / inside <pre> blocks. Case-sensitive (lowercase only) so the
+            # product name "Claude Code" in prose doesn't match.
+            (r"(?:[\$>]\s*|<code[^>]*>|<pre[^>]*>[^<]*?)\bclaude\s+code\b",
+             "uses `claude code` as if it were a subcommand (in shell prompt or code block). The CLI is `claude` (no subcommand). Use `claude` for REPL or `claude -p '<prompt>'` for one-shot."),
+            (r"claude\s*/mcp\s+\w",
+             "concatenates `claude /mcp <arg>` — that's neither valid form. Use the SHELL form `claude mcp <subcommand>` OR the SLASH form `/mcp` inside an interactive Claude session, never both."),
+            (r"\bclaude\s+auth\b",
+             "uses `claude auth` — invented subcommand. Use `claude /login` (interactive) or `ANTHROPIC_API_KEY` env var (headless)."),
+            (r"claude\s+code\s*\(?\s*desktop\s*\)?",
+             "calls Claude Code 'Claude Code Desktop' or 'Claude Code (Desktop)' — Claude Code is a CLI, not a desktop app. Don't conflate with the separate 'Claude Desktop' product."),
+            (r"claude\.ai/download",
+             "links to claude.ai/download as the Claude Code install URL — wrong product. Real install: `npm install -g @anthropic-ai/claude-code` OR `curl -fsSL https://claude.ai/install.sh | bash`."),
+            (r"str_replace_editor",
+             "references `str_replace_editor` as a Claude Code tool name. That's an Anthropic API computer-use tool type, not a Claude Code hook matcher. Use capitalized real tools: `Edit`, `Write`, `Read`, `Bash`."),
+            # Lowercased tool names in hook matchers / settings.json
+            (r'"matcher"\s*:\s*"(?:read_file|edit_file|bash|read|write|edit|grep|glob)"',
+             "uses lowercase tool names in a hook matcher — Claude Code tool names are CAPITALIZED in settings.json (`Edit`, `Write`, `Bash`, `Read`, `Grep`, `Glob`)."),
+            # invented settings.json schema
+            (r'"hooks"\s*:\s*\{\s*"pre_tool_use"',
+             "uses snake_case `pre_tool_use` in settings.json — events are PascalCase (`PreToolUse`, `PostToolUse`, `Stop`)."),
+            (r'"subagents"\s*:\s*\{',
+             "puts a `subagents` map in settings.json — fictional structure. Subagents are auto-discovered from `.claude/agents/*.md` files, not registered in JSON."),
+            (r'"file_operations"\s*:\s*\{[^}]*"allowed_extensions"',
+             "uses `permissions.file_operations.allowed_extensions` — invented schema. Real shape: `permissions.allow: [...]`, `permissions.deny: [...]`."),
+            (r'"system_commands"\s*:\s*\{[^}]*"allowed"',
+             "uses `permissions.system_commands.allowed` — invented schema. Real: `permissions.allow: [\"Bash(...)\"]`."),
+        ]
+        for pat, msg in cc_drifts:
+            # Case-sensitive against haystack_orig — Title Case product
+            # name "Claude Code" must not trigger the shell-subcommand drift.
+            if re.search(pat, haystack_orig):
+                violations.append(f"CLAUDE_CODE_DRIFT: {msg}")
+        # Hook example uses `exit 1` to "block" — context-dependent, only
+        # flag if the same chunk teaches blocking. Catches both shell
+        # `exit 1` and Python `sys.exit(1)` / `exit(1)`.
+        if re.search(
+            r"(?:hook|guardrail|block).{0,400}(?:\bexit\s+1\b|\b(?:sys\.)?exit\s*\(\s*1\s*\))",
+            haystack, re.DOTALL | re.IGNORECASE,
+        ):
+            if "exit 2" not in haystack and "exit(2)" not in haystack:
+                violations.append("CLAUDE_CODE_DRIFT: hook example uses `exit 1` to block — that does NOT block, it warns. Use `exit 2` to block (verified facts).")
+
+    if course_has_aider:
+        aider_drifts = [
+            # Wrong model id slug
+            (r"kimi-k2-0\d{3}\b|kimi-k2-latest\b|kimi-k2-0711\b",
+             "uses a date-stamped Kimi K2 slug (`kimi-k2-0905`, `kimi-k2-latest`, `kimi-k2-0711`). The canonical OpenRouter slug is `moonshotai/kimi-k2` — use the unversioned form for stability."),
+            # Invented /load usage
+            (r"/load\s+\S*\.(?:md|txt|prompt)\b",
+             "teaches `/load <prompt-file>.md` — that's NOT how /load works. /load replays slash-command history; use `/read <file>` to inject a file as context, OR `aider --message-file <file>` at the shell."),
+            # Invented .aider/commands/ directory
+            (r"\.aider/commands(?:/|\b)",
+             "references `.aider/commands/` directory — fictional. Aider has no 'custom commands' feature stored at that path. Store reusable prompt templates anywhere (e.g. `prompts/<name>.md`) and inject via `--message-file` or `/read`."),
+            # Wrong env var combo
+            (r"--openai-api-base.{0,200}OPENAI_API_KEY",
+             "teaches `--openai-api-base` + `OPENAI_API_KEY` for OpenRouter — non-canonical LiteLLM passthrough. Use canonical: `--model openrouter/<provider>/<model>` + `OPENROUTER_API_KEY`."),
+            # CLAUDE.md as Aider context file
+            (r"\bCLAUDE\.md\b",
+             "uses CLAUDE.md as the project-conventions file in an Aider course — that's the Claude-Code-specific name. Aider docs say `CONVENTIONS.md`; community standard is `AGENTS.md`. Pick ONE name and use consistently."),
+            # Aider version drift / stale pins
+            (r"aider\s+0\.4[0-9]\b|aider\s+0\.5[0-9]\b",
+             "pins to a stale Aider version (0.4x / 0.5x). Use 'Aider 0.86+' or 'any recent Aider' instead."),
+        ]
+        for pat, msg in aider_drifts:
+            if re.search(pat, haystack_orig, re.IGNORECASE):
+                violations.append(f"AIDER_DRIFT: {msg}")
+
+    return violations
+
+
+def _aider_reference_facts() -> str:
+    """VERIFIED Aider + open-router-routed model facts. NEW v8.7 (2026-04-25)
+    after the Kimi+Aider course expert review caught:
+
+      - Invented `/load prompts/audit-endpoint.md` — `/load` exists but loads
+        SAVED COMMAND HISTORY, not arbitrary prompt files
+      - Invented `.aider/commands/` directory (no such convention)
+      - Wrong model id `kimi-k2-0905` (not a published OpenRouter slug)
+      - Non-canonical `--openai-api-base` + `OPENAI_API_KEY` flow when the
+        documented form is `--model openrouter/...` + `OPENROUTER_API_KEY`
+      - Aider version drift inside the same step (0.45.0 vs 0.65.0)
+
+    Inject via `_course_has_aider_scope(title, description)` check whenever
+    a course teaches Aider.
+    """
+    return """
+AIDER REFERENCE FACTS (v2026-04 — QUOTE VERBATIM, do not paraphrase):
+
+=== Real Aider in-session commands (the FULL list — do NOT invent others) ===
+/help, /add, /drop, /clear, /reset, /run, /test, /commit, /diff, /undo,
+/architect, /code, /ask, /chat-mode, /editor, /lint, /load, /save, /tokens,
+/voice, /web, /ls, /git, /report, /settings, /model, /multiline-mode,
+/think-tokens, /reasoning-effort, /copy, /paste, /context, /map, /map-refresh,
+/copy-context, /exit, /quit
+
+CONTEXT FOR LOAD/SAVE — A FREQUENTLY HALLUCINATED PAIR:
+  - `/save <file>` — saves the SLASH-COMMAND HISTORY of the current session
+    to a file (one /command per line). Used to checkpoint a session.
+  - `/load <file>` — REPLAYS the slash-command history from such a file.
+    It does NOT load arbitrary text/markdown into context; it does NOT
+    inject "prompt templates" into your message; it ONLY runs lines as if
+    you typed them.
+  - DO NOT teach `/load prompts/<name>.md` to "load a reusable prompt."
+    That is NOT how /load works. The valid replacements:
+      (a) `/read prompts/<name>.md`           ← injects file as read-only context
+      (b) `aider --message-file prompts/<name>.md`   ← shell flag, runs the file's text as the first message
+      (c) shell aliases or Make targets piping into `aider --message "..."`
+
+=== `.aider/commands/` does NOT exist ===
+- There is NO Aider feature called "custom commands" stored at
+  `.aider/commands/<name>.md`. Do not teach this. It is fictional.
+- For reusable prompt templates, store them at any path you choose
+  (e.g. `prompts/<name>.md`) and inject via `--message-file` or `/read`.
+
+=== Project conventions file ===
+- Aider supports a project-conventions file declared in `.aider.conf.yml`
+  via `read: CONVENTIONS.md` (or any path). The community-standard naming
+  is `CONVENTIONS.md`; many teams use `AGENTS.md` (cross-tool standard).
+- DO NOT call this file `CLAUDE.md` in an Aider course — that's the
+  Claude-Code-specific convention. Aider docs say `CONVENTIONS.md`;
+  AGENTS.md is the cross-tool community standard. Pick ONE name (AGENTS.md
+  is fine for AI-tool-agnostic courses) and use it consistently.
+
+=== `.aider.conf.yml` real keys (frequently hallucinated) ===
+auto-commits, dirty-commits, attribute-author, attribute-committer,
+read, edit-format, model, weak-model, editor-model, map-tokens,
+restore-chat-history, dark-mode, light-mode, pretty, stream, voice-input,
+gitignore, encoding, openai-api-base, openai-api-key, openrouter-api-key,
+verify-ssl, suggest-shell-commands, fancy-input, multiline-mode
+
+=== Auto-commits behavior ===
+- `auto-commits: true` (default) — Aider commits each accepted edit immediately
+  with an LLM-generated message. PR-review workflows usually want this OFF
+  (`auto-commits: false`) so the human can curate the commit graph.
+- `dirty-commits: true` (default) — when the working tree has uncommitted
+  changes when Aider starts, it commits them as "before aider" so its own
+  diffs stay clean. Some teams want this OFF too.
+
+=== Model routing — OpenRouter (canonical) ===
+- Route: `--model openrouter/<provider>/<model>`
+- Auth env: `OPENROUTER_API_KEY`
+- For Moonshot Kimi K2 specifically:
+    --model openrouter/moonshotai/kimi-k2
+    OPENROUTER_API_KEY=<key>
+- DO NOT use `kimi-k2-0905`, `kimi-k2-latest`, `kimi-k2-0711` as the model
+  slug in the path. The canonical OpenRouter slug for the Moonshot K2
+  product is `moonshotai/kimi-k2`. Date-stamped variants are aliases that
+  may rotate; use the unversioned slug for stability.
+
+=== Model routing — non-canonical OpenAI-compatible passthrough ===
+- The form `--openai-api-base https://openrouter.ai/api/v1 --model
+  openai/<openrouter-slug>` works (LiteLLM passthrough) but is NOT the
+  documented Aider path. It uses `OPENAI_API_KEY` (counter-intuitive)
+  rather than the real env var.
+- Prefer `--model openrouter/...` + `OPENROUTER_API_KEY`. Reserve the
+  passthrough only when explicitly teaching how legacy/incompatible
+  providers route; do not use it in a "first encounter with Kimi" step.
+
+=== Mode primitives ===
+- `/architect`  — plan-only mode (LLM proposes, you confirm before edit)
+- `/code`       — direct edit mode (default for most workflows)
+- `/ask`        — read-only Q&A about codebase (no edits)
+- `/chat-mode <code|architect|ask|help|context>` — switch mode mid-session
+
+There is NO `/plan`, `/scaffold`, `/refactor`, `/review` mode primitive.
+
+=== Cost telemetry ===
+- `/tokens` — prints session token use + estimated cost (per-model rates).
+  ALWAYS teach this in cost-conscious courses.
+- `/clear` to drop the chat history when the session bloats; map-tokens
+  caps at `--map-tokens` (default 1024).
+
+=== `/run` and `/test` ===
+- `/run <cmd>` — runs a shell command, captures its stdout/stderr, and adds
+  the output to the chat as context for the next turn.
+- `/test <cmd>` — same but flagged as a test command; auto-injected as
+  context after every accepted edit (set in .aider.conf.yml `test-cmd`).
+
+=== Aider versioning ===
+- DO NOT pin to a stale version like 0.45 in instructions; current Aider
+  releases ship monthly. Prefer "Aider 0.86+" or "any recent Aider"
+  language unless a specific version is load-bearing for a feature.
+"""
+
+
+def _course_has_aider_scope(title: str = "", description: str = "", source_material: str = "") -> bool:
+    """True if the course's text mentions Aider (the open-source AI coding
+    CLI) in a meaningful way. Mirrors `_course_has_claude_code_scope`.
+    """
+    text = f"{title}\n{description}\n{source_material}".lower()
+    return any(m in text for m in (
+        "aider", ".aider.conf", "aider-chat", "aider.chat",
+        "openrouter", "kimi k2", "kimi-k2", "moonshotai",
+    ))
 
 
 def _course_has_claude_code_scope(title: str = "", description: str = "", source_material: str = "") -> bool:
@@ -8669,8 +8963,14 @@ IMPORTANT for incident_console:
                 _cc_title = _cc_title or (step_title or "")
                 if _course_has_claude_code_scope(_cc_title, _cc_desc, _cc_src):
                     prompt += "\n\n" + _claude_code_reference_facts() + "\n"
+                # 2026-04-25 v8.7 — Aider verified-facts block. Mirrors the
+                # claude_code injection. Added after Kimi+Aider course expert
+                # review caught fictional `/load <prompt>` syntax + invented
+                # `.aider/commands/` directory + wrong model id `kimi-k2-0905`.
+                if _course_has_aider_scope(_cc_title, _cc_desc, _cc_src):
+                    prompt += "\n\n" + _aider_reference_facts() + "\n"
             except Exception as _cc_err:
-                logging.warning("Claude Code facts injection failed (non-fatal): %s", _cc_err)
+                logging.warning("Verified-facts injection failed (non-fatal): %s", _cc_err)
             # v8.6 (2026-04-24) LANGUAGE LOCK — domain-expert review of TS v12
             # caught 7/10 code_exercise steps shipping as Python despite a TS
             # course. Root cause: the static code_exercise prompt listed Python
@@ -10188,6 +10488,45 @@ async def _creator_generate_impl(
                 except Exception as _onto_err:
                     # Gate bug must NOT hard-fail generation; log + continue.
                     logging.warning("ontology gate error (soft-pass): %s", _onto_err)
+
+                # 2026-04-25 v8.7 — VERIFIED-FACTS DRIFT GATE.
+                # The _claude_code_reference_facts() / _aider_reference_facts()
+                # blocks are injected into the Creator prompt for in-scope
+                # courses. Despite that, the LLM occasionally paraphrases or
+                # reverts to stale training data — caught by the AIE + Kimi
+                # expert reviews (2026-04-25). This gate scans the produced
+                # content for known-bad strings and rejects → forces retry
+                # with the violations captured into _last_invariant_reason.
+                try:
+                    _vf_title = ""
+                    _vf_desc = ""
+                    _vf_src = ""
+                    if isinstance(course_context, dict):
+                        _vf_title = str(course_context.get("course_title") or course_context.get("title") or "")
+                        _vf_desc = str(course_context.get("description") or "")
+                        _vf_src = str(course_context.get("source_material") or "")
+                    _vf_title = _vf_title or (step_outline.title or "")
+                    _has_cc = _course_has_claude_code_scope(_vf_title, _vf_desc, _vf_src)
+                    _has_aider = _course_has_aider_scope(_vf_title, _vf_desc, _vf_src)
+                    if _has_cc or _has_aider:
+                        _violations = _check_verified_facts_drift(
+                            content_obj=content_obj,
+                            course_has_claude_code=_has_cc,
+                            course_has_aider=_has_aider,
+                        )
+                        if _violations:
+                            logging.warning(
+                                "VERIFIED-FACTS DRIFT step=%r ex_type=%s n_violations=%d:\n  - %s",
+                                getattr(step_outline, "title", "?"), ex_type,
+                                len(_violations), "\n  - ".join(_violations[:5]),
+                            )
+                            _last_invariant_reason[0] = (
+                                "Verified-facts drift — fix THESE specific issues from the prior attempt:\n"
+                                + "\n".join(f"  - {v}" for v in _violations[:8])
+                            )[-1500:]
+                            return False
+                except Exception as _vf_err:
+                    logging.warning("verified-facts drift gate error (soft-pass): %s", _vf_err)
                 # Reject any concept/roleplay content that is self-referential filler — text that
                 # references its own step title or module title as the topic ("In the work you'll do
                 # after this course, *[module-title]* shows up most often...") was identified by the
