@@ -6905,23 +6905,81 @@ NotebookEdit, TodoWrite. Do NOT use `read_file`, `edit_file`, `bash` (lowercase)
 The capitalized names are what appear in the subagent's `tools:` field and
 in `settings.json` `permissions.allow`.
 
-=== Hook contract (PreToolUse / PostToolUse / Stop) ===
-- Hooks are shell scripts / commands registered in settings.json.
-- **Input**: JSON on STDIN. NOT via environment variables. (`CLAUDE_TOOL_INPUT`
-  is NOT a real env var.) Read stdin with `input=$(cat)`, parse with `jq`.
-- **Exit codes**:
+=== Hook contract (PreToolUse / PostToolUse / Stop / UserPromptSubmit) ===
+
+**settings.json shape — FREQUENTLY HALLUCINATED, GET THIS RIGHT**:
+The `hooks` value is a DICT keyed by event name (PascalCase). Each event maps
+to an ARRAY of matcher-groups. Each matcher-group is `{matcher: "<tool>",
+hooks: [{type: "command", command: "..."}]}`. NESTED. Multiple hooks can match
+the same matcher (they run in order).
+
+CORRECT shape (what's documented at code.claude.com/docs/en/hooks):
+```json
+{
+  "hooks": {
+    "PreToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {"type": "command", "command": "python3 .claude/hooks/block-prod-config.py"}
+        ]
+      }
+    ],
+    "PostToolUse": [
+      {
+        "matcher": "Edit",
+        "hooks": [
+          {"type": "command", "command": "./mvnw spotless:apply"}
+        ]
+      }
+    ]
+  }
+}
+```
+
+WRONG shapes that are commonly hallucinated — DO NOT USE:
+  ✗ `"preToolUse"` (camelCase — events are PascalCase; camelCase is silently ignored)
+  ✗ `"PreToolUse": {"command": "x", "args": [...]}`  (must be ARRAY of matcher-groups, not flat dict)
+  ✗ Top-level `"PreToolUse": [{"type": "command", ...}]` (missing matcher wrapper)
+
+**`matcher` field**: a TOOL NAME (PascalCase: `Edit`, `Write`, `Bash`, `Read`,
+`Grep`, `Glob`, `Agent`, `WebFetch`, `WebSearch`, `AskUserQuestion`, `ExitPlanMode`,
+`MultiEdit`, `NotebookEdit`, `TodoWrite`, `Task`, or MCP tools as
+`mcp__<server>__<tool>`). Use `"matcher": "*"` to match all tools, or omit for
+events that don't take a tool (e.g. `Stop`, `UserPromptSubmit`).
+
+DO NOT use `str_replace_editor` as a tool name — that's the Anthropic API
+tool-use type for the `computer-use` family, NOT a Claude Code hook matcher.
+Claude Code's actual built-in tools are listed above.
+
+**Input**: JSON on STDIN. NOT environment variables. Read with `input=$(cat)`.
+The JSON shape:
+```json
+{"tool_name": "Edit", "tool_input": {"file_path": "/path", "old_string": "...", "new_string": "..."}}
+```
+DO NOT reference `data.arguments.path` or `data.parameters.path` — those are
+fictional paths. The real fields are `tool_name` (top-level) and the tool's
+input shape under `tool_input` (e.g. `tool_input.file_path` for Edit/Write,
+`tool_input.command` for Bash).
+
+**Exit codes**:
     0 = ALLOW (tool call proceeds)
     2 = BLOCK (tool call is prevented; stderr is shown to the model)
-    other = error (treated as allow with warning)
-  DO NOT use `exit 1` to block — it is treated as an error, not a block.
-- Example PreToolUse hook body:
-    input=$(cat)
-    cmd=$(echo "$input" | jq -r '.tool_input.command // empty')
-    if echo "$cmd" | grep -qE '(rm -rf|--force|DROP TABLE)'; then
-      echo "BLOCKED: destructive command pattern" >&2
-      exit 2
-    fi
-    exit 0
+    1 / other = error (non-blocking; stderr forwarded to model as a warning)
+  DO NOT use `exit 1` to block — it does NOT block, it warns.
+
+Example PreToolUse hook body that blocks edits to prod config:
+```bash
+#!/usr/bin/env bash
+input=$(cat)
+tool=$(echo "$input" | jq -r '.tool_name // ""')
+path=$(echo "$input" | jq -r '.tool_input.file_path // ""')
+if [[ "$tool" == "Edit" || "$tool" == "Write" ]] && [[ "$path" == *application-prod.properties ]]; then
+  echo "BLOCKED: cannot edit production config" >&2
+  exit 2
+fi
+exit 0
+```
 
 === Config file layout — where things ACTUALLY live ===
 - ~/.claude/settings.json   → `permissions.allow`, `permissions.deny`,
@@ -6961,14 +7019,62 @@ File: .claude/agents/<slug>.md
 name: test-fixer
 description: Runs pytest, proposes minimal fix, verifies, stops at 5 iterations.
 tools: [Read, Edit, Bash]        # capitalized; subset of built-in tools
+model: sonnet                    # alias preferred; full IDs go stale (sonnet/opus/haiku)
+maxTurns: 8                      # turn budget cap. NOT `max_turns`, NOT `max_tokens`
 ---
 <system prompt body as markdown>
 
+Valid frontmatter fields (others silently ignored):
+  name, description, tools, disallowedTools, model, permissionMode, maxTurns,
+  skills, mcpServers, hooks, memory, effort, background, isolation, color,
+  initialPrompt
+INVALID fields (do NOT emit; they're silently dropped):
+  ✗ max_tokens          (not a real field — use `maxTurns` for turn cap)
+  ✗ system_prompt       (the markdown body IS the system prompt; no field)
+  ✗ allowed_tools       (use `tools:`)
+
 Learner's subagent is auto-discovered — NO registration needed in settings.json.
 
-=== Slash commands (for reference when authoring course content) ===
-- /login, /logout, /clear, /help, /mcp, /agents, /model
-- These are entered at the `>` prompt INSIDE Claude Code, not at the shell.
+=== Subagent INVOCATION — frequently hallucinated ===
+There is NO `claude @<agent-name> "prompt"` shell-form. That command does not
+exist. To invoke a custom subagent:
+
+  (a) Inside an interactive Claude session:
+      `Use the test-fixer subagent to fix the failing tests.`   ← natural language
+      OR
+      `@"test-fixer (agent)"` ← @-mention form
+  (b) Spawn a whole session under that agent at the shell:
+      `claude --agent test-fixer`   (then prompt as usual)
+
+DO NOT teach `claude @agent "prompt"` as a shell one-liner — it isn't valid.
+
+=== Slash commands (in-session) ===
+Built-ins: /login, /logout, /clear, /help, /mcp, /agents, /model, /init, /pr_comments
+These are entered at the `>` prompt INSIDE Claude Code, NOT at the shell.
+
+**Custom slash commands** live at `.claude/commands/<name>.md`. Inside the
+file, the user's argument string is substituted via `$ARGUMENTS` (the entire
+arg blob) or `$0`/`$1`/`$2` (positional). DO NOT use `{{className}}` or any
+Mustache-style template — that's a hallucination. The real form:
+
+```md
+---
+description: Audit a Spring Boot controller for prod risks
+argument-hint: [controller-class-name]
+---
+Audit the $ARGUMENTS controller for missing @Valid, unhandled exceptions, ...
+```
+
+The `argument-hint` field is for tab-completion help text. There is NO
+`Arguments:` body field in the format — the markdown body is the prompt
+template, with `$ARGUMENTS` interpolated at invocation time.
+
+=== Shell vs slash-command boundary (catches a common hallucination) ===
+- `claude mcp list`                ← real SHELL command
+- `/mcp` (inside session)          ← real SLASH command
+- `claude /mcp list`               ← NOT VALID; do not concatenate. Either you're
+                                     at the shell (`claude mcp list`) OR inside
+                                     Claude (`/mcp`).
 """
 
 
