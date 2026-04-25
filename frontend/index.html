@@ -4702,6 +4702,68 @@ ${esc(wrapper)} check                    <span style="color:#8892a8"># grades + 
 }
 
 
+// 2026-04-25 v6 — _runWidgetScripts: re-execute every <script> in the
+// container so widget code lands. innerHTML doesn't auto-run scripts;
+// we rebuild each into a fresh <script> element + replace. Wraps the
+// original code in a timer-tracked IIFE for zombie-teardown across step
+// nav, and aggressively hoists named function/const/let declarations to
+// `window` so inline onclick handlers can resolve them.
+//
+// Extracted to a helper 2026-04-25 v6 because BOTH the standard render
+// path AND the terminal-native pointer-card path need to run it (the
+// pointer card embeds the briefing content, which can include widgets).
+function _runWidgetScripts(container) {
+  if (!container) return;
+  if (!window._widgetTimers) {
+    window._widgetTimers = { intervals: [], timeouts: [] };
+    window._tearDownWidgetTimers = function() {
+      try {
+        (window._widgetTimers.intervals || []).forEach(id => { try { clearInterval(id); } catch (e) {} });
+        (window._widgetTimers.timeouts || []).forEach(id => { try { clearTimeout(id); } catch (e) {} });
+      } catch (e) {}
+      window._widgetTimers = { intervals: [], timeouts: [] };
+    };
+  }
+  window._tearDownWidgetTimers();
+  container.querySelectorAll('script').forEach(oldScript => {
+    const newScript = document.createElement('script');
+    if (oldScript.src) {
+      newScript.src = oldScript.src;
+    } else {
+      let code = oldScript.textContent || '';
+      const domReadyRegex = /(?:document|window)\s*\.\s*addEventListener\s*\(\s*['"]DOMContentLoaded['"]\s*,\s*(?:function\s*\(\s*\)\s*|\(\s*\)\s*=>\s*)\{([\s\S]*)\}\s*\)\s*;?\s*$/;
+      const m = code.trim().match(domReadyRegex);
+      if (m) code = `(function(){${m[1]}})();`;
+      const _hoistShapes = [
+        /(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
+        /(?:^|\n)\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z_$][\w$]*\s*=>)/g,
+      ];
+      const _hoistedNames = new Set();
+      for (const re of _hoistShapes) {
+        for (const mm of code.matchAll(re)) _hoistedNames.add(mm[1]);
+      }
+      const _RESERVED = new Set(['if','else','for','while','do','switch','case','return',
+                                 'function','var','let','const','class','new','this','async',
+                                 'await','try','catch','finally','throw','break','continue',
+                                 'true','false','null','undefined','NaN','Infinity']);
+      const _toHoist = [..._hoistedNames].filter(n => !_RESERVED.has(n));
+      const _hoistTail = _toHoist
+        .map(n => `try{if(typeof ${n}!=="undefined")window[${JSON.stringify(n)}]=${n};}catch(_e){}`)
+        .join('');
+      code = `(function(){
+        const _origInt = window.setInterval.bind(window);
+        const _origTo  = window.setTimeout.bind(window);
+        const _tracked = window._widgetTimers;
+        const setInterval = (fn, d, ...a) => { const id = _origInt(fn, d, ...a); _tracked.intervals.push(id); return id; };
+        const setTimeout  = (fn, d, ...a) => { const id = _origTo(fn, d, ...a);  _tracked.timeouts.push(id);  return id; };
+        try { ${code}\n${_hoistTail} } catch (e) { console.error('[widget script]', e); }
+      })();`;
+      newScript.textContent = code;
+    }
+    oldScript.parentNode.replaceChild(newScript, oldScript);
+  });
+}
+
 // 2026-04-25 v6 — Widget-action event delegation (replaces the chronic
 // "inline-onclick → function not on window → silent dead click" failure).
 //
@@ -4810,8 +4872,19 @@ function renderStep(rawStep, index) {
   // Phase 3 surface gate (2026-04-25). Terminal-native steps render the
   // CLI-pointer panel and skip the exercise dispatch entirely. Legacy
   // steps without the field (NULL → undefined) stay on the existing path.
+  //
+  // 2026-04-25 v6 — Even terminal-native steps inject briefing content
+  // that may contain interactive concept widgets (Kimi M0.S1's scenario
+  // selector, for example, is taught via a web widget even though the
+  // step is graded in the terminal). The early-return was skipping
+  // _runWidgetScripts + the action-delegator rewrite, leaving widget
+  // scripts un-executed and clicks dead. Now we run them on the
+  // pointer-card path too.
   if (rawStep && rawStep.learner_surface === 'terminal') {
     container.innerHTML = renderTerminalNativePanel(rawStep, index);
+    _runWidgetScripts(container);
+    _installWidgetActionDelegator();
+    _rewriteOnclicksToDataActions(container);
     return;
   }
   // Merge demo_data and validation into step so renderers can access fields directly.
@@ -4995,124 +5068,11 @@ function renderStep(rawStep, index) {
   html += '</div>';
   container.innerHTML = html;
 
-  // Execute inline <script> tags (innerHTML doesn't run them automatically).
-  // F3 fix 2026-04-21: the Creator tends to wrap setup code in
-  // `document.addEventListener('DOMContentLoaded', function() { ... })`, but
-  // DOMContentLoaded has ALREADY fired by the time we reinstantiate these
-  // scripts — so the body never runs and "Click to reveal" widgets look dead
-  // (user report on /41/0 of created-d08b7691ff00).
-  // Strip the DOMContentLoaded wrapper and run the body inline as an IIFE.
-  //
-  // Fix A 2026-04-21 (zombie-timer teardown): any setInterval / setTimeout
-  // armed inside a widget script SURVIVES step navigation because we only
-  // replace the container's innerHTML on nav. The old interval keeps firing
-  // against a now-null `getElementById(...)`, throwing 10-100 errors/min
-  // (user report on skills.sclr.ac/#created-2672ff02d5d0/126/1, module intro
-  // widget's "Auto-pulse sync indicator" interval kept firing on step 1).
-  //
-  // Fix: tear down any timers armed by the PREVIOUS widget script before we
-  // arm the new one. We shim setInterval/setTimeout inside the widget's IIFE
-  // so the timer IDs are captured and we can clear them on step nav. The
-  // shimmed functions feed the shared _widgetTimers registry on `window`.
-  if (!window._widgetTimers) {
-    window._widgetTimers = { intervals: [], timeouts: [] };
-    window._tearDownWidgetTimers = function() {
-      try {
-        (window._widgetTimers.intervals || []).forEach(id => { try { clearInterval(id); } catch (e) {} });
-        (window._widgetTimers.timeouts || []).forEach(id => { try { clearTimeout(id); } catch (e) {} });
-      } catch (e) {}
-      window._widgetTimers = { intervals: [], timeouts: [] };
-    };
-  }
-  // Clear any timers the PREVIOUS widget armed before running the new one.
-  window._tearDownWidgetTimers();
-
-  container.querySelectorAll('script').forEach(oldScript => {
-    const newScript = document.createElement('script');
-    if (oldScript.src) {
-      newScript.src = oldScript.src;
-    } else {
-      let code = oldScript.textContent || '';
-      // Match patterns like:
-      //   document.addEventListener('DOMContentLoaded', function() { BODY });
-      //   window.addEventListener('DOMContentLoaded', () => { BODY });
-      // Extract BODY and run inline via IIFE.
-      const domReadyRegex = /(?:document|window)\s*\.\s*addEventListener\s*\(\s*['"]DOMContentLoaded['"]\s*,\s*(?:function\s*\(\s*\)\s*|\(\s*\)\s*=>\s*)\{([\s\S]*)\}\s*\)\s*;?\s*$/;
-      const m = code.trim().match(domReadyRegex);
-      if (m) {
-        code = `(function(){${m[1]}})();`;
-      }
-      // 2026-04-25 v6 — STRUCTURAL FIX (user directive: "hoisting issue is
-      // repetitive — make sure we fix the root cause and generalise").
-      //
-      // The chronic problem: widget HTML uses `<button onclick="fn()">`
-      // patterns. For inline onclicks to work, `fn` must be on `window`.
-      // We patched ONE shape (top-level `function NAME(){}` → hoist),
-      // but every new definition shape breaks differently:
-      //   - `const NAME = ...` (block-scoped, never on window)
-      //   - `window.NAME = function...` inside IIFE (works ONLY if IIFE runs)
-      //   - Arrow functions assigned to const
-      //   - Functions inside callbacks
-      //   - Conditional definitions
-      // Each shape needs a separate hoist regex. Whack-a-mole.
-      //
-      // GENERALIZATION: stop relying on inline onclick attribute resolution.
-      // After the script runs, this block does TWO things:
-      //   1. Aggressive multi-shape hoist (top-level `function NAME`,
-      //      `const NAME = function`, `const NAME = (`, `let/var NAME =`)
-      //      → window. Catches more shapes than v5's hoist did.
-      //   2. **Event delegation** — walk every `[onclick]` attribute in the
-      //      rendered container, parse the function name + arg list, and
-      //      install a `data-action` attribute on the element. A SINGLE
-      //      delegated click listener (installed once on the container,
-      //      see _installWidgetActionDelegator below) reads data-action,
-      //      resolves the function on window, and invokes. Works regardless
-      //      of HOW the widget script defined the function — as long as
-      //      something puts it on window (which our hoists now broadly
-      //      cover, and which Creator-emitted `window.X = ...` already
-      //      does directly).
-      //   3. If a referenced function is MISSING from window after the
-      //      script runs, log a clear console.error naming the function
-      //      AND surface a console hint about the widget content.
-      //      No more silent dead clicks.
-      const _hoistShapes = [
-        // function NAME(...) { ... }    — at start of line OR after }/;/blank
-        /(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
-        // const NAME = function ... | const NAME = (...) => ... | const NAME = async ...
-        /(?:^|\n)\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z_$][\w$]*\s*=>)/g,
-      ];
-      const _hoistedNames = new Set();
-      for (const re of _hoistShapes) {
-        for (const m of code.matchAll(re)) _hoistedNames.add(m[1]);
-      }
-      // Skip names that look like reserved words / common false positives.
-      const _RESERVED = new Set(['if','else','for','while','do','switch','case','return',
-                                 'function','var','let','const','class','new','this','async',
-                                 'await','try','catch','finally','throw','break','continue',
-                                 'true','false','null','undefined','NaN','Infinity']);
-      const _toHoist = [..._hoistedNames].filter(n => !_RESERVED.has(n));
-      const _hoistTail = _toHoist
-        .map(n => `try{if(typeof ${n}!=="undefined")window[${JSON.stringify(n)}]=${n};}catch(_e){}`)
-        .join('');
-      code = `(function(){
-        const _origInt = window.setInterval.bind(window);
-        const _origTo  = window.setTimeout.bind(window);
-        const _tracked = window._widgetTimers;
-        const setInterval = (fn, d, ...a) => { const id = _origInt(fn, d, ...a); _tracked.intervals.push(id); return id; };
-        const setTimeout  = (fn, d, ...a) => { const id = _origTo(fn, d, ...a);  _tracked.timeouts.push(id);  return id; };
-        try { ${code}\n${_hoistTail} } catch (e) { console.error('[widget script]', e); }
-      })();`;
-      newScript.textContent = code;
-    }
-    oldScript.parentNode.replaceChild(newScript, oldScript);
-  });
-
-  // 2026-04-25 v6 — Event-delegation rewrite of inline onclick handlers.
-  // After scripts execute, scan the container for `[onclick]` attributes,
-  // convert each to `data-action` + `data-args`, and install ONE delegated
-  // click listener that resolves data-action via window. This avoids the
-  // chronic "function not on window → silent dead click" failure mode
-  // regardless of how the widget script defined the function.
+  // 2026-04-25 v6 — Script execution + click-delegation pipeline. Helpers
+  // defined above renderStep. Both the standard render path AND the
+  // terminal-native pointer-card path call these so widget scripts run
+  // regardless of surface gating.
+  _runWidgetScripts(container);
   _installWidgetActionDelegator();
   _rewriteOnclicksToDataActions(container);
 
