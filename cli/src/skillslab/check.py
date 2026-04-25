@@ -400,13 +400,13 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
 
     # 2) must_contain only → deterministic local check
     must_contain = validation.get("must_contain") or []
-    rubric = validation.get("rubric") or validation.get("explanation_rubric")
-    if must_contain and not rubric:
+    rubric_raw = validation.get("rubric") or validation.get("explanation_rubric")
+    if must_contain and not rubric_raw:
         return _check_paste_contains({"tokens": must_contain}, submission)
 
     # 3) Rubric (or rubric+must_contain) → bridge to LMS by default. Verdict
     #    comes back through the API and we render it in the terminal.
-    if rubric or must_contain:
+    if rubric_raw or must_contain:
         return _bridge_validate(step, submission, accept_rc)
 
     # 4) No grading hook at all

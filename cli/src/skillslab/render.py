@@ -157,7 +157,7 @@ def step_to_markdown(step: dict, course_title: str = "", module_title: str = "")
                 "",
             ]
             if rubric:
-                parts += ["**Rubric criteria:**", "", rubric.strip(), ""]
+                parts += ["**Rubric criteria:**", "", _rubric_to_text(rubric), ""]
             if must_contain:
                 parts += ["**Must contain (tokens):**", ""] + [f"- `{t}`" for t in must_contain] + [""]
 
@@ -176,3 +176,22 @@ def _yaml_dump(obj) -> str:
         return yaml.safe_dump(obj, default_flow_style=False, sort_keys=False).rstrip()
     except Exception:
         return json.dumps(obj, indent=2)
+
+
+def _rubric_to_text(rubric) -> str:
+    """The LMS sometimes emits validation.rubric as a string (zero-code
+    courses), sometimes as a dict (`{criteria: [...], passing_threshold: 0.7}`),
+    sometimes as a list of bullet strings. Normalize to readable markdown so
+    the briefing always renders.
+    """
+    if rubric is None:
+        return ""
+    if isinstance(rubric, str):
+        return rubric.strip()
+    if isinstance(rubric, list):
+        return "\n".join(f"- {item}" for item in rubric).strip()
+    if isinstance(rubric, dict):
+        # Common shapes: {criteria: [...], passing_threshold: 0.7}
+        # or {scoring: {...}, hints: [...]}. YAML-dump for legibility.
+        return _yaml_dump(rubric)
+    return str(rubric).strip()

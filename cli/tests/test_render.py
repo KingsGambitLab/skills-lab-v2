@@ -107,3 +107,51 @@ def test_step_to_markdown_renders_rubric_when_present():
     assert "Acceptance" in md
     assert "Rubric" in md
     assert "clarity" in md
+
+
+def test_step_to_markdown_handles_rubric_as_dict():
+    """Some LMS courses emit validation.rubric as a dict (criteria + threshold).
+    Don't crash; render it as YAML."""
+    step = {
+        "id": 3,
+        "title": "Dict rubric",
+        "exercise_type": "code_exercise",
+        "content": "<p>Do the thing.</p>",
+        "validation": {
+            "rubric": {
+                "criteria": ["clarity", "correctness", "test coverage"],
+                "passing_threshold": 0.7,
+            },
+        },
+    }
+    md = step_to_markdown(step)
+    assert "Rubric" in md
+    assert "clarity" in md
+    assert "0.7" in md
+
+
+def test_step_to_markdown_handles_rubric_as_list():
+    step = {
+        "id": 4,
+        "title": "List rubric",
+        "exercise_type": "concept",
+        "content": "<p>Reflect.</p>",
+        "validation": {"rubric": ["names a real example", "explains the why", "cites sources"]},
+    }
+    md = step_to_markdown(step)
+    assert "real example" in md
+    assert "the why" in md
+    assert "cites" in md
+
+
+def test_step_to_markdown_handles_rubric_none():
+    step = {
+        "id": 5,
+        "title": "Concept only",
+        "exercise_type": "concept",
+        "content": "<p>Read.</p>",
+        "validation": {},
+    }
+    # Should not raise
+    md = step_to_markdown(step)
+    assert "# Concept only" in md
