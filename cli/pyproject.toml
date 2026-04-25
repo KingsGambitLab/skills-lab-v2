@@ -1,0 +1,27 @@
+[project]
+name = "skillslab"
+version = "0.1.0"
+description = "Skills Lab CLI — run AI-augmented engineering courses in your terminal"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+dependencies = [
+    "click>=8.1",
+    "httpx>=0.27",
+    "pyyaml>=6.0",
+    "rich>=13.7",
+]
+
+[project.scripts]
+skillslab = "skillslab.cli:main"
+# Per-course wrappers — thin scripts that call the base CLI with --course=<slug>
+kimi-course = "skillslab.cli:_wrapper_kimi"
+aie-course = "skillslab.cli:_wrapper_aie"
+jspring-course = "skillslab.cli:_wrapper_jspring"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/skillslab"]
