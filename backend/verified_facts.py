@@ -1,4 +1,4 @@
-"""Tech-registry for verified-facts injection + drift detection.
+r"""Tech-registry for verified-facts injection + drift detection.
 
 Per user directive 2026-04-25: "whatever you do, don't make it a one-time
 fix, but it should compound over time + extensible for other tech."
@@ -168,6 +168,7 @@ def check_drift(
     code: str = "",
     validation: dict | None = None,
     demo_data: dict | None = None,
+    title: str = "",  # NEW v8.7 (2026-04-25) — step title, scanned for drift
     course_title: str = "",
     course_description: str = "",
     source_material: str = "",
@@ -175,6 +176,11 @@ def check_drift(
     """Scan a generated step's content for drift against EVERY in-scope
     tech's patterns. Returns a flat list of violation messages prefixed
     with the tech_id. Empty list = clean.
+
+    Scans: title + content + code + validation (json-dumped) + demo_data.
+    Adding title scan caught Kimi M6.S2 lingering `kimi-k2-latest` in
+    title (body had been correctly regenerated to canonical slug, but
+    title was untouched).
     """
     import json as _json
     techs = in_scope_techs(course_title, course_description, source_material)
@@ -182,6 +188,8 @@ def check_drift(
         return []
 
     parts: list[str] = []
+    if isinstance(title, str) and title:
+        parts.append(title)
     if isinstance(content, str):
         parts.append(content)
     if isinstance(code, str):

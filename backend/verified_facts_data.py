@@ -136,6 +136,45 @@ _CLAUDE_CODE_DRIFTS = [
     (r"(?:hook|guardrail|block).{0,400}(?:\bexit\s+1\b|\b(?:sys\.)?exit\s*\(\s*1\s*\))",
      "hook example uses `exit 1` to block — that does NOT block, it warns. Use `exit 2` to block (verified facts).",
      True),
+
+    # ── 2026-04-25 v8.7 expert re-review additions (compounding) ──
+    # AIE M6.S5 regressed by emitting `.claude/subagents.json` + `.claude/hooks.json`
+    # as separate files. Real Claude Code uses INDIVIDUAL `.claude/agents/*.md`
+    # files for subagents, and hooks live INSIDE `settings.json` under `hooks.PreToolUse`.
+    (r"\.claude/subagents\.json\b",
+     "writes a `.claude/subagents.json` file — that file does NOT exist. Subagents are individual Markdown files at `.claude/agents/<slug>.md`, auto-discovered.",
+     True),
+    (r"\.claude/hooks\.json\b",
+     "writes a `.claude/hooks.json` file — fictional. Hooks live INSIDE `settings.json` at `hooks.PreToolUse: [{matcher, hooks: [{type:\"command\", command}]}]`.",
+     True),
+    # Invented slash commands flagged by AIE expert
+    (r"claude\s*/settings\s+(?:reload|show|validate)",
+     "uses `claude /settings reload|show|validate` — invented slash commands. There is no `/settings` slash command for these. To reload settings, restart the session; to inspect, read `~/.claude/settings.json` or `<project>/.claude/settings.json` directly.",
+     True),
+    # Invented CLI flag for subagents
+    (r"claude\s+--subagent\s+\S",
+     "uses `claude --subagent <name>` — invented flag. To spawn a session under a custom subagent, use `claude --agent <name>` (the real flag).",
+     True),
+    # Claude Desktop conflation — `mcpServers` JSON shown as Claude CODE config
+    # (it's the schema for Claude DESKTOP). Real Claude Code MCP wiring is via
+    # `claude mcp add ... --transport stdio` OR a project `.mcp.json`.
+    (r'(?i)claude\s+code.{0,300}"mcpServers"\s*:\s*\{',
+     "shows a `mcpServers` JSON block in a Claude Code context. That schema lives in Claude DESKTOP's config (claude_desktop_config.json), not Claude Code. Claude Code uses `claude mcp add <name> <command> --transport stdio` OR a project `.mcp.json` file.",
+     True),
+    # Haiku 3 pricing labeled as Haiku 3.5 (model pricing drift — Anthropic
+    # changed price ladder when 3.5 launched). Haiku 3 was $0.25/$1.25 per M;
+    # Haiku 3.5 is $0.80/$4. Catch the old prices when course mentions 3.5.
+    (r'(?i)haiku.{0,60}3\.5.{0,400}\$\s*0\.25.{0,40}\$\s*1\.25',
+     "labels a cost calculator with Haiku 3 pricing ($0.25 in / $1.25 out) while the course names Haiku 3.5. Haiku 3.5 is $0.80 in / $4.00 out per million tokens.",
+     True),
+    (r'(?i)\$\s*0\.25\s*(?:in)?\s*/\s*\$\s*1\.25\s*(?:out)?.{0,200}haiku',
+     "associates Haiku-3 prices ($0.25/$1.25) with a Haiku label — Anthropic Haiku-3.5 prices are $0.80/$4.00 per million tokens.",
+     True),
+    # Shebang/language mismatch in hook scripts (caught by AIE M6.S2 review)
+    # — `#!/bin/bash` immediately followed by Python imports.
+    (r"#!/bin/bash.{0,80}\n\s*(?:import\s+\w+|from\s+\w+\s+import|def\s+\w)",
+     "starter has `#!/bin/bash` shebang followed by Python code — file is unrunnable. Either change shebang to `#!/usr/bin/env python3`, or rewrite the body in bash.",
+     True),
 ]
 
 register_tech(
@@ -221,6 +260,27 @@ _AIDER_DRIFTS = [
      False),
     (r"aider\s+0\.4[0-9]\b|aider\s+0\.5[0-9]\b",
      "pins to a stale Aider version (0.4x / 0.5x). Use 'Aider 0.86+' or 'any recent Aider' instead.",
+     True),
+
+    # ── 2026-04-25 v8.7 Kimi expert re-review additions (compounding) ──
+    # `.aider.conf.yml` invented keys flagged by Kimi expert (M2.S1):
+    #   - `context-files:` — not a real key; should be `read:`
+    #   - bare `test:` (not `test-cmd:` or `auto-test: true`)
+    #   - bare `lint: true` boolean (not `auto-lint: true` / `lint-cmd: "..."`)
+    (r"^\s*context-files\s*:",
+     "uses `context-files:` in .aider.conf.yml — not a valid key. Correct key is `read: <path>` (or list of paths).",
+     False),
+    (r"^\s*test\s*:\s*[\"'].{1,80}[\"']\s*$",
+     "uses bare `test:` key in .aider.conf.yml — not a valid key. Correct: `test-cmd: \"pytest -xvs\"` plus `auto-test: true`.",
+     False),
+    (r"^\s*lint\s*:\s*(?:true|false)\s*$",
+     "uses bare `lint: true|false` in .aider.conf.yml — not a valid key. Correct: `auto-lint: true` (bool) OR `lint-cmd: \"ruff check\"` (string).",
+     False),
+    # Hybrid OpenRouter syntax — uses canonical `openrouter/...` prefix AND
+    # `--openai-api-base` flag together. Pick one path: canonical or LiteLLM
+    # passthrough. M0.S2 review caught this.
+    (r"--model\s+openrouter/\S+.{0,300}--openai-api-base",
+     "mixes canonical `openrouter/<model>` prefix WITH `--openai-api-base` flag — pick one path. Canonical form: `--model openrouter/moonshotai/kimi-k2` + `OPENROUTER_API_KEY` (NO --openai-api-base needed).",
      True),
 ]
 

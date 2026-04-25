@@ -125,6 +125,7 @@ def scan_drift(lms_url: str, course_filter: list[str] | None) -> dict:
                     code=s.get("code", "") or "",
                     validation=s.get("validation", {}) or {},
                     demo_data=s.get("demo_data", {}) or {},
+                    title=s.get("title", "") or "",
                     course_title=title,
                     course_description=meta.get("description", ""),
                 )

@@ -10553,6 +10553,7 @@ async def _creator_generate_impl(
                         code=content_obj.get("code") or "",
                         validation=content_obj.get("validation") or {},
                         demo_data=content_obj.get("demo_data") or {},
+                        title=getattr(step_outline, "title", "") or "",
                         course_title=_vf_title,
                         course_description=_vf_desc,
                         source_material=_vf_src,

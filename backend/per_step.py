@@ -856,11 +856,13 @@ async def patch_step_fields(
     if not mod_row or mod_row.course_id != course_id:
         return {"ok": False, "reason": "step_not_in_course"}
 
-    # Safelist of editable fields. Never expose title change through this
-    # endpoint — title is part of the outline shape and editing it would
-    # break downstream step-index references. Use module regen if you need
-    # to change titles.
-    allowed_fields = {"content", "code", "expected_output", "validation", "demo_data"}
+    # Safelist of editable fields. v8.7 (2026-04-25): added `title` — the
+    # registry-driven drift gate now scans titles too, and a title-only fix
+    # for verified-facts drift (e.g. `kimi-k2-latest` lingering in a title)
+    # is overkill to regen the whole step. Title doesn't affect step-index
+    # references (those are by step.id). It DOES affect step-filename hashing
+    # for the CLI's local markdown cache — learner reruns `start` to refresh.
+    allowed_fields = {"title", "content", "code", "expected_output", "validation", "demo_data"}
     applied: list[str] = []
     for k, v in (updates or {}).items():
         if k not in allowed_fields:
