@@ -1,5 +1,47 @@
 # Skills Lab v2 — AI LMS Platform
 
+## 🚢 SHIP-AS-YOU-WIN — commit + push after every major upgrade or successful win (2026-04-25)
+
+**User directive (verbatim, 2026-04-25):** *"After every successful major upgrade / win — commit to github."*
+
+Don't sit on landed work. Every time a coherent unit ships clean — feature complete, smoke-tested, no regressions — commit + push to `origin/main` BEFORE moving to the next thing. Don't batch 5 unrelated wins into one commit; don't leave a working-state stash dangling for hours.
+
+### What counts as a "major upgrade / win"
+
+- **Platform fixes** that close one root cause (e.g. extending the verified-facts-block, dockerizing a runtime, swapping a validator path). One coherent change.
+- **Course generation that lands clean** (whole course or batch of per-step regens, all green).
+- **A review-pass result that you've fully triaged** (artifact in `reviews/` is enough on its own — that's a unit too).
+- **A new feature** end-to-end (backend endpoints + frontend wiring + verified working).
+- **A repo scaffold** that pushes a course's GitHub assets (each `kimi-eng-course-repo` / `jspring-course-repo` push is a win).
+- **A documentation pass** (CLAUDE.md update capturing a learning) — counts on its own.
+
+### What does NOT need its own commit
+
+- Half-built work mid-debugging (don't commit broken code just to feel productive).
+- Untracked files that aren't part of the intent (review artifacts the agent wrote without you reading them; tmp scratch files; broken WIP).
+- Pure formatting / whitespace changes that aren't the point of the change.
+
+### Per-commit checklist
+
+1. The change is COHERENT (one win, one commit).
+2. Imports are clean (`backend.main` loads without error).
+3. The thing you claimed to ship works — smoke-tested via curl, browser, or the harness.
+4. Commit message names the win + WHY (not just the file). End with the standard `Co-Authored-By:` trailer.
+5. `git push origin main`. Don't leave it local.
+
+### Why this matters
+
+- **Audit trail**: every state of the system is reachable via `git log`. If a regen burns budget on a wrong direction, `git revert` is one command.
+- **Backups**: `origin/main` is durable; a laptop drive is not. Today's 5 commits to `origin/main` would survive my laptop dying.
+- **Collaborator visibility**: if anyone else opens the repo, the latest pushed sha tells them where things stand. Local-only commits are invisible.
+- **Discipline forcing-function**: if you can't commit cleanly, the change probably isn't a coherent win. The commit message itself reveals whether you actually finished a thing or just fiddled.
+
+### Anti-pattern to watch for
+
+The "I'll commit at the end of the day" trap. By end of day, you have 6 entangled changes; the commit message is "various fixes"; rolling back any one piece is impossible. Catch yourself: if a thing landed clean, push it NOW, then start the next thing.
+
+---
+
 ## 🧰 v8.6.2 Phase 2 (2026-04-24 latest) — Post-review platform fixes (8 root-cause fixes shipped as wiring, not per-course regen)
 
 **User directive (verbatim, 2026-04-24):** *"Don't fix any symptom, fix root cause. And don't edit course content directly, regen the step. You can fix wiring on the go."*
