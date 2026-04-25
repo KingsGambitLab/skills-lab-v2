@@ -8821,7 +8821,14 @@ ENGINEERING-CAPSTONE GENRE LOCK (non-negotiable):
 ### TERMINAL_EXERCISE AUTHORING RULES (MANDATORY)
 
 1. **Commands ALWAYS in `validation.cli_commands` (machine-readable).** Briefing = WHY, instructions = HOW (human prose), cli_commands = WHAT (CLI executes). The CLI runs cli_commands, captures output, submits — learners do NOT paste anything. The web frontend shows a "open your CLI" pointer instead of a paste textarea for these steps.
-2. **NEVER use the word 'paste' / 'copy and paste' / 'copy the output' in content / instructions / rubric.** The flow is: learner runs `skillslab check`, CLI executes cli_commands, output streams to terminal, learner confirms submission, score returns inline. No browser round-trip exists.
+2. **NEVER use the word 'paste' / 'copy and paste' / 'copy the output' in ANY briefing prose** — including the 'Success Preview' / 'What you'll see' / 'What success looks like' / 'Acceptance' sections. The flow is: learner runs `skillslab check`, CLI executes cli_commands, output streams to the terminal, learner confirms submission, score returns inline. No browser round-trip exists. Specifically:
+   - WRONG: "You'll paste two complete files: app/api/orders.py and tests/test_orders_endpoint.py"
+   - RIGHT: "You'll have implemented `app/api/orders.py` and `tests/test_orders_endpoint.py`. Run `skillslab check` — the CLI runs your local pytest suite and shows tests passing inline."
+   - WRONG: "Your final paste shows pytest output with all tests passing"
+   - RIGHT: "Your terminal shows pytest output with all tests passing — captured automatically by `skillslab check`."
+   - WRONG: "Submit by pasting your output"
+   - RIGHT: "Submit by running `skillslab check` (auto-captures + grades)"
+   Even when describing what the LEARNER will SEE / HAVE / DO, never use 'paste' as the verb. The artifact lives in the terminal; the CLI is the eye that reads it.
 3. **Each cli_commands entry has cmd + optional expect regex + optional label.** Make `cmd` runnable as-is; assume only the tools listed in the runtime-deps brief are on PATH. If the command would be platform-specific, offer ALTERNATIVES inside `instructions` HTML, but cli_commands itself should be ONE invocation per logical check.
 4. **Every command needs**: in `instructions`, the command shown + expected output 1-line + top-1 error + fix in <details>. Not in cli_commands itself (that's machine-only).
 5. **Platform-aware install steps**: show macOS / Linux / Windows+WSL variants in `instructions` HTML with <h4> sections. cli_commands runs in the container — point it at the cross-platform path.

@@ -1,0 +1,49 @@
+[20:11:09] mass regen starting: 21 steps
+[20:11:09] [1/21] 85142 kimi-M1.S2 Fix the N+1 bug in OrderService.get_recent_orders  ... regen
+[20:11:41]   ✅ ok in 31.8s | hash 8416e7d7a6999d8a→2d8ff1deafe40c96 | cli_commands=3
+[20:11:41] [2/21] 85144 kimi-M1.S4 What did Kimi NOT know? Name 3 conventions ... regen
+[20:12:11]   ✅ ok in 29.7s | hash f823f2de6113133d→1dcfdc77d7e617df | cli_commands=2
+[20:12:11] [3/21] 85146 kimi-M2.S2 Author AGENTS.md and .aider.conf.yml for the start ... regen
+[20:12:53]   ✅ ok in 42.6s | hash 554e461d54e8efe0→274c3f989127d29d | cli_commands=4
+[20:12:53] [4/21] 85148 kimi-M2.S4 Re-fix the M1 N+1 bug WITH AGENTS.md ... regen
+[20:13:28]   ✅ ok in 34.6s | hash 0f902547502e6875→eeae68c6be23910a | cli_commands=3
+[20:13:28] [5/21] 85151 kimi-M3.S2 Plan-then-execute: extract OrderQueryRepository wi ... regen
+[20:13:59]   ✅ ok in 31.1s | hash fdd49bd456196a29→1bef3a99b23f545b | cli_commands=3
+[20:13:59]   [budget] spent=$310.80 remaining=$39.20 enabled=True
+[20:13:59] [6/21] 85152 kimi-M3.S3 Author /audit-endpoint as a reusable Aider custom  ... regen
+[20:14:33]   ✅ ok in 33.9s | hash 1f56114da47d5fc8→4234c171492fd800 | cli_commands=3
+[20:14:33] [7/21] 85155 kimi-M4.S2 Implement harness/loop.py: read_file, edit_file, r ... regen
+[20:15:06]   ✅ ok in 33.0s | hash b362345d44d3a683→ebb72af36726dbcd | cli_commands=4
+[20:15:06] [8/21] 85156 kimi-M4.S3 Add a pre-tool guardrail: block writes to .env and ... regen
+[20:15:41]   ✅ ok in 35.3s | hash 3559c3c618e2c6c7→00317ee0199d97e7 | cli_commands=3
+[20:15:41] [9/21] 85159 kimi-M5.S2 Spawn the team-tickets MCP and write a 50-line Pyt ... regen
+[20:16:13]   ✅ ok in 31.9s | hash a5350cda1f4b860b→fcf9ae4aee34b45f | cli_commands=3
+[20:16:13] [10/21] 85161 kimi-M5.S4 Drive Kimi to call list_recent_tickets through you ... regen
+[20:16:52]   ✅ ok in 38.7s | hash 9efd2a547de1c354→e8bf5345627ec06f | cli_commands=2
+[20:16:52]   [budget] spent=$311.10 remaining=$38.90 enabled=True
+[20:16:52] [11/21] 85163 kimi-M6.S2 Fork module-6-capstone and verify starter tests ... regen
+[20:17:25]   ✅ ok in 32.7s | hash 4e0a44c03154d986→f700c7f4fe73bf28 | cli_commands=4
+[20:17:25] [12/21] 85059 claude-code-M0.S2 Verify your toolchain on your own machine ... regen
+[20:17:53]   ✅ ok in 28.9s | hash 4bbbf61fee3ad8c3→4e61b1b2c4574113 | cli_commands=3
+[20:17:53] [13/21] 85061 claude-code-M1.S2 Diagnose + fix the failing test with Claude Code ... regen
+[20:18:26]   ✅ ok in 33.0s | hash 658966998e58e13a→ab4807e424159717 | cli_commands=4
+[20:18:26] [14/21] 85066 claude-code-M2.S3 Write CLAUDE.md for the M1 repo ... regen
+[20:18:59]   ✅ ok in 32.8s | hash 42e2aecc6c2266f2→a7fb03603798ec15 | cli_commands=3
+[20:18:59] [15/21] 85067 claude-code-M2.S4 Redo the M1 fix — measure the delta ... regen
+[20:19:32]   ✅ ok in 32.6s | hash 1e98bb5540a9e07c→d4fcdea3fe66b388 | cli_commands=3
+[20:19:32]   [budget] spent=$311.38 remaining=$38.62 enabled=True
+[20:19:32] [16/21] 85070 claude-code-M3.S3 Ship /health against a schema gotcha ... regen
+[20:20:06]   ✅ ok in 34.6s | hash 5b46594089ffd27a→8f98052bd1731cd7 | cli_commands=6
+[20:20:06] [17/21] 85074 claude-code-M4.S3 Ship a feature with the team-tickets MCP ... regen
+[20:20:38]   ✅ ok in 31.6s | hash 02fdb99148dc904c→c6bbea3ab2d603f5 | cli_commands=3
+[20:20:38] [18/21] 85079 claude-code-M5.S4 Run your loop on a planted bug + judge interventio ... regen
+[20:21:05]   ✅ ok in 27.3s | hash 4ad739fb1ade9d28→bc81a754204d9620 | cli_commands=3
+[20:21:05] [19/21] 85080 claude-code-M5.S5 Ship the harness — GHA runs it on 3 bugs of rising ... regen
+[20:21:37]   ✅ ok in 31.7s | hash d0013928121f86c1→010b7cc07687acfa | cli_commands=4
+[20:21:37] [20/21] 85082 claude-code-M6.S1 Write a custom subagent for the test-fix loop ... regen
+[20:22:18]   ❌ FAIL ok=True bad_gates=['no_paste_lang'] | dur=40.4s | reason=
+[20:22:18]   [budget] spent=$311.68 remaining=$38.32 enabled=True
+[20:22:18] [21/21] 85086 claude-code-M6.S5 Ship a .claude/ teammate-ready configuration ... regen
+[20:22:48]   ✅ ok in 30.2s | hash 53be77fac09131f0→f6fb92b5b8f099e6 | cli_commands=4
+[20:22:48] BATCH DONE: 20/21 green
+[20:22:48] Results JSON: /tmp/regen_mass_results.json

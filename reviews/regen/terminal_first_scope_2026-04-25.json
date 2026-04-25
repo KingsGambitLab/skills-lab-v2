@@ -1,0 +1,149 @@
+[
+  {
+    "step_id": 85142,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M1.S2",
+    "title": "Fix the N+1 bug in OrderService.get_recent_orders (no AGENTS.md)"
+  },
+  {
+    "step_id": 85144,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M1.S4",
+    "title": "What did Kimi NOT know? Name 3 conventions"
+  },
+  {
+    "step_id": 85146,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M2.S2",
+    "title": "Author AGENTS.md and .aider.conf.yml for the starter repo"
+  },
+  {
+    "step_id": 85148,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M2.S4",
+    "title": "Re-fix the M1 N+1 bug WITH AGENTS.md"
+  },
+  {
+    "step_id": 85151,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M3.S2",
+    "title": "Plan-then-execute: extract OrderQueryRepository with /architect + /code"
+  },
+  {
+    "step_id": 85152,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M3.S3",
+    "title": "Author /audit-endpoint as a reusable Aider custom command"
+  },
+  {
+    "step_id": 85155,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M4.S2",
+    "title": "Implement harness/loop.py: read_file, edit_file, run_pytest in ~100 lines"
+  },
+  {
+    "step_id": 85156,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M4.S3",
+    "title": "Add a pre-tool guardrail: block writes to .env and alembic/versions/"
+  },
+  {
+    "step_id": 85159,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M5.S2",
+    "title": "Spawn the team-tickets MCP and write a 50-line Python adapter"
+  },
+  {
+    "step_id": 85161,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M5.S4",
+    "title": "Drive Kimi to call list_recent_tickets through your adapter"
+  },
+  {
+    "step_id": 85163,
+    "course_id": "created-698e6399e3ca",
+    "course_label": "kimi",
+    "label": "M6.S2",
+    "title": "Fork module-6-capstone and verify starter tests"
+  },
+  {
+    "step_id": 85059,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M0.S2",
+    "title": "Verify your toolchain on your own machine"
+  },
+  {
+    "step_id": 85061,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M1.S2",
+    "title": "Diagnose + fix the failing test with Claude Code"
+  },
+  {
+    "step_id": 85066,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M2.S3",
+    "title": "Write CLAUDE.md for the M1 repo"
+  },
+  {
+    "step_id": 85067,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M2.S4",
+    "title": "Redo the M1 fix \u2014 measure the delta"
+  },
+  {
+    "step_id": 85070,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M3.S3",
+    "title": "Ship /health against a schema gotcha"
+  },
+  {
+    "step_id": 85074,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M4.S3",
+    "title": "Ship a feature with the team-tickets MCP"
+  },
+  {
+    "step_id": 85079,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M5.S4",
+    "title": "Run your loop on a planted bug + judge intervention"
+  },
+  {
+    "step_id": 85080,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M5.S5",
+    "title": "Ship the harness \u2014 GHA runs it on 3 bugs of rising difficulty"
+  },
+  {
+    "step_id": 85082,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M6.S1",
+    "title": "Write a custom subagent for the test-fix loop"
+  },
+  {
+    "step_id": 85086,
+    "course_id": "created-7fee8b78c742",
+    "course_label": "claude-code",
+    "label": "M6.S5",
+    "title": "Ship a .claude/ teammate-ready configuration"
+  }
+]

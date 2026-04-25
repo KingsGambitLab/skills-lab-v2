@@ -674,6 +674,35 @@ async def regenerate_single_step(
             logger.info("per_step regen attempt %d failed completeness: %s", attempt, reason)
             continue
 
+        # 2026-04-25 — gate-parity with full course-gen path. Pilot regen of
+        # Kimi M6.S3 (step 85164) caught a bypass: per-step regen was only
+        # running `_minimal_completeness_check` and skipping the full
+        # ontology contract (`validate_step_against_ontology`). Result: a
+        # terminal_exercise regen that DROPPED required `validation.cli_commands`
+        # was accepted. Wire the same ontology gate the full course-gen
+        # path runs in main.py:_is_complete so retry feedback surfaces the
+        # specific contract violation.
+        try:
+            from backend.ontology import validate_step_against_ontology
+            ont_ok, ont_reason = validate_step_against_ontology(
+                ex_type,
+                candidate.get("demo_data") or {},
+                candidate.get("validation") or {},
+                code=candidate.get("code"),
+            )
+            if not ont_ok:
+                last_reason = f"ontology gate: {ont_reason}"
+                last_failure_class = "ontology_failed"
+                logger.warning(
+                    "per_step regen attempt %d ontology gate REJECT: %s",
+                    attempt, ont_reason,
+                )
+                continue
+        except Exception as _onto_err:
+            # Gate bug must NOT hard-fail regen — log + continue (parity
+            # with main.py:_is_complete's soft-pass behavior).
+            logger.warning("per_step regen ontology gate error (soft-pass): %s", _onto_err)
+
         # v8.6 (2026-04-24) UNIFY WITH COURSE GEN — user directive post-v14:
         # "don't duplicate code for step regen". Shared invariant-check
         # helper `validate_code_exercise_invariant` in main.py encapsulates:

@@ -1,0 +1,338 @@
+[
+  {
+    "step_id": 85142,
+    "label": "kimi-M1.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 31.8,
+    "pre_hash": "8416e7d7a6999d8a",
+    "post_hash": "2d8ff1deafe40c96",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85144,
+    "label": "kimi-M1.S4",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 29.7,
+    "pre_hash": "f823f2de6113133d",
+    "post_hash": "1dcfdc77d7e617df",
+    "cli_count": 2,
+    "reason": ""
+  },
+  {
+    "step_id": 85146,
+    "label": "kimi-M2.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 42.6,
+    "pre_hash": "554e461d54e8efe0",
+    "post_hash": "274c3f989127d29d",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85148,
+    "label": "kimi-M2.S4",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 34.6,
+    "pre_hash": "0f902547502e6875",
+    "post_hash": "eeae68c6be23910a",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85151,
+    "label": "kimi-M3.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 31.1,
+    "pre_hash": "fdd49bd456196a29",
+    "post_hash": "1bef3a99b23f545b",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85152,
+    "label": "kimi-M3.S3",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 33.9,
+    "pre_hash": "1f56114da47d5fc8",
+    "post_hash": "4234c171492fd800",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85155,
+    "label": "kimi-M4.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 33.0,
+    "pre_hash": "b362345d44d3a683",
+    "post_hash": "ebb72af36726dbcd",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85156,
+    "label": "kimi-M4.S3",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 35.3,
+    "pre_hash": "3559c3c618e2c6c7",
+    "post_hash": "00317ee0199d97e7",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85159,
+    "label": "kimi-M5.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 31.9,
+    "pre_hash": "a5350cda1f4b860b",
+    "post_hash": "fcf9ae4aee34b45f",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85161,
+    "label": "kimi-M5.S4",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 38.7,
+    "pre_hash": "9efd2a547de1c354",
+    "post_hash": "e8bf5345627ec06f",
+    "cli_count": 2,
+    "reason": ""
+  },
+  {
+    "step_id": 85163,
+    "label": "kimi-M6.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 32.7,
+    "pre_hash": "4e0a44c03154d986",
+    "post_hash": "f700c7f4fe73bf28",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85059,
+    "label": "claude-code-M0.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 28.9,
+    "pre_hash": "4bbbf61fee3ad8c3",
+    "post_hash": "4e61b1b2c4574113",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85061,
+    "label": "claude-code-M1.S2",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 33.0,
+    "pre_hash": "658966998e58e13a",
+    "post_hash": "ab4807e424159717",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85066,
+    "label": "claude-code-M2.S3",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 32.8,
+    "pre_hash": "42e2aecc6c2266f2",
+    "post_hash": "a7fb03603798ec15",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85067,
+    "label": "claude-code-M2.S4",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 32.6,
+    "pre_hash": "1e98bb5540a9e07c",
+    "post_hash": "d4fcdea3fe66b388",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85070,
+    "label": "claude-code-M3.S3",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 34.6,
+    "pre_hash": "5b46594089ffd27a",
+    "post_hash": "8f98052bd1731cd7",
+    "cli_count": 6,
+    "reason": ""
+  },
+  {
+    "step_id": 85074,
+    "label": "claude-code-M4.S3",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 31.6,
+    "pre_hash": "02fdb99148dc904c",
+    "post_hash": "c6bbea3ab2d603f5",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85079,
+    "label": "claude-code-M5.S4",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 27.3,
+    "pre_hash": "4ad739fb1ade9d28",
+    "post_hash": "bc81a754204d9620",
+    "cli_count": 3,
+    "reason": ""
+  },
+  {
+    "step_id": 85080,
+    "label": "claude-code-M5.S5",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 31.7,
+    "pre_hash": "d0013928121f86c1",
+    "post_hash": "010b7cc07687acfa",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85082,
+    "label": "claude-code-M6.S1",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": false
+    },
+    "duration_s": 40.4,
+    "pre_hash": "787551b788904aba",
+    "post_hash": "4f84403b089d9906",
+    "cli_count": 4,
+    "reason": ""
+  },
+  {
+    "step_id": 85086,
+    "label": "claude-code-M6.S5",
+    "ok": true,
+    "gates": {
+      "hash_moved": true,
+      "has_cli_commands": true,
+      "no_bare_moonshotai": true,
+      "no_paste_lang": true
+    },
+    "duration_s": 30.2,
+    "pre_hash": "53be77fac09131f0",
+    "post_hash": "f6fb92b5b8f099e6",
+    "cli_count": 4,
+    "reason": ""
+  }
+]
