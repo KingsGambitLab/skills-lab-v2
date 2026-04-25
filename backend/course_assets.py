@@ -169,6 +169,43 @@ def build_bootstrap_command(
 # "don't hard code" — each course is ONE entry here, not code-level wiring.
 
 register_course_assets(CourseAsset(
+    slug="kimi",
+    title_hint="Open-Source AI Coding: Kimi K2 + Aider",
+    # 2026-04-25 — open-source-friendly variant of the AIE shape.
+    # Same patterns (BYO-key, terminal-first, per-module branches,
+    # GHA capstone) but Aider + Kimi K2 (Moonshot) + Python content.
+    # Reuses the language-agnostic aie-team-tickets-mcp via a Python
+    # adapter (M5) so the same MCP serves Anthropic + non-Anthropic
+    # learners.
+    course_repo="https://github.com/tusharbisht/kimi-eng-course-repo",
+    module_branches={
+        "preflight":      "module-0-preflight",
+        "first-fix":      "module-1-starter",
+        "claudemd":       "module-2-claudemd",
+        "agents":         "module-3-agents",
+        "hooks":          "module-4-hooks",
+        "mcp":            "module-5-mcp",
+        "capstone":       "module-6-capstone",
+    },
+    mcp_servers=(
+        McpServerAsset(
+            name="team-tickets",
+            repo="https://github.com/tusharbisht/aie-team-tickets-mcp",
+            transport="stdio",
+            tools=("list_recent_tickets", "get_ticket_health"),
+            description=(
+                "Linear-flavored team-tickets MCP (reused from AIE). "
+                "Spring Boot + Python teams alike consume it; in M5 the "
+                "Kimi course wires it via a Python MCP-adapter that "
+                "bridges stdio JSON-RPC to OpenAI-compatible tool_call "
+                "definitions Moonshot accepts natively."
+            ),
+        ),
+    ),
+))
+
+
+register_course_assets(CourseAsset(
     slug="jspring",
     title_hint="Claude Code for Spring Boot",
     # v8.6.2 (2026-04-24) — Java + Spring Boot variant of the AIE course
