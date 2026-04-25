@@ -124,6 +124,54 @@
     });
   }
 
+  // 2026-04-25 — click-to-copy on every <pre> in a container. Wraps each
+  // <pre> in a div.tmpl-pre-wrap and pins a Copy button in the top-right
+  // (revealed on hover, opaque on focus). Idempotent: skips already-decorated.
+  // The copied text is the <pre>'s textContent (raw, no HTML), so multi-line
+  // shell commands paste cleanly into a real terminal.
+  function decorateCopyButtons(root) {
+    if (!root) return;
+    const pres = Array.from(root.querySelectorAll('pre'));
+    pres.forEach(pre => {
+      // Skip if already wrapped (re-mount safety)
+      if (pre.parentElement && pre.parentElement.classList.contains('tmpl-pre-wrap')) return;
+      // Skip empty pres (no command to copy)
+      const text = (pre.textContent || '').trim();
+      if (!text) return;
+      const wrap = document.createElement('div');
+      wrap.className = 'tmpl-pre-wrap';
+      pre.parentNode.insertBefore(wrap, pre);
+      wrap.appendChild(pre);
+      const btn = document.createElement('button');
+      btn.type = 'button';
+      btn.className = 'tmpl-copy-btn';
+      btn.textContent = 'Copy';
+      btn.setAttribute('aria-label', 'Copy command to clipboard');
+      btn.addEventListener('click', async (ev) => {
+        ev.preventDefault();
+        ev.stopPropagation();
+        const payload = (pre.textContent || '').trim();
+        try {
+          await navigator.clipboard.writeText(payload);
+          const orig = btn.textContent;
+          btn.textContent = '✓ Copied';
+          btn.classList.add('copied');
+          setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1500);
+        } catch (_) {
+          // Fallback for older browsers / non-https — text-select + cmd+C
+          const range = document.createRange();
+          range.selectNodeContents(pre);
+          const sel = window.getSelection();
+          sel.removeAllRanges();
+          sel.addRange(range);
+          btn.textContent = 'Press ⌘C';
+          setTimeout(() => { btn.textContent = 'Copy'; }, 2000);
+        }
+      });
+      wrap.appendChild(btn);
+    });
+  }
+
   function mount(container, data, handlersOrJudgeFn) {
     const judgeFn = (typeof handlersOrJudgeFn === 'function')
       ? handlersOrJudgeFn
@@ -229,7 +277,15 @@
 
     // Instructions
     const instrEl = container.querySelector('[data-slot="instructions"]');
-    if (instrEl) instrEl.innerHTML = data.instructions || '';
+    if (instrEl) {
+      instrEl.innerHTML = data.instructions || '';
+      // 2026-04-25 — click-to-copy on every <pre> block. User directive: "allow
+      // copy pasting from our terminal window where commands are present, to make
+      // terminal assignments easy to follow." Inline <code> stays as-is (single
+      // tokens are fine to double-click); multiline <pre> blocks get a hover-
+      // reveal Copy button. Generic + applies to every Creator-emitted pre.
+      decorateCopyButtons(instrEl);
+    }
 
     // v8.6.1 — Paste area: single textarea OR structured slots
     const singleBlock = container.querySelector('[data-role="paste-single-block"]');

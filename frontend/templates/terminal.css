@@ -61,6 +61,41 @@
   white-space: pre;
   margin: 10px 0;
 }
+
+/* 2026-04-25 — click-to-copy on every command block in instructions.
+   Wrapper is .tmpl-pre-wrap added by JS at mount; button hover-reveals
+   in top-right of the <pre>. Same pattern as the bootstrap-code button
+   but applied to ALL <pre>'s the Creator emits in instructions. */
+.tmpl-terminal .tmpl-pre-wrap {
+  position: relative;
+}
+.tmpl-terminal .tmpl-pre-wrap .tmpl-copy-btn {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  background: rgba(74, 124, 255, 0.85);
+  color: #fff;
+  border: 0;
+  border-radius: 4px;
+  padding: 3px 9px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 0.15s ease;
+  z-index: 2;
+}
+.tmpl-terminal .tmpl-pre-wrap:hover .tmpl-copy-btn,
+.tmpl-terminal .tmpl-pre-wrap .tmpl-copy-btn:focus {
+  opacity: 1;
+}
+.tmpl-terminal .tmpl-pre-wrap .tmpl-copy-btn:hover {
+  background: rgba(74, 124, 255, 1);
+}
+.tmpl-terminal .tmpl-pre-wrap .tmpl-copy-btn.copied {
+  background: rgba(45, 212, 191, 0.9);
+  opacity: 1;
+}
 .tmpl-terminal .tmpl-instructions h3 {
   color: #cdd8ff;
   font-size: 1.02rem;
