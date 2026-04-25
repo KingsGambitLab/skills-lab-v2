@@ -310,6 +310,14 @@ body.catalog-mode .content-scroll {
   max-width: 900px;
   width: 100%;
   margin: 0 auto;
+  /* 2026-04-25 v8.7 — bottom padding so the in-flow nav buttons (Prev /
+   * Next) never sit underneath the fixed Clicky FAB (bottom-right, z-900).
+   * Beginner reviewer caught this on AIE M1.S2 — clicking "Next" after a
+   * wrong submit hit the FAB instead of advancing. The FAB takes priority
+   * because position:fixed creates a stacking context. Padding pushes the
+   * page content up so the Next button is always above the FAB region.
+   */
+  padding-bottom: 88px;
 }
 .step-nav-btn {
   display: flex;
@@ -4999,11 +5007,28 @@ function renderBanner(type) {
     mcq: ['banner-interactive', '&#10067; Multiple Choice'],
     system_build: ['banner-system-build', '&#9881; System Build'],
     adaptive_roleplay: ['banner-interactive', '&#128172; Live Roleplay'],
+    voice_mock_interview: ['banner-interactive', '&#127908; Voice Interview'],
     incident_console: ['banner-system-build', '&#128680; Incident Console'],
     simulator_loop: ['banner-system-build', '&#9201; Live Simulation'],
+    // Capstone / shipping types — all sit under "system-build" visually since
+    // they're real-world deliverable checkpoints.
+    terminal_exercise: ['banner-system-build', '&#128187; Terminal Exercise'],
+    github_classroom_capstone: ['banner-system-build', '&#128640; GitHub Classroom Capstone'],
+    document_authoring: ['banner-interactive', '&#128221; Document Authoring'],
   };
-  const [cls, text] = banners[type] || ['banner-concept', type];
-  return `<div class="step-type-banner ${cls}">${text}</div>`;
+  // Fallback: if the Creator emits an unknown / new exercise_type, render it
+  // as a humanized label rather than the raw snake_case string. Beginner
+  // reviewer 2026-04-25 caught `github_classroom_capstone` showing raw type
+  // for AIE M4.S3 — the registry above closes the known cases; this branch
+  // keeps unknown types readable until they're added explicitly.
+  if (banners[type]) {
+    const [cls, text] = banners[type];
+    return `<div class="step-type-banner ${cls}">${text}</div>`;
+  }
+  const humanized = String(type || 'concept')
+    .replace(/_/g, ' ')
+    .replace(/\b\w/g, c => c.toUpperCase());
+  return `<div class="step-type-banner banner-concept">&#9881; ${humanized}</div>`;
 }
 
 // ===================================================================
