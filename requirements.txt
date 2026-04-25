@@ -2,6 +2,12 @@ fastapi==0.115.0
 uvicorn[standard]==0.30.6
 sqlalchemy==2.0.35
 aiosqlite==0.20.0
+# 2026-04-25 v8 (deploy/postgres-multi-user) — Postgres async driver. Used when
+# DATABASE_URL is set to `postgresql+asyncpg://...` (production multi-user
+# instance on 52.88.255.208). Local dev keeps using aiosqlite + skills_lab.db
+# unless DATABASE_URL is overridden. backend/database.py auto-detects which
+# branch to take based on the URL scheme.
+asyncpg==0.29.0
 pydantic==2.9.2
 httpx==0.27.2
 python-multipart==0.0.12
