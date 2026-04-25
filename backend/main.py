@@ -7558,6 +7558,187 @@ def _course_has_aider_scope(title: str = "", description: str = "", source_mater
     ))
 
 
+def _course_repo_facts(course_title: str = "") -> str:
+    """Per-course CANONICAL REPO STATE — injected into Creator prompt to
+    prevent the LLM from hallucinating GitHub URLs / branch names / file
+    paths / test function names / MCP tool names.
+
+    2026-04-25 v5 — added after multiple rounds of regen feedback showed
+    the LLM repeatedly inventing:
+      - skillslab-xyz/* / skillslab/* / skillslab-ai/* — none of those
+        orgs exist on GitHub
+      - module-2-flowcast-orders / health-endpoint-challenge in old
+        rounds — nonexistent branches
+      - tests/test_order_service.py / tests/test_orders_endpoint.py —
+        wrong file paths
+      - get_tickets / update_ticket / get_team_tickets — fictional MCP
+        tools
+
+    Each course's CourseAsset registry entry knows the canonical repo
+    URL + valid branches. This function adds the file-paths + test
+    function names + MCP tool names that are stable + structural for
+    the course's pedagogy, so the LLM has the ground truth at gen time
+    rather than discovering it via review-cycle ground-truthing.
+
+    Returns the empty string if the course doesn't match any registered
+    asset (graceful no-op for non-CLI courses).
+    """
+    title_lc = (course_title or "").lower()
+    if not title_lc:
+        return ""
+    try:
+        from .course_assets import _COURSE_ASSETS
+    except Exception:
+        return ""
+
+    # Robust slug matching with PRIORITY (most-specific token wins).
+    # Why ordering matters: a title like "Claude Code for Spring Boot"
+    # contains both "claude code" AND "spring boot". The course is
+    # semantically JSpring (Java content), not the AIE/Claude-Code Python
+    # course. List jspring tokens FIRST so they short-circuit when a
+    # title matches both.
+    SLUG_TOKENS: tuple[tuple[str, tuple[str, ...]], ...] = (
+        ("jspring",     ("spring boot", "java + spring", "jspring")),
+        ("kimi",        ("kimi k2", "kimi+aider", "kimi", "aider")),
+        ("claude-code", ("claude code", "claude-code", "ai-augmented engineering")),
+        ("aie",         ("ai-augmented engineering",)),
+    )
+    matched = None
+    for slug, tokens in SLUG_TOKENS:
+        if any(t in title_lc for t in tokens):
+            matched = _COURSE_ASSETS.get(slug)
+            if matched:
+                break
+    if not matched:
+        return ""
+
+    # Per-course repo facts. Hardcoded canonical truth verified live
+    # against gh api on 2026-04-25.
+    KIMI_FILES = {
+        "starter (module-1-starter)": [
+            "app/services/order_service.py  (the planted N+1 bug — .customer lazy-load)",
+            "tests/services/test_order_service.py  (the canonical N+1 test path — NOT tests/test_order_service.py)",
+            "tests/test_health.py  (preflight)",
+            "pyproject.toml  (hatch wheel packages = ['app'] — required for `uv pip install -e .`)",
+        ],
+        "capstone (module-6-capstone)": [
+            "tests/api/test_orders.py  (capstone tests — NOT tests/test_orders_endpoint.py)",
+            "harness/loop.py-STUB  (the loop the learner copies + implements)",
+            "harness/mcp_adapter.py-STUB",
+            ".github/workflows/lab-grade.yml  (real grading job: 'grade')",
+        ],
+    }
+    AIE_FILES = {
+        "starter (module-1-starter)": [
+            "app/health.py  (NOT app/schemas/health.py — schemas/ doesn't exist)",
+            "app/repositories.py  (the planted missing-commit bug)",
+            "tests/test_tickets.py  (real tests: test_ticket_create_persists, test_ticket_get_by_id, test_ticket_list_returns_recent — NOT test_create_ticket_with_priority)",
+            "pyproject.toml  (asyncio_mode='auto' configured)",
+        ],
+        "challenge branches": [
+            "health-endpoint-challenge  (M3 starting branch)",
+            "module-6-final  (M6 final branch)",
+        ],
+    }
+    JSPRING_FILES = {
+        "package": [
+            "com.tusharbisht.jspring.*  (the canonical Java package — NOT com.crateflow, NOT com.example)",
+        ],
+        "ci": [
+            ".github/workflows/lab-grade.yml  (5 gates: Spotless, Checkstyle, JaCoCo 80%, ruff-equiv, lab-grade — propagated to all module branches as of 2026-04-25)",
+        ],
+    }
+    files_map = {
+        "kimi": KIMI_FILES,
+        "claude-code": AIE_FILES,
+        "aie": AIE_FILES,
+        "jspring": JSPRING_FILES,
+    }
+    files = files_map.get(matched.slug, {})
+
+    # Real MCP tool names (NOT the LLM's invented variants).
+    mcp_tools = []
+    for m in (matched.mcp_servers or ()):
+        if m.tools:
+            mcp_tools.append(
+                f"  - {m.name} ({m.repo}): {', '.join(m.tools)}  "
+                f"(transport: {m.transport})"
+            )
+    mcp_block = ""
+    if mcp_tools:
+        mcp_block = (
+            "\n### MCP servers (REAL tool names — DO NOT invent others):\n"
+            + "\n".join(mcp_tools) + "\n"
+        )
+
+    # Branches that EXIST.
+    branches = sorted(set(matched.module_branches.values()))
+    branch_lines = "\n".join(f"  - {b}" for b in branches)
+
+    # File paths — flatten the per-section dict.
+    file_section = ""
+    if files:
+        file_section = "\n### Key file paths (use these EXACT paths):\n"
+        for section_label, paths in files.items():
+            file_section += f"  **{section_label}**:\n"
+            for p in paths:
+                file_section += f"  - {p}\n"
+
+    # The "NEVER reference" denylist accumulates known hallucinations from
+    # past review rounds. Adding entries here prevents them from being
+    # emitted by future regens.
+    NEVER_REF = {
+        "kimi": [
+            "skillslab-platform/* / skillslab-ai/* / skillslab/* (orgs do NOT exist)",
+            "flowcast-* (fictional product name)",
+            "module-2-flowcast-orders (branch does NOT exist)",
+            "tests/test_order_service.py (wrong path — real: tests/services/)",
+            "tests/test_orders_endpoint.py (wrong path — real: tests/api/test_orders.py)",
+            "get_tickets / get_team_tickets / update_ticket (fictional MCP tools)",
+            "tusharbisht-kimi-eng-course-repo (wrong dir name — `gh repo fork --clone` makes `kimi-eng-course-repo/`)",
+        ],
+        "claude-code": [
+            "skillslab-xyz/techtickets-broken (does NOT exist)",
+            "@skillslab/team-tickets-mcp (npm package does NOT exist — MCP is Python)",
+            "app/schemas/* (directory does NOT exist on the repo)",
+            "test_create_ticket_with_priority (function does NOT exist)",
+            "claude --list-agents (flag does NOT exist; use `cat .claude/agents/*.md`)",
+            "claude --agent <X> --dry-run (flags do NOT exist)",
+            "claude config validate (subcommand does NOT exist; use `python -c 'import json; json.load(open(...))'` or `jq`)",
+            "claude hooks status (subcommand does NOT exist; use `cat .claude/settings.json | jq .hooks`)",
+            "claude agents list (subcommand does NOT exist; use `ls .claude/agents/`)",
+            "tool_input.new_content (Edit's real fields are file_path/old_string/new_string)",
+            'gha_workflow_check.required_jobs = ["test","lint","type-check"] (workflow has 1 job: "grade")',
+        ],
+        "aie": [
+            "(see claude-code)",
+        ],
+        "jspring": [
+            "com.crateflow / com.example (fictional packages — real: com.tusharbisht.jspring)",
+            "claude /agents list (slash + shell mixed; real: `claude /agents` inside session OR `ls .claude/agents/` shell)",
+            "claude --agent <X> (flag does not exist)",
+        ],
+    }
+    never = NEVER_REF.get(matched.slug, [])
+    never_section = ""
+    if never:
+        never_section = "\n### NEVER reference (catalog of past hallucinations to avoid):\n"
+        for item in never:
+            never_section += f"  - {item}\n"
+
+    return (
+        "## GROUND TRUTH REPO STATE — quote VERBATIM, don't invent\n"
+        "When emitting cli_commands, demo_data, code, content — use ONLY these "
+        "URLs / branches / paths / test names / MCP tools. The Creator's drift gate "
+        "rejects steps that reference anything outside this list.\n"
+        f"\n### Canonical repo: {matched.course_repo}\n"
+        f"\n### Valid branches (DO NOT reference any other branch):\n{branch_lines}\n"
+        f"{file_section}"
+        f"{mcp_block}"
+        f"{never_section}"
+    )
+
+
 def _course_has_claude_code_scope(title: str = "", description: str = "", source_material: str = "") -> bool:
     """Returns True if the course clearly touches Claude Code tooling —
     BYO-key flows, Claude Code commands, MCP, custom subagents, hooks,
@@ -9149,6 +9330,15 @@ IMPORTANT for incident_console:
                 _facts_blob = _ts.assemble_creator_prompt_block(_cc_title, _cc_desc, _cc_src)
                 if _facts_blob:
                     prompt += "\n\n" + _facts_blob + "\n"
+                # 2026-04-25 v5 — Hallucinated-URL prevention via per-course
+                # canonical-state injection. Replaces the "regen → review →
+                # find hallucinated URL → regen" whack-a-mole with gen-time
+                # ground truth. Drift catalog (NEVER reference) accumulates
+                # known hallucinations from past review rounds, so each
+                # iteration leaves the prompt smarter.
+                _repo_facts = _course_repo_facts(_cc_title)
+                if _repo_facts:
+                    prompt += "\n\n" + _repo_facts + "\n"
                 # Belt-and-braces: also inject the legacy facts-block while
                 # the schema's coverage stabilizes. Will be removed.
                 try:
