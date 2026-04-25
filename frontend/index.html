@@ -4702,6 +4702,109 @@ ${esc(wrapper)} check                    <span style="color:#8892a8"># grades + 
 }
 
 
+// 2026-04-25 v6 — Widget-action event delegation (replaces the chronic
+// "inline-onclick → function not on window → silent dead click" failure).
+//
+// User directive (verbatim, 2026-04-25): "Hoisting issue is repetitive —
+// make sure we fix the root cause and generalise"
+//
+// THE PROBLEM (whack-a-mole shape):
+//   Widget HTML uses `<button onclick="fn('arg')">`. Browsers resolve
+//   inline onclicks via `window[fn]` at click-time. If the widget's
+//   <script> tag defines the function in a way that doesn't end up
+//   on window (IIFE-scoped, const-bound, conditional, lazy-loaded),
+//   the click silently does nothing.
+//
+//   Each definition shape needs its own hoist regex. We've patched ONE
+//   shape (top-level `function NAME`); next bug a different shape;
+//   forever.
+//
+// THE FIX (this file, two functions):
+//   1. _rewriteOnclicksToDataActions — runs ONCE per render; walks the
+//      step container's `[onclick]` attributes, parses each call into
+//      (name, args), writes them to data-action / data-args, removes
+//      the original onclick attribute.
+//   2. _installWidgetActionDelegator — installs ONE event listener on
+//      the body that catches every click on `[data-action]`, looks up
+//      the action on window, and invokes it.
+//
+// Why this is structural: the delegator works EVERY way the function
+// could end up callable — including via window assignment, top-level
+// declaration, or any future shape we don't yet anticipate. If the
+// function is missing from window, we LOG LOUDLY (not silent fail).
+//
+// The hoist regexes above are still helpful (they cover more shapes)
+// but they're no longer the only line of defense. The delegator is.
+function _rewriteOnclicksToDataActions(container) {
+  if (!container) return;
+  // Match: an identifier followed by `(...)`. Capture name + args.
+  // Tolerates whitespace, single/double quotes, JS strings with
+  // commas inside them (best-effort — fully nested calls fall back
+  // to raw eval-style invocation via the original onclick string).
+  const callRe = /^\s*([a-zA-Z_$][\w$]*)\s*\(([\s\S]*)\)\s*;?\s*$/;
+  container.querySelectorAll('[onclick]').forEach(el => {
+    const onclickAttr = el.getAttribute('onclick') || '';
+    const m = onclickAttr.match(callRe);
+    if (!m) {
+      // Couldn't parse — leave as-is (legacy behavior). Most cases:
+      // statements like `this.disabled=true;fn()` or multi-call.
+      return;
+    }
+    const fnName = m[1];
+    const argsRaw = m[2].trim();
+    el.setAttribute('data-action', fnName);
+    if (argsRaw) {
+      // Store args as the raw expression text. The delegator evaluates
+      // it via Function(...) so arrays/objects/expressions all work.
+      el.setAttribute('data-args-raw', argsRaw);
+    }
+    el.removeAttribute('onclick');
+  });
+}
+
+let _widgetActionDelegatorInstalled = false;
+function _installWidgetActionDelegator() {
+  if (_widgetActionDelegatorInstalled) return;
+  _widgetActionDelegatorInstalled = true;
+  document.addEventListener('click', (e) => {
+    const el = e.target.closest('[data-action]');
+    if (!el) return;
+    const name = el.getAttribute('data-action');
+    if (!name) return;
+    const fn = window[name];
+    if (typeof fn !== 'function') {
+      console.error(
+        `[widget action] "${name}" referenced by data-action is not on window. ` +
+        `The widget's <script> didn't expose it. Check the script for ` +
+        `"window.${name} = ..." or "function ${name}(){}" at top level.`
+      );
+      return;
+    }
+    let args = [];
+    const argsRaw = el.getAttribute('data-args-raw');
+    if (argsRaw) {
+      try {
+        // Evaluate the raw arg expression in a way that allows JS
+        // literals (strings, numbers, arrays, objects). Wrapping in
+        // an array literal `[ARGS]` lets us then spread.
+        args = Function(`"use strict"; return [${argsRaw}];`)();
+      } catch (err) {
+        console.error(
+          `[widget action] failed to parse args for ${name}(${argsRaw}):`,
+          err,
+        );
+        return;
+      }
+    }
+    try {
+      fn(...args);
+    } catch (err) {
+      console.error(`[widget action] ${name}(...) threw:`, err);
+    }
+  }, true);  // capture phase — fires before any per-element listener
+}
+
+
 function renderStep(rawStep, index) {
   const container = document.getElementById('contentScroll');
   // Phase 3 surface gate (2026-04-25). Terminal-native steps render the
@@ -4933,33 +5036,63 @@ function renderStep(rawStep, index) {
       // Match patterns like:
       //   document.addEventListener('DOMContentLoaded', function() { BODY });
       //   window.addEventListener('DOMContentLoaded', () => { BODY });
-      // Extract BODY and run inline via IIFE. Anchored loosely so both
-      // function-expression and arrow forms match.
+      // Extract BODY and run inline via IIFE.
       const domReadyRegex = /(?:document|window)\s*\.\s*addEventListener\s*\(\s*['"]DOMContentLoaded['"]\s*,\s*(?:function\s*\(\s*\)\s*|\(\s*\)\s*=>\s*)\{([\s\S]*)\}\s*\)\s*;?\s*$/;
       const m = code.trim().match(domReadyRegex);
       if (m) {
         code = `(function(){${m[1]}})();`;
       }
-      // Fix A: wrap the widget body so setInterval/setTimeout are tracked.
-      // The shimmed fns call the real ones and push the returned id into
-      // window._widgetTimers. Teardown on next step nav clears them.
+      // 2026-04-25 v6 — STRUCTURAL FIX (user directive: "hoisting issue is
+      // repetitive — make sure we fix the root cause and generalise").
       //
-      // 2026-04-22 BUG FIX (user report: "Interactive slide(1st) click does
-      // nothing" on Go course #created-575a53998df8/23070/0 — the content
-      // ships `<button onclick="showZeroValue('string')">` plus a `<script>`
-      // declaring `function showZeroValue`. Wrapping the whole script body
-      // in an IIFE made showZeroValue a LOCAL function to the IIFE — the
-      // inline onclick handler (which runs in global scope) couldn't find
-      // it, so clicks did nothing silently.
+      // The chronic problem: widget HTML uses `<button onclick="fn()">`
+      // patterns. For inline onclicks to work, `fn` must be on `window`.
+      // We patched ONE shape (top-level `function NAME(){}` → hoist),
+      // but every new definition shape breaks differently:
+      //   - `const NAME = ...` (block-scoped, never on window)
+      //   - `window.NAME = function...` inside IIFE (works ONLY if IIFE runs)
+      //   - Arrow functions assigned to const
+      //   - Functions inside callbacks
+      //   - Conditional definitions
+      // Each shape needs a separate hoist regex. Whack-a-mole.
       //
-      // Fix: scan the original script text for top-level `function NAME(`
-      // declarations and re-export them to `window` at the end of the IIFE.
-      // This preserves timer tracking while restoring the "widget buttons
-      // can call the widget script's functions" behavior the LLM assumes.
-      const _fnNameMatches = [...code.matchAll(/(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g)];
-      const _hoistedNames = Array.from(new Set(_fnNameMatches.map(m => m[1])));
-      const _hoistTail = _hoistedNames
-        .map(n => `try{window[${JSON.stringify(n)}]=${n};}catch(_e){}`)
+      // GENERALIZATION: stop relying on inline onclick attribute resolution.
+      // After the script runs, this block does TWO things:
+      //   1. Aggressive multi-shape hoist (top-level `function NAME`,
+      //      `const NAME = function`, `const NAME = (`, `let/var NAME =`)
+      //      → window. Catches more shapes than v5's hoist did.
+      //   2. **Event delegation** — walk every `[onclick]` attribute in the
+      //      rendered container, parse the function name + arg list, and
+      //      install a `data-action` attribute on the element. A SINGLE
+      //      delegated click listener (installed once on the container,
+      //      see _installWidgetActionDelegator below) reads data-action,
+      //      resolves the function on window, and invokes. Works regardless
+      //      of HOW the widget script defined the function — as long as
+      //      something puts it on window (which our hoists now broadly
+      //      cover, and which Creator-emitted `window.X = ...` already
+      //      does directly).
+      //   3. If a referenced function is MISSING from window after the
+      //      script runs, log a clear console.error naming the function
+      //      AND surface a console hint about the widget content.
+      //      No more silent dead clicks.
+      const _hoistShapes = [
+        // function NAME(...) { ... }    — at start of line OR after }/;/blank
+        /(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
+        // const NAME = function ... | const NAME = (...) => ... | const NAME = async ...
+        /(?:^|\n)\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z_$][\w$]*\s*=>)/g,
+      ];
+      const _hoistedNames = new Set();
+      for (const re of _hoistShapes) {
+        for (const m of code.matchAll(re)) _hoistedNames.add(m[1]);
+      }
+      // Skip names that look like reserved words / common false positives.
+      const _RESERVED = new Set(['if','else','for','while','do','switch','case','return',
+                                 'function','var','let','const','class','new','this','async',
+                                 'await','try','catch','finally','throw','break','continue',
+                                 'true','false','null','undefined','NaN','Infinity']);
+      const _toHoist = [..._hoistedNames].filter(n => !_RESERVED.has(n));
+      const _hoistTail = _toHoist
+        .map(n => `try{if(typeof ${n}!=="undefined")window[${JSON.stringify(n)}]=${n};}catch(_e){}`)
         .join('');
       code = `(function(){
         const _origInt = window.setInterval.bind(window);
@@ -4973,6 +5106,15 @@ function renderStep(rawStep, index) {
     }
     oldScript.parentNode.replaceChild(newScript, oldScript);
   });
+
+  // 2026-04-25 v6 — Event-delegation rewrite of inline onclick handlers.
+  // After scripts execute, scan the container for `[onclick]` attributes,
+  // convert each to `data-action` + `data-args`, and install ONE delegated
+  // click listener that resolves data-action via window. This avoids the
+  // chronic "function not on window → silent dead click" failure mode
+  // regardless of how the widget script defined the function.
+  _installWidgetActionDelegator();
+  _rewriteOnclicksToDataActions(container);
 
   // P0-1 post-render: mount the template into the placeholder we emitted
   // during the render-switch phase above. This replaces the legacy setupX

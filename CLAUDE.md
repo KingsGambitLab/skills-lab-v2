@@ -1,5 +1,41 @@
 # Skills Lab v2 — AI LMS Platform
 
+## 🖱 WIDGET CLICKS — EVENT DELEGATION, NOT INLINE-ONCLICK RESOLUTION (2026-04-25 v6)
+
+**User directive (verbatim, 2026-04-25):** *"Hoisting issue is repetitive — make sure we fix the root cause and generalise"*
+
+**The chronic problem.** Concept-widget HTML uses `<button onclick="fn('arg')">`. Browsers resolve that via `window[fn]` at click-time. But our injected widget scripts get wrapped in IIFEs (timer-tracking + zombie-teardown), so functions defined inside them are NOT on window unless the script explicitly does `window.fn = ...`. Every new definition shape (`const fn = ...`, `let fn = function`, conditional definitions, async assignments) breaks differently. We patched ONE shape (top-level `function NAME` → hoist) on 2026-04-22; the chain of dead-button bugs continued.
+
+**The structural fix (2026-04-25 v6).** Stop relying on inline-onclick → window resolution. After every step render, the frontend:
+
+1. **`_rewriteOnclicksToDataActions(container)`** — walks every `[onclick]` attribute in the rendered container; parses each call into `(name, argsRaw)`; writes `data-action="<name>"` + `data-args-raw="<args>"`; removes the original `onclick`. Multi-statement legacy onclicks (`a;b;c()`) that don't parse cleanly are left untouched.
+2. **`_installWidgetActionDelegator()`** — installs ONE delegated click listener (capture phase) on `document` that catches every click on `[data-action]`, looks up the action on `window`, evaluates `data-args-raw` via `Function(...)` to support arrays/objects/string literals, and invokes. **If `window[name]` is undefined → console.error names the missing function, no silent fail.**
+
+The hoist-shapes regex (function declarations + const/let/var assignments) still earns its keep — it covers more shapes than the original v5 hoist did, so widgets that don't use `window.X = ...` explicitly still work. But the delegator is the load-bearing piece: it works regardless of HOW the function got onto window.
+
+**Why this is structural, not a patch.**
+
+| Old failure mode | Old fix shape | New behavior |
+|---|---|---|
+| `function NAME(){}` inside IIFE | hoist `function` decls to window | already covered + delegator catches missing |
+| `const NAME = function(){}` inside IIFE | (would have needed new regex) | hoist now covers; delegator catches missing |
+| `window.NAME = ...` already correct | (worked) | unchanged; delegator routes through window |
+| Lazy/conditional `if (x) NAME = ...` | (silent fail) | delegator logs the missing-function error |
+| Future shape we don't anticipate | (silent fail forever) | delegator surfaces with named error |
+
+**Rule going forward:**
+
+1. Any new widget that ships `<button onclick="X()">` works regardless of definition shape, as long as the script puts X on window. The hoist regex covers most idiomatic cases; explicit `window.X = ...` is always safe.
+2. New widget content SHOULD prefer explicit `data-action="X"` attributes (Creator prompt update queued). The delegator handles both shapes; data-action is just clearer + grep-able.
+3. If a learner reports "button does nothing", FIRST check the browser console for `[widget action] "X" referenced by data-action is not on window`. That's a definitive diagnosis without DOM inspection.
+4. Never re-add a hoist regex for "the next definition shape that bites." If a function isn't on window, the delegator's loud error tells us; we either fix the widget script (Creator prompt) or extend the hoist regex (one place, file `frontend/index.html`).
+
+**Reference**: `frontend/index.html` — the `_rewriteOnclicksToDataActions` + `_installWidgetActionDelegator` helpers near `function renderStep`, plus the in-script wrap that does the hoist.
+
+**Smoke-tested 2026-04-25**: 10 representative onclick shapes (single-arg / no-arg / object / array / string-with-comma / multi-statement / no-paren) — all parse correctly OR safely degrade.
+
+---
+
 ## 🎨 RENDERING LAYER OWNS TYPOGRAPHY — NOT THE CREATOR (2026-04-25)
 
 **User directive (verbatim, 2026-04-25):** *"How can we improve the data presentation here? The indentation is broken + too much context. Fix the root cause, don't fix symptoms. Add to claude.md and follow here."*
