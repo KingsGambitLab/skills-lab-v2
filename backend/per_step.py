@@ -733,6 +733,18 @@ async def regenerate_single_step(
         step_row.validation = llm_content.get("validation") or step_row.validation
     if "demo_data" in llm_content:
         step_row.demo_data = llm_content.get("demo_data") or step_row.demo_data
+    # Phase 2 (2026-04-25): if the regen LLM declared a fresh learner_surface
+    # (because the regen touched interactivity / changed exercise_type),
+    # respect it. Otherwise keep the stored value — it was already
+    # canonicalized at first persist.
+    if "learner_surface" in llm_content:
+        try:
+            from .learner_surface import normalize as _norm_surface
+            _new_surface = _norm_surface(llm_content.get("learner_surface"))
+            if _new_surface:
+                step_row.learner_surface = _new_surface
+        except Exception:
+            pass  # surface module missing → keep prior value
 
     await db.commit()
     await db.refresh(step_row)

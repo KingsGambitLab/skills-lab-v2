@@ -59,6 +59,11 @@ class StepOut(BaseModel):
     title: str
     step_type: str
     exercise_type: str | None = None
+    # Surface-aware split (Phase 2 v8.7 2026-04-25). 'web' | 'terminal' | None.
+    # Browser frontend renders a "this step is terminal-native" panel when
+    # 'terminal'; CLI prints "open in browser" when 'web'. NULL = legacy
+    # step (treated as 'web' by both consumers).
+    learner_surface: str | None = None
     content: str | None = None
     code: str | None = None
     expected_output: str | None = None

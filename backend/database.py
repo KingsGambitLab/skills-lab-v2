@@ -181,6 +181,14 @@ class Step(Base):
     expected_output: Mapped[str | None] = mapped_column(Text, nullable=True)
     validation: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     demo_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
+    # 2026-04-25 — surface-aware split (Phase 2). Per-step declaration of
+    # which surface "owns" this assignment end-to-end. Values: 'web' (browser
+    # widget — drag-drop, simulator, mock interview), 'terminal' (CLI-native
+    # — terminal_exercise / system_build / code_exercise on a CLI-eligible
+    # course). NULL = legacy step pre-backfill; consumer treats it as 'web'
+    # for safety. Buddy-Opus review insisted this be an EXPLICIT declaration,
+    # not inferred at runtime — see CLAUDE.md §"Surface-aware split".
+    learner_surface: Mapped[str | None] = mapped_column(String, nullable=True)
 
     module: Mapped["Module"] = relationship(back_populates="steps")
     progress_records: Mapped[list["UserProgress"]] = relationship(
@@ -370,6 +378,13 @@ async def create_tables() -> None:
         table="courses",
         column="published_at",
         ddl="ALTER TABLE courses ADD COLUMN published_at DATETIME",
+    )
+    # v8.7 (2026-04-25) — per-step surface declaration. NULL until backfill
+    # script runs; consumers treat NULL as 'web' for safety.
+    await _ensure_column(
+        table="steps",
+        column="learner_surface",
+        ddl="ALTER TABLE steps ADD COLUMN learner_surface VARCHAR",
     )
 
 

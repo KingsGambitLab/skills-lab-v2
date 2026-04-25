@@ -355,6 +355,12 @@ async def seed_courses_if_empty():
                         title=sdata["title"],
                         step_type=sdata.get("step_type", "concept"),
                         exercise_type=sdata.get("exercise_type"),
+                        learner_surface=_resolve_learner_surface(
+                            ex_type=sdata.get("exercise_type"),
+                            content=sdata.get("content"),
+                            course_title=cdata.get("title", ""),
+                            declared=sdata.get("learner_surface"),
+                        ),
                         content=sdata.get("content"),
                         code=sdata.get("code"),
                         expected_output=sdata.get("expected_output"),
@@ -553,6 +559,40 @@ def _strip_answer_comments_from_code(code: str) -> str:
         if ln is not None:
             out.append(ln)
     return "\n".join(out)
+
+
+def _resolve_learner_surface(
+    *,
+    ex_type: str | None,
+    content: str | None,
+    course_title: str = "",
+    declared: object = None,
+) -> str:
+    """Resolve a step's `learner_surface` value at persist time.
+
+    Order of precedence:
+      1. `declared` — value the LLM (or seed dict) emitted. If it normalizes
+         to 'web' / 'terminal', use it verbatim.
+      2. Heuristic from `learner_surface.classify_step()` — same heuristic the
+         backfill script uses, so a Creator that forgets the field falls back
+         to a sensible default rather than NULL.
+
+    Always returns a valid value ('web' or 'terminal') — never None on the
+    persist path. NULL only exists in the DB for legacy rows pre-backfill.
+
+    Buddy-Opus pushed back on having any heuristic at runtime, but this is
+    the persist path — a one-time decision when the row is born. The
+    runtime read path (API responses) consults the declared value only.
+    """
+    from .learner_surface import classify_step, is_cli_eligible_course, normalize
+    declared_norm = normalize(declared)
+    if declared_norm:
+        return declared_norm
+    return classify_step(
+        exercise_type=ex_type,
+        content=content,
+        course_cli_eligible=is_cli_eligible_course(course_title=course_title),
+    )
 
 
 def _sanitize_step_for_learner(step_dict: dict) -> dict:
@@ -7940,6 +7980,26 @@ with 15 user interviews" — completely different assignment):
   the title names. A "Rate Limiting" step exercises rate-limiters; a "Deployment Pipeline"
   step exercises deployment pipelines. No off-topic filler.
 
+UNIVERSAL FIELD — add to EVERY JSON object you emit, regardless of exercise type:
+  "learner_surface": "web"  OR  "terminal"
+
+Rules:
+  - Interactive widgets (drag-drop, simulators, voice/text mock interviews, click-the-bug,
+    multi-choice, drag-to-reorder, scenario-branch, adaptive-roleplay) → "web" — these
+    require browser execution.
+  - Code-writing on a CLI-eligible course (kimi-k2/aider, claude-code AIE, java spring-boot,
+    or any course where the learner uses `claude`/`aider`/`mvn`/`pytest`/`git` directly)
+    → "terminal" — covers terminal_exercise, system_build, code_exercise, code_read.
+  - Pure text concept (no <script> widget) on a CLI-eligible course → "terminal".
+  - All concepts on a non-CLI-eligible course → "web".
+  - When in doubt, "web". A web declaration is always safe; a wrong "terminal" declaration
+    sends the learner to a CLI they don't have.
+
+This field declares which surface owns the END-TO-END learner experience for this step.
+The browser hides terminal-native steps behind a "open your terminal" pointer; the CLI
+hides web-native steps behind a "open in browser" pointer. Steps NEVER fragment across
+surfaces — pick ONE surface that completes the full assignment.
+
 Generate ONLY JSON (no fences):
 """
 
@@ -11430,6 +11490,12 @@ async def _creator_generate_impl(
                     title=step_outline.title,
                     step_type=step_type,
                     exercise_type=ex_type if ex_type != "concept" else None,
+                    learner_surface=_resolve_learner_surface(
+                        ex_type=ex_type,
+                        content=content,
+                        course_title=title,
+                        declared=llm_content.get("learner_surface"),
+                    ),
                     content=content,
                     code=code,
                     expected_output=expected_output,
@@ -11781,6 +11847,12 @@ async def _creator_generate_impl(
                 title=step_outline.title,
                 step_type=step_type,
                 exercise_type=ex_type if ex_type != "concept" else None,
+                learner_surface=_resolve_learner_surface(
+                    ex_type=ex_type,
+                    content=content,
+                    course_title=title,
+                    declared=(llm_content or {}).get("learner_surface"),
+                ),
                 content=content,
                 code=code,
                 expected_output=expected_output,
