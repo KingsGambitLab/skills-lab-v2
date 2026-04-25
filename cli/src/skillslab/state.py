@@ -67,10 +67,15 @@ def token_path() -> Path:
 def api_url() -> str:
     """API URL is configurable via env, with a fallback file at ~/.skillslab/api_url.
     First-run sets it from DEFAULT_API_URL.
+
+    2026-04-25 v2 — same empty-env-var hardening as web_url(): truthy check
+    rather than membership check. docker-compose.yml may default
+    SKILLSLAB_API_URL to '' which used to return '' here.
     """
+    explicit = os.environ.get("SKILLSLAB_API_URL", "").strip()
+    if explicit:
+        return explicit
     p = home() / "api_url"
-    if "SKILLSLAB_API_URL" in os.environ:
-        return os.environ["SKILLSLAB_API_URL"]
     if p.exists():
         return p.read_text().strip() or DEFAULT_API_URL
     return DEFAULT_API_URL
@@ -93,9 +98,17 @@ def web_url() -> str:
 
     For prod where API and web share an FQDN (e.g. `https://lms.example.com`),
     just point SKILLSLAB_API_URL there and (3) returns it untouched.
+
+    2026-04-25 v2 — TRUTHY check, not membership check. CLI-walk v1 caught
+    that the docker-compose.yml DEFAULTS the env var to empty-string via
+    `${SKILLSLAB_WEB_URL:-}`, which makes `"X" in os.environ` True but the
+    value useless. An empty string here returned `""` and produced URLs
+    like `/#created-...` (no host). Truthy check falls through to the
+    auto-derive path, which is the correct behavior.
     """
-    if "SKILLSLAB_WEB_URL" in os.environ:
-        return os.environ["SKILLSLAB_WEB_URL"].rstrip("/")
+    explicit = os.environ.get("SKILLSLAB_WEB_URL", "").strip()
+    if explicit:
+        return explicit.rstrip("/")
     p = home() / "web_url"
     if p.exists():
         v = p.read_text().strip()

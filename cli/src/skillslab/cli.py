@@ -282,8 +282,18 @@ def start(slug: str):
                 "module_pos": m_pos,
                 "step_pos": s_pos,
                 "step_id": s.get("id"),
+                # 2026-04-25 v2 — also store as `id` so downstream Rich
+                # panels can do `step.get('id')` without re-mapping. CLI-walk
+                # v1 caught the spec panel rendering "step id: None" because
+                # only `step_id` was present.
+                "id": s.get("id"),
                 "title": s.get("title", ""),
                 "exercise_type": s.get("exercise_type") or "concept",
+                # 2026-04-25 v2 — capture module_title here so the spec/now
+                # panels can show it without re-fetching the course tree.
+                # CLI-walk v1 caught the panel rendering "module:    type: ..."
+                # with empty module name.
+                "module_title": m_title,
                 # Phase 3 (2026-04-25) — surface-aware split. Captured at
                 # `start` time so status/spec/check can dispatch by surface
                 # without refetching the step. NULL → 'web' default (legacy
@@ -576,9 +586,13 @@ def status(ctx, course):
         if surface == "web":
             _print_web_pointer(step, meta.get("course_id", ""), action_verb="render")
         else:
-            console.print()
-            console.print("[dim]skillslab spec     # cat the briefing[/dim]")
-            console.print("[dim]skillslab check    # grade your work + advance on pass[/dim]")
+            # 2026-04-25 v2 — was two `[dim]` lines; CLI-walk v1 caught
+            # this as the most-run command's CTA still being flat text
+            # while next/now/spec got Panel highlighting. Same Panel
+            # treatment here for visual consistency — every "what's next"
+            # surfaces in a green-bordered Panel.
+            actions = _next_action(slug, meta, step)
+            _print_next_actions(actions)
 
 
 @cli.command()
@@ -667,18 +681,22 @@ def spec(ctx, course, no_pager):
 @click.option("--course", default=None)
 @click.pass_context
 def now_cmd(ctx, course):
-    """Show what to do RIGHT NOW for the current course/step.
+    """Show what to do RIGHT NOW — current step + the command to run next.
 
-    User-filed (2026-04-25): "Add a cli helper command to show next step at
-    all times". This is the omnipresent guidance — runnable any time, gives
-    a one-glance answer to 'where am I, what's next?'. Pulls the same
-    next-action state tree status/spec/check use, plus a one-line cursor
-    summary, into one tight panel.
+    \b
+    Examples:
+      skillslab now                # for the default / most-recent course
+      skillslab now --course kimi  # for a specific course
 
-    Usage:
-        skillslab now             # default course
-        skillslab now --course kimi
+    Useful any time you've been away from the CLI, after a context switch,
+    or when you've forgotten which step you're on. Surfaces: where in the
+    course, the surface (web/terminal), the module repo, and the next
+    command to run, all in one panel.
     """
+    # Dev note: User-filed (2026-04-25) — "Add a cli helper command to show
+    # next step at all times". CLI-walk v1 caught the previous docstring
+    # leaking commit-message-style provenance into Click's --help output;
+    # rewrote as user-facing prose with `\b` to preserve the example block.
     slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
     meta, cur, step = _load_cursor(slug)
     total = len(meta.get("steps", []))
@@ -938,8 +956,16 @@ def check(ctx, course, paste, cwd, verbose):
                 meta["last_active_at"] = _now_iso()
                 state.write_meta(slug, meta)
                 nxt = meta["steps"][cur + 1]
-                console.print(f"\n[bold]Next:[/bold] M{nxt['module_pos']-1}.S{nxt['step_pos']} — {nxt['title']}")
-                console.print("[dim]skillslab spec[/dim]")
+                label = f"M{nxt['module_pos']-1}.S{nxt['step_pos']}"
+                console.print(f"\n[green]→[/green] [bold cyan]{label}[/bold cyan] — [bold]{nxt['title']}[/bold]")
+                # 2026-04-25 v3 — CLI-walk v2 caught: this branch was the
+                # last "flat dim CTA" remnant after v2 upgraded next / now /
+                # status / spec to Panel. Same one-line fix as P1-5 — the
+                # post-pass message is one of the most-rewarded moments
+                # (learner just succeeded), so keeping it visually
+                # consistent reinforces the loop.
+                actions = _next_action(slug, meta, nxt)
+                _print_next_actions(actions)
             else:
                 console.print(f"\n[bold green]🎉 Course complete![/bold green]")
         except api.ApiError as e:
@@ -1019,7 +1045,11 @@ def dashboard(ctx, course):
     if not meta:
         console.print("[red]No active course state.[/red]"); sys.exit(2)
     cid = meta.get("course_id")
-    url = f"{state.api_url()}/#{cid}"
+    # 2026-04-25 v2 — was state.api_url() which prints host.docker.internal
+    # in dev; learner's browser can't resolve that. CLI-walk v1 caught this
+    # exact regression — same bug class as _print_web_pointer's, just in
+    # this command. Both must use web_url().
+    url = f"{state.web_url()}/#{cid}"
     console.print(f"  {url}")
 
 

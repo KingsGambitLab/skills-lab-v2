@@ -282,26 +282,49 @@ def step_to_markdown(
     # "Why This Matters") but the explicit ACTION list lives in
     # demo_data.instructions for terminal_exercise. Surface it as a
     # "## What to do" section so learners always know the steps to perform.
+    #
+    # 2026-04-25 v2 — CLI-walk v1 caught: instructions is usually a STRING
+    # of HTML (`<h3>Step 1: Fork</h3><pre>$ gh repo fork ...</pre>...`).
+    # Previous v1 code dumped that as one giant line — Rich's Markdown
+    # widget silently strips inline HTML, so a beginner saw the section
+    # heading then EMPTY BODY. Worse than no section. Fix: run the same
+    # html_to_markdown converter we use on the main body so the section
+    # actually renders.
     demo = step.get("demo_data") or {}
     instructions = demo.get("instructions") if isinstance(demo, dict) else None
     if instructions:
-        parts += ["", "## What to do", ""]
+        rendered_lines: list[str] = []
         if isinstance(instructions, list):
             for i, instr in enumerate(instructions, 1):
                 if isinstance(instr, dict):
                     label = instr.get("label") or instr.get("title") or f"Step {i}"
                     body_txt = instr.get("body") or instr.get("description") or instr.get("text") or ""
                     cmd = instr.get("command") or instr.get("cmd") or ""
-                    parts.append(f"{i}. **{label}**")
+                    # body_txt may itself be HTML — convert defensively.
+                    if body_txt and ("<" in body_txt and ">" in body_txt):
+                        body_txt = html_to_markdown(body_txt)
+                    rendered_lines.append(f"{i}. **{label}**")
                     if body_txt:
-                        parts.append(f"   {body_txt}")
+                        for ln in body_txt.splitlines():
+                            rendered_lines.append(f"   {ln}" if ln.strip() else "")
                     if cmd:
-                        parts += [f"   ```", f"   {cmd}", f"   ```"]
+                        rendered_lines += [f"   ```", f"   {cmd}", f"   ```"]
                 else:
-                    parts.append(f"{i}. {instr}")
+                    # Could be a string item, possibly HTML.
+                    txt = str(instr)
+                    if "<" in txt and ">" in txt:
+                        txt = html_to_markdown(txt)
+                    rendered_lines.append(f"{i}. {txt}")
         elif isinstance(instructions, str):
-            parts.append(instructions)
-        parts.append("")
+            # The common shape per CLI-walk v1: `<h3>...</h3><pre>...</pre>...`.
+            # Always pass through html_to_markdown — it's a no-op on plain text.
+            rendered_lines.append(html_to_markdown(instructions))
+
+        # Only emit the section header IF we have actual rendered body —
+        # never advertise "What to do" with empty content underneath.
+        rendered = "\n".join(rendered_lines).strip()
+        if rendered:
+            parts += ["", "## What to do", "", rendered, ""]
 
     # If the step has a `code` field (starter snippet), surface it too
     if code and code.strip():
