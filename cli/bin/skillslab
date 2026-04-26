@@ -6,11 +6,19 @@
 # `git clone`, `pytest`, `aider`, `claude` etc all see your real working
 # dir without the cli source files shadowing it.
 #
-# Install:
-#     mkdir -p ~/.local/bin
-#     ln -sf "$(pwd)/cli/bin/skillslab" ~/.local/bin/skillslab
-#     # ensure ~/.local/bin is on PATH (most shells already include it)
-#     skillslab --help
+# Install (one-line, no clone needed for the image; skillslab itself is
+# pulled from Docker Hub on first run as `tusharbisht1391/skillslab:latest`):
+#
+#     # Get the launcher + compose file (a thin wrapper around docker compose):
+#     curl -fsSL https://raw.githubusercontent.com/KingsGambitLab/skills-lab-v2/main/cli/bin/skillslab \
+#       -o ~/.local/bin/skillslab
+#     curl -fsSL https://raw.githubusercontent.com/KingsGambitLab/skills-lab-v2/main/cli/docker-compose.yml \
+#       -o ~/.local/share/skillslab/docker-compose.yml  # set SKILLSLAB_REPO to this dir's parent
+#     chmod +x ~/.local/bin/skillslab
+#
+#     # OR clone for the launcher (if you also want to contribute):
+#     git clone https://github.com/KingsGambitLab/skills-lab-v2.git
+#     ln -sf "$(pwd)/skills-lab-v2/cli/bin/skillslab" ~/.local/bin/skillslab
 #
 # Usage:
 #     cd ~/where/you/want/to/work     # any clean dir

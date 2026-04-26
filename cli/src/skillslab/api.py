@@ -66,8 +66,13 @@ def my_courses() -> list[dict[str, Any]]:
 def all_courses() -> list[dict[str, Any]]:
     """Public catalog (no auth needed) — used to surface courses the
     learner could enroll in via `skillslab courses`.
+
+    2026-04-26 fix: was using auth-required `_client()` despite the
+    docstring saying "no auth needed". Pre-login users got 401 here.
+    Now `with_auth=False` so first-time users can browse the catalog
+    before they have a bearer.
     """
-    with _client() as c:
+    with _client(with_auth=False) as c:
         r = c.get("/api/courses")
     return _check(r) or []
 
