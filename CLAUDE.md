@@ -2237,6 +2237,28 @@ register_assignment(AssignmentType(id="my_capstone", grade_primitives=["hidden_t
 
 The registry + prompt assembler + gate form the spine. Runtime backends (docker, GHA, vscode, terminal) land as separate handler registrations that bind into `RUNTIME_REGISTRY` at import time.
 
+## 🔑 SSH KEY for prod boxes (2026-04-25)
+
+**Key file**: `~/Downloads/ai-agent-demo.pem` (chmod 400)
+**SSH user**: `ec2-user` (Amazon Linux 2023 — NOT `ubuntu`)
+
+**Boxes the same key opens**:
+
+| IP / hostname | Internal hostname | Notes |
+|---|---|---|
+| `52.88.255.208` | `ip-172-31-39-221.us-west-2` | Production deploy 2026-04-25; 26 pre-existing courses + Kimi/AIE/jspring migrated. DO NOT wipe DB. |
+| `skills.sclr.ac` | `ip-172-31-13-27.us-west-2` | SHARED with external team (§"shared deploy" below) |
+| `18.236.242.248` | (same as skills.sclr.ac) | Default beta target |
+
+**Connect**:
+```bash
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@52.88.255.208
+```
+
+`52.88.255.208` and `skills.sclr.ac` are SEPARATE EC2 instances despite the shared SSH key. The note below about `skills.sclr.ac and 18.236.242.248 being the SAME MACHINE` does NOT apply to `52.88.255.208` — that's a third box (`ip-172-31-39-221`).
+
+---
+
 ## ⚠️ `skills.sclr.ac` and `18.236.242.248` are THE SAME MACHINE (2026-04-22)
 
 Both DNS names resolve to `ip-172-31-13-27.us-west-2.compute.internal` (confirmed by SSH to each). There is:
