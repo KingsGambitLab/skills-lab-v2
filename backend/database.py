@@ -389,15 +389,19 @@ async def create_tables() -> None:
 
 
 async def _ensure_column(*, table: str, column: str, ddl: str) -> None:
-    """Add a column to an existing SQLite table if it isn't already present.
+    """Add a column to an existing table if it isn't already present.
 
-    PRAGMA table_info(name) returns one row per column. We check membership and
-    run the ALTER only when missing. Safe + idempotent across restarts.
+    Idempotent: re-checks the column list and skips when present.
+
+    2026-04-26 — engine-aware after Postgres migration. Was SQLite-only
+    via PRAGMA table_info; now uses the engine's introspection so the
+    same migration works against both SQLite and PG.
     """
-    from sqlalchemy import text
+    from sqlalchemy import text, inspect
+    def _existing_cols(sync_conn):
+        return {c["name"] for c in inspect(sync_conn).get_columns(table)}
     async with engine.begin() as conn:
-        rows = (await conn.execute(text(f"PRAGMA table_info({table})"))).fetchall()
-        existing = {r[1] for r in rows}
+        existing = await conn.run_sync(_existing_cols)
         if column in existing:
             return
         await conn.execute(text(ddl))

@@ -1,5 +1,122 @@
 # Skills Lab v2 — AI LMS Platform
 
+## 🚀 DEPLOY PLAYBOOK — UPDATE-DEPLOY ON A LIVE BOX (2026-04-26)
+
+**This is the exact sequence used to deploy 52.88.255.208 successfully on 2026-04-26. Replay verbatim for `skills.sclr.ac` next.** All commands assume `~/Downloads/ai-agent-demo.pem` is the SSH key + `ec2-user` is the user (Amazon Linux 2023; NOT `ubuntu`).
+
+### Phase 1 — Code + DB content sync (SQLite or pre-migration)
+
+```bash
+# 1. Stop service to avoid races during sync
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "sudo systemctl stop skills-lab.service"
+
+# 2. Rsync code (NEVER include .db-shm / .db-wal — corrupts the WAL on remote)
+rsync -az --delete \
+  --exclude={'.venv','.git','__pycache__','*.pyc','skills_lab.db','*.db-journal','*.db-wal','*.db-shm','.anthropic_budget.json','.skillslab','reviews','.claude','node_modules'} \
+  -e "ssh -i ~/Downloads/ai-agent-demo.pem" \
+  ./ ec2-user@<HOST>:/home/ec2-user/skills-lab-v2/
+
+# 3. If DB has corrupt WAL (sqlite3 says "database disk image is malformed"):
+#    move .db-shm + .db-wal aside; the .db file alone is usually intact + integrity-checks OK.
+
+# 4. Schema migration — engine-agnostic (works against SQLite OR Postgres):
+#    backend/database.py:_ensure_column uses sqlalchemy.inspect, NOT PRAGMA.
+#    On startup, the service runs the ALTERs idempotently. So schema-add is automatic.
+#    If you need to add MANUALLY (e.g., before service can boot): see Phase 2 step 6.
+
+# 5. Pip install missing deps (every fresh deploy on a stale venv):
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
+  cd /home/ec2-user/skills-lab-v2
+  .venv/bin/pip install -q -r requirements.txt
+  # 2026-04-25 — email-validator was missing on .208; add to requirements.
+  .venv/bin/pip install -q 'pydantic[email]' email-validator
+"
+
+# 6. nginx — scope basic auth to / HTML only; /api/* + /templates/* must be open
+#    (CLI sends Bearer auth, NOT Basic; nginx-level basic auth on /api breaks the CLI).
+#    Edit /etc/nginx/conf.d/skills-lab.conf — see the 2026-04-26 commit (22d2b2e) for the
+#    canonical config block. Test with `sudo nginx -t` then `sudo systemctl reload nginx`.
+
+# 7. (Optional) Data migration — INSERT OR REPLACE specific courses from local SQLite
+#    via /tmp/migrate_courses.py + /tmp/remote_apply.py pattern (see commit ff13bba).
+#    Use when porting kimi/aie/jspring courses to a fresh box.
+
+# 8. Restart + smoke
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "sudo systemctl restart skills-lab.service"
+curl -s http://<HOST>/api/courses | jq 'length'  # should match expected count
+```
+
+### Phase 2 — Postgres migration (one-shot, on top of Phase 1)
+
+**Status**: completed on `52.88.255.208` (2026-04-26). When ready, replay on `skills.sclr.ac` to bring it to parity.
+
+**Why migrate**: SQLite is fine for single-user dev; Postgres is needed for concurrent learner writes (multiple users solving exercises simultaneously without WAL contention). Plus, prepared statements + connection pooling, plus durable FK enforcement (which caught a stale `creator_user_id` ref the first time we ran the migration — see step 5b).
+
+```bash
+PGPASS=$(openssl rand -hex 16)
+echo "PG password: $PGPASS"  # SAVE THIS — used in DATABASE_URL
+
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
+  set -e
+  # 1. Install + start (Amazon Linux 2023)
+  sudo dnf install -y postgresql15-server postgresql15 postgresql15-contrib
+  sudo /usr/bin/postgresql-setup --initdb
+  sudo systemctl enable --now postgresql
+
+  # 2. Fix pg_hba.conf — default uses 'ident' which fails for non-postgres user
+  sudo sed -i 's|^host\\(.*\\)127.0.0.1/32\\(.*\\)ident|host\\1127.0.0.1/32\\2scram-sha-256|' /var/lib/pgsql/data/pg_hba.conf
+  sudo sed -i 's|^host\\(.*\\)::1/128\\(.*\\)ident|host\\1::1/128\\2scram-sha-256|' /var/lib/pgsql/data/pg_hba.conf
+  sudo systemctl reload postgresql
+
+  # 3. Create user + db
+  sudo -u postgres psql -c \"CREATE USER skillslab WITH PASSWORD '$PGPASS';\"
+  sudo -u postgres psql -c 'CREATE DATABASE skills_lab OWNER skillslab;'
+  sudo -u postgres psql -c 'GRANT ALL ON DATABASE skills_lab TO skillslab;'
+
+  # 4. Install asyncpg in venv
+  /home/ec2-user/skills-lab-v2/.venv/bin/pip install -q asyncpg==0.30.0
+
+  # 5. Append DATABASE_URL to .env (commented; flip post-migration in step 7)
+  echo \"#DATABASE_URL=postgresql+asyncpg://skillslab:$PGPASS@localhost:5432/skills_lab\" >> /home/ec2-user/skills-lab-v2/.env
+"
+
+# 6. Run the migration script (uses /tmp/migrate_sqlite_to_pg.py from this session;
+#    canonical version checked in at tools/migrate_sqlite_to_pg.py if you commit it).
+#    Notes:
+#      - NULL out creator_user_id / user_id FK refs to users that don't exist on the
+#        remote SQLite (artifact of past cross-host INSERT OR REPLACE migrations
+#        which SQLite doesn't FK-enforce; PG does).
+#      - Migration order: User → Session → Course → Module → Step → Enrollment →
+#        UserProgress → Certificate → ReviewSchedule → CourseReview.
+#      - Advance PG sequences after migration (so next AUTO insert doesn't collide
+#        with migrated PKs).
+DST_URL="postgresql+asyncpg://skillslab:$PGPASS@localhost:5432/skills_lab"
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
+  "cd /home/ec2-user/skills-lab-v2 && DST_URL='$DST_URL' .venv/bin/python tools/migrate_sqlite_to_pg.py"
+# Confirm "Verification: row counts SQLite → PG" shows ✓ on every table.
+
+# 7. Cutover: flip the DATABASE_URL env var
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
+  cp /home/ec2-user/skills-lab-v2/.env /home/ec2-user/skills-lab-v2/.env.bak
+  cp /home/ec2-user/skills-lab-v2/skills_lab.db /home/ec2-user/skills-lab-v2/skills_lab.db.pre-pg-bak  # rollback path
+  sed -i 's|^#DATABASE_URL=|DATABASE_URL=|' /home/ec2-user/skills-lab-v2/.env
+  sudo systemctl restart skills-lab.service
+"
+
+# 8. Verify writes land in PG (not SQLite)
+curl -s -X POST http://<HOST>/api/auth/register -H "Content-Type: application/json" \
+  -d '{"email":"pg-smoke@example.com","password":"pg-2026","name":"PG Smoke"}'
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
+  "PGPASSWORD='$PGPASS' psql -h localhost -U skillslab -d skills_lab -c 'SELECT id, email FROM users ORDER BY id;'"
+# Expected: pg-smoke@example.com appears in PG output
+```
+
+### Rollback (if PG cutover fails)
+
+`mv ~/skills-lab-v2/skills_lab.db.pre-pg-bak ~/skills-lab-v2/skills_lab.db && sed -i 's|^DATABASE_URL=|#DATABASE_URL=|' ~/skills-lab-v2/.env && sudo systemctl restart skills-lab.service`
+
+---
+
 ## 🖱 WIDGET CLICKS — EVENT DELEGATION, NOT INLINE-ONCLICK RESOLUTION (2026-04-25 v6)
 
 **User directive (verbatim, 2026-04-25):** *"Hoisting issue is repetitive — make sure we fix the root cause and generalise"*
