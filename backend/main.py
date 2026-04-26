@@ -15546,13 +15546,23 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
         gha_cfg = demo_data["gha_workflow_check"]
     gha_result = None
     gha_score = None
-    if isinstance(gha_cfg, dict) and workflow_run_url:
-        gha_result = _check_github_workflow_run(
-            workflow_run_url,
-            expected_conclusion=gha_cfg.get("expected_conclusion") or "success",
-            required_job=gha_cfg.get("grading_job"),
-        )
-        gha_score = 1.0 if gha_result.get("ok") else 0.0
+    if isinstance(gha_cfg, dict):
+        if workflow_run_url:
+            gha_result = _check_github_workflow_run(
+                workflow_run_url,
+                expected_conclusion=gha_cfg.get("expected_conclusion") or "success",
+                required_job=gha_cfg.get("grading_job"),
+            )
+            gha_score = 1.0 if gha_result.get("ok") else 0.0
+        else:
+            # 2026-04-26 P0 fix (detailed-walk agent): empty workflow_run_url
+            # used to leave gha_score=None → fell through to phases/checklist-
+            # only mode where total_phases=0 + total_checklist=0 each defaulted
+            # to 1.0 → silent 100% pass on an empty submission for any
+            # gha_workflow_check capstone with no phases. The contract is
+            # "GHA url required"; not submitting one means 0%, not "skip
+            # this gate". Same logic mirrored below for endpoint_check + rubric.
+            gha_score = 0.0
 
     # v8.6.2 (2026-04-24) — ZERO-CODE CAPSTONE grader: LLM rubric on pasted markdown.
     # When the Creator emitted `validation.rubric` (string) AND the learner pasted
@@ -15570,25 +15580,31 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
         or response.get("markdown")
         or ""
     ).strip()
-    if isinstance(rubric_text, str) and rubric_text.strip() and paste:
-        try:
-            # Reuse the same LLM-rubric primitive code_read + terminal_exercise use.
-            # Returns {score: 0..1, feedback: str}. Falls back gracefully if LLM off.
-            # NB: don't traverse `step.module.course` lazy-loaded relationship —
-            # this validator runs in a non-async context so lazy-load triggers
-            # greenlet_spawn errors. Pass only synchronous attributes.
-            graded = _llm_rubric_grade(
-                rubric=rubric_text.strip(),
-                submission=paste[:12000],  # cap submission to stay in budget
-                step_title=step.title or "Capstone",
-                course_title="",  # intentionally empty; title not needed for grading
-            )
-            rubric_score = float(graded.get("score", 0.0)) if graded.get("score") is not None else None
-            rubric_feedback = str(graded.get("feedback", ""))
-        except Exception as e:
-            logging.warning("system_build rubric grader failed: %s", e)
-            rubric_score = None
-            rubric_feedback = "Rubric grader unavailable — try resubmitting."
+    if isinstance(rubric_text, str) and rubric_text.strip():
+        if paste:
+            try:
+                # Reuse the same LLM-rubric primitive code_read + terminal_exercise use.
+                # Returns {score: 0..1, feedback: str}. Falls back gracefully if LLM off.
+                # NB: don't traverse `step.module.course` lazy-loaded relationship —
+                # this validator runs in a non-async context so lazy-load triggers
+                # greenlet_spawn errors. Pass only synchronous attributes.
+                graded = _llm_rubric_grade(
+                    rubric=rubric_text.strip(),
+                    submission=paste[:12000],  # cap submission to stay in budget
+                    step_title=step.title or "Capstone",
+                    course_title="",  # intentionally empty; title not needed for grading
+                )
+                rubric_score = float(graded.get("score", 0.0)) if graded.get("score") is not None else None
+                rubric_feedback = str(graded.get("feedback", ""))
+            except Exception as e:
+                logging.warning("system_build rubric grader failed: %s", e)
+                rubric_score = None
+                rubric_feedback = "Rubric grader unavailable — try resubmitting."
+        else:
+            # Contract requires a paste; learner submitted none → 0%.
+            # Same silent-pass fix as gha_workflow_check + endpoint_check above.
+            rubric_score = 0.0
+            rubric_feedback = "No submission pasted — rubric grader needs a doc to grade."
 
     total_phases = len(phases_defined)
     total_checklist = len(checklist_defined)
@@ -15613,49 +15629,59 @@ def _validate_system_build(validation: dict, response: dict, step: Step) -> dict
         else:
             missing_checks.append(item.get("label", item_id))
 
-    phase_score = completed_phase_count / total_phases if total_phases > 0 else 1.0
-    check_score = completed_check_count / total_checklist if total_checklist > 0 else 1.0
+    # 2026-04-26 P0 fix follow-on: when phases/checklist are NOT configured,
+    # they don't get a free 1.0 — they're EXCLUDED from scoring entirely.
+    # The weight gets redistributed across the components that ARE present
+    # (see "Scoring" block below). Pre-fix: empty-phases defaulted to 1.0,
+    # which compounded with the gha-empty silent-pass (gha_score=None →
+    # falls through to 60% phases + 40% checklist of 1.0 each = 100%).
+    phase_score = completed_phase_count / total_phases if total_phases > 0 else None
+    check_score = completed_check_count / total_checklist if total_checklist > 0 else None
 
-    # endpoint_check HTTP probe — runs only when both the contract and the
-    # learner-submitted URL are present.
+    # endpoint_check HTTP probe — runs when contract + URL are present;
+    # contract-without-URL = 0% (same fix as gha_workflow_check above).
     probe_result = None
     endpoint_score = None
-    if isinstance(endpoint_check, dict) and endpoint_url:
-        probe_result = _probe_system_build_endpoint(endpoint_check, endpoint_url)
-        endpoint_score = 1.0 if probe_result.get("matched") else 0.0
+    if isinstance(endpoint_check, dict):
+        if endpoint_url:
+            probe_result = _probe_system_build_endpoint(endpoint_check, endpoint_url)
+            endpoint_score = 1.0 if probe_result.get("matched") else 0.0
+        else:
+            endpoint_score = 0.0  # contract requires endpoint, none submitted
 
-    # Scoring — GHA / endpoint / rubric all use the same 50% slot (first-match wins).
+    # Scoring — GHA / endpoint / rubric use the SAME 50% slot (first-match wins).
+    # Phases are 30%, checklist is 20%. Components that aren't configured for
+    # this step are EXCLUDED from the weighted sum (and the remaining weights
+    # are renormalized) — they don't get a "free 1.0" anymore.
     # Priority: gha_workflow_check > endpoint_check > rubric > phases/checklist-only.
+    components: list[tuple[float, float]] = []  # (score, weight) pairs
+
     if gha_score is not None:
-        total_score = round(
-            (gha_score * 0.5) + (phase_score * 0.3) + (check_score * 0.2),
-            2,
-        )
+        components.append((gha_score, 0.5))
     elif endpoint_score is not None:
-        total_score = round(
-            (endpoint_score * 0.5) + (phase_score * 0.3) + (check_score * 0.2),
-            2,
-        )
+        components.append((endpoint_score, 0.5))
     elif rubric_score is not None:
-        # v8.6.2 (2026-04-24) — zero-code / rubric-only capstone.
-        # Expert + beginner reviewers 2026-04-24 both flagged that
-        # "Phases 0/4" dragged a 90% rubric + 6/6 checklist down to 65%
-        # because the zero-code capstone UI had no way to check off phases.
-        # Root cause: phases are a PLANNING affordance for the LEARNER, NOT
-        # a separate grade primitive orthogonal to the rubric. When the
-        # submission is LLM-graded against a content rubric, the rubric
-        # already evaluates whether the learner did the Structure / Draft
-        # / Validate / Publish work — requiring redundant checkbox clicks
-        # is punishment, not teaching. Fix: auto-credit phases for
-        # rubric-only capstones (no GHA, no endpoint_check). Phases still
-        # appear in the briefing as guidance; they just don't gate score.
-        effective_phase_score = 1.0
-        total_score = round(
-            (rubric_score * 0.5) + (effective_phase_score * 0.3) + (check_score * 0.2),
-            2,
-        )
+        components.append((rubric_score, 0.5))
+        # v8.6.2 zero-code carry-over: when grading via rubric, phases are
+        # auto-credited as "the rubric already evaluates whether the
+        # learner did the Structure / Draft / Validate / Publish work"
+        # — phases are a planning affordance, not a primitive. Inject a
+        # 1.0 phase_score at full 0.3 weight here.
+        if total_phases > 0:
+            components.append((1.0, 0.3))
+            total_phases = 0  # don't double-count below
+
+    if total_phases > 0 and phase_score is not None:
+        components.append((phase_score, 0.3))
+    if total_checklist > 0 and check_score is not None:
+        components.append((check_score, 0.2))
+
+    if components:
+        total_weight = sum(w for _, w in components)
+        total_score = round(sum(s * w for s, w in components) / total_weight, 2)
     else:
-        total_score = round((phase_score * 0.6) + (check_score * 0.4), 2)
+        # No primitive AND no phases AND no checklist = nothing to grade.
+        total_score = 0.0
 
     # 2026-04-22 v4 — grade-primitive floor for system_build.
     # Audit P0 (2026-04-22): `system_build` capstones with neither
