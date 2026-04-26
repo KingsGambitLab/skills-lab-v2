@@ -125,6 +125,42 @@ def run_cli_commands(
             normalized.append(c)
         # else: silently drop malformed entries (Creator bug, surfaces as 0 cmds)
 
+    # 2026-04-26 — pre-flight env check (per beginner-walk v6 nit #2).
+    # Some tools hang for the full timeout when their auth env var is
+    # missing (aider waited 120s before erroring; user thought the run
+    # was stuck). Detect the common cases up front and fast-fail with
+    # a helpful pointer instead of letting a learner stare at silence.
+    #
+    # Map: regex over `cmd` text → list of env vars that MUST be set.
+    # New tools: add the regex + var here; the loop below picks them up.
+    import re as _re
+    _ENV_REQS: list[tuple[_re.Pattern, tuple[str, ...], str]] = [
+        # aider routes through OpenRouter via litellm — needs OPENROUTER_API_KEY
+        # (per backend/tech_docs/aider.md line 80). aider hangs ~120s on a
+        # missing key before erroring; warn upfront.
+        (_re.compile(r"\baider\b"), ("OPENROUTER_API_KEY",),
+         "Get a key at https://openrouter.ai/keys, then "
+         "`export OPENROUTER_API_KEY=...` and re-run."),
+        # claude CLI uses ANTHROPIC_API_KEY OR `claude /login`. Don't fast-fail
+        # if key is missing — the user might be using /login auth which lives
+        # in ~/.claude/auth.json (bind-mounted). Only warn, don't block.
+        # (Intentionally NOT in this list as a hard requirement.)
+    ]
+    if console:
+        for c in normalized:
+            cmd = c["cmd"]
+            for pat, vars_required, hint in _ENV_REQS:
+                if pat.search(cmd):
+                    missing = [v for v in vars_required if not os.environ.get(v)]
+                    if missing:
+                        console.print(
+                            f"[bold yellow]⚠ Missing env var{'s' if len(missing)>1 else ''}:[/bold yellow] "
+                            f"[yellow]{', '.join(missing)}[/yellow]"
+                        )
+                        console.print(f"[dim]  Command will likely hang or fail: {cmd[:80]}{'...' if len(cmd) > 80 else ''}[/dim]")
+                        console.print(f"[dim]  {hint}[/dim]")
+                        console.print()
+
     if console:
         console.print()
         console.print(f"[bold cyan]▶ Running {len(normalized)} command{'s' if len(normalized)!=1 else ''} from validation.cli_commands[/bold cyan]")
@@ -201,9 +237,18 @@ def run_cli_commands(
     if not auto_confirm and console:
         # Prompt for confirmation. Default Yes — most learners just want to ship
         # the captured output. Decline lets them re-run before submitting.
+        #
+        # 2026-04-26 fix: EOF on piped stdin (`echo y | docker run -i ...
+        # skillslab check`, headless CI) was treated as "n" → silently
+        # cancelled the submission even when the caller explicitly piped
+        # `y`. Per the [Y/n] convention, uppercase = default = yes; EOF
+        # without input means "use default" = yes. KeyboardInterrupt is
+        # explicit user-cancel and stays as decline.
         try:
             ans = console.input("[bold]Submit captured output for grading?[/bold] [Y/n]: ").strip().lower()
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
+            ans = ""  # honor the default (yes)
+        except KeyboardInterrupt:
             ans = "n"
         if ans and ans not in ("y", "yes", ""):
             summary.aborted_by_user = True
@@ -367,11 +412,16 @@ def run_gha_push_and_watch(
                 console.print(f"  [dim]{line}[/dim]")
             if len(dirty_out.strip().splitlines()) > 10:
                 console.print(f"  [dim]...({len(dirty_out.strip().splitlines()) - 10} more files)[/dim]")
+            # Same EOF-vs-Ctrl-C semantics as the cli_commands prompt above:
+            # piped stdin / EOF means "use the [Y/n] default = yes"; only
+            # explicit Ctrl-C cancels. (2026-04-26)
             try:
                 ans = console.input(
                     "[bold]Commit all changes and push?[/bold] [Y/n]: "
                 ).strip().lower()
-            except (EOFError, KeyboardInterrupt):
+            except EOFError:
+                ans = ""  # honor default
+            except KeyboardInterrupt:
                 ans = "n"
             if ans and ans not in ("y", "yes", ""):
                 out.error = "Cancelled — commit your changes manually then re-run `skillslab check`."

@@ -3639,7 +3639,17 @@ async function enrollInCourse(courseId) {
 async function loadCatalog() {
   try {
     showLoading();
-    state.courses = await fetchCourses();
+    // Fetch the CLI install/upgrade config alongside the catalog. Fire in
+    // parallel; tolerate the config call failing (the catalog is the
+    // load-bearing call, the config is metadata for the terminal-pointer
+    // panel + install instructions). 2026-04-26 — replaces hardcoded
+    // image name in renderTerminalNativePanel; backend env-driven.
+    const [coursesRes, cliCfgRes] = await Promise.all([
+      fetchCourses(),
+      fetch(`${API}/config/cli`).then(r => r.ok ? r.json() : null).catch(() => null),
+    ]);
+    state.courses = coursesRes;
+    if (cliCfgRes) state.cliConfig = cliCfgRes;
   } catch (e) {
     showError('Failed to load courses. Please check your connection.', loadCatalog);
     return;
@@ -4667,8 +4677,8 @@ function renderTerminalNativePanel(rawStep, index) {
           <div style="font-size:12px; color:#8892a8; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:8px;">
             ① Open your terminal
           </div>
-          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8;"># first time only — build the toolchain image (Docker service is always
-# named "skillslab"; the per-course wrapper lives inside the container)</span>
+          <pre style="background:#0a0e1a; border:1px solid #2a3352; border-radius:6px; padding:12px; margin:0; color:#e8ecf4; font-family:monospace; font-size:13px; overflow-x:auto;"><span style="color:#8892a8;"># first time only — Compose pulls ${esc((state.cliConfig && state.cliConfig.image) || 'the published toolchain image')}
+# from Docker Hub (~700MB, cached forever). No build needed.</span>
 docker compose run --rm skillslab</pre>
         </div>
 

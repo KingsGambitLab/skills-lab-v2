@@ -47,7 +47,12 @@ services:
     # Power users + contributors can also `docker compose build` to test
     # local cli/Dockerfile changes before pushing a new tag — the build
     # context stays wired below.
-    image: tusharbisht1391/skillslab:latest
+    # 2026-04-26 — image is overridable via env so a future image rename /
+    # version pin / private-registry swap is a one-place edit. Default
+    # matches the canonical published image. Backend's /api/config/cli
+    # serves the same value as the SOURCE OF TRUTH; this default is a
+    # ship-with-the-repo convenience only.
+    image: ${SKILLSLAB_CLI_IMAGE:-tusharbisht1391/skillslab:latest}
     pull_policy: missing  # auto-pull on first run; never re-pull silently
     build:
       context: .

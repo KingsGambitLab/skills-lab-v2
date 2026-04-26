@@ -39,6 +39,21 @@ except ImportError:
 # Track cumulative cost in a local file; auto-switch to mock mode when depleted.
 # Override with USE_MOCK_LLM=1 env var to force mocks for testing.
 
+# 2026-04-26 — Single source of truth for the published CLI image name +
+# upgrade-related URLs. Configurable via env so a future image rename /
+# org migration / version pin is a one-place edit (this env var) and
+# every consumer (frontend pointer panel, docs, compose default) picks
+# it up automatically. Frontend fetches via /api/config/cli at startup.
+_SKILLSLAB_CLI_IMAGE = os.getenv("SKILLSLAB_CLI_IMAGE", "tusharbisht1391/skillslab:latest")
+_SKILLSLAB_CLI_REPO_URL = os.getenv(
+    "SKILLSLAB_CLI_REPO_URL",
+    "https://github.com/KingsGambitLab/skills-lab-v2",
+)
+_SKILLSLAB_CLI_DOCS_URL = os.getenv(
+    "SKILLSLAB_CLI_DOCS_URL",
+    "https://github.com/KingsGambitLab/skills-lab-v2/blob/main/cli/README.md",
+)
+
 _ANTHROPIC_BUDGET_USD = float(os.getenv("ANTHROPIC_BUDGET_USD", "250.0"))
 _BUDGET_FILE = Path(__file__).resolve().parent.parent / ".anthropic_budget.json"
 _FORCE_MOCK = os.getenv("USE_MOCK_LLM", "").lower() in ("1", "true", "yes")
@@ -2296,6 +2311,33 @@ def _clicky_mock_response(message: str, course_title: str, step_type: str) -> st
         "• **Connect to work** — ask how this applies at your organization\n\n"
         "_(Using offline-mock mode right now. Specific sub-questions get better answers.)_"
     )
+
+
+@app.get("/api/config/cli")
+async def get_cli_config():
+    """Single source of truth for CLI install + upgrade metadata.
+
+    Returned to the frontend's terminal-pointer panel + any consumer that
+    needs to render install / pull / upgrade instructions. Keys here are
+    overridable via env (SKILLSLAB_CLI_IMAGE, SKILLSLAB_CLI_REPO_URL,
+    SKILLSLAB_CLI_DOCS_URL) so a future image rename / org migration / pin
+    bump is a one-place change without touching frontend HTML or docs.
+
+    Public endpoint (no auth) — these are install instructions, not secrets.
+    """
+    return {
+        "image": _SKILLSLAB_CLI_IMAGE,
+        "repo_url": _SKILLSLAB_CLI_REPO_URL,
+        "docs_url": _SKILLSLAB_CLI_DOCS_URL,
+        # Convenience: derived install commands so the frontend doesn't have
+        # to reconstruct them. If we ever need different shells (powershell,
+        # fish), add them here as separate keys.
+        "install_one_liner": (
+            f"curl -fsSL {_SKILLSLAB_CLI_REPO_URL}/raw/main/cli/bin/skillslab "
+            f"-o ~/.local/bin/skillslab && chmod +x ~/.local/bin/skillslab"
+        ),
+        "pull_command": f"docker pull {_SKILLSLAB_CLI_IMAGE}",
+    }
 
 
 @app.get("/api/admin/budget")
