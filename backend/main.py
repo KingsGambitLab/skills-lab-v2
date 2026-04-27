@@ -4006,6 +4006,129 @@ F4 — **The toolchain install IS the first lesson, not glossed-over setup.**
      prose + the validation.hint surfaces — NOT the validation contract.
 
 
+F5 — **AUTHORING terminal_exercise steps MUST emit a `template_files`
+     scaffold AND an explicit `task_kind`.**
+     User directive (verbatim, 2026-04-27): "Can you review both — I don't
+     think either of them gives enough information to the user and in the
+     right format / steps to help them solve the assignment."
+
+     Background: `terminal_exercise` has been used for two semantically
+     different shapes that need different rendering. Without distinguishing
+     them, the renderer can't show the right surfaces — leading to learners
+     seeing GRADING checks ("ls -la AGENTS.md", "grep -E 'FastAPI'") under
+     a "What to do" header when they haven't written any files yet.
+
+     Two flavors:
+
+       1. **DIAGNOSTIC** (e.g. "Smoke-test your toolchain against Kimi K2"):
+          learner runs prepared cli_commands, output is regex-graded.
+          The cli_commands ARE the work. Today's behavior is correct for
+          this shape.
+
+       2. **AUTHORING** (e.g. "Author AGENTS.md and .aider.conf.yml for
+          the starter repo"): learner CREATES files (config / docs / prompts)
+          on disk, then we verify. The cli_commands are GRADING PROBES,
+          not authoring instructions. The actual work — writing the file
+          contents — has no scaffold today, so the learner is expected to
+          invent file shape from prose hints.
+
+     CONTRACT for terminal_exercise:
+
+     a. **Emit `task_kind` as a top-level field** alongside `exercise_type`:
+        "authoring" | "diagnostic" | "exploration". Default is "diagnostic"
+        if omitted, but explicit is preferred. Renderer keys panel order
+        and labels off this field.
+
+     b. **For `task_kind: "authoring"`, emit `demo_data.template_files`** —
+        one entry per file the learner must produce:
+
+        ```json
+        {
+          "task_kind": "authoring",
+          "demo_data": {
+            "template_files": [
+              {
+                "path": "AGENTS.md",
+                "template": "# Team conventions\\n\\n## Tech stack\\n- FastAPI for HTTP routing\\n- SQLAlchemy 2.0 (async, declarative_base style)\\n- pytest for tests (NOT unittest)\\n\\n## Coding conventions\\n- (fill in your team's actual conventions here)\\n",
+                "language": "markdown",
+                "optional": false,
+                "placeholder_regions": [
+                  {"start_line": 6, "end_line": 7,
+                   "instruction": "Replace each bullet with one your team actually uses (4-7 bullets total)"}
+                ],
+                "hints": "AGENTS.md is read by Aider on every invocation. Keep it scannable; avoid prose."
+              },
+              {
+                "path": ".aider.conf.yml",
+                "template": "model: openrouter/moonshotai/kimi-k2-0905\\nedit-format: diff\\nread:\\n  - AGENTS.md\\nyes-always: false\\n",
+                "language": "yaml",
+                "optional": false,
+                "hints": "Aider's docs at aider.chat/docs/config — `read:` auto-loads files into every prompt."
+              }
+            ]
+          },
+          "validation": {
+            "cli_commands": [
+              {"cmd": "ls -la AGENTS.md .aider.conf.yml", "label": "Files exist"},
+              {"cmd": "grep -E 'FastAPI|SQLAlchemy 2\\\\.0|pytest' AGENTS.md", "label": "Tech stack documented"}
+            ],
+            "must_contain": ["AGENTS.md", "FastAPI", "openrouter/moonshotai/kimi-k2-0905"]
+          }
+        }
+        ```
+
+     c. **`template` field rules** (per-file):
+        - 20–80 lines of starter content (NOT empty; NOT the full answer either —
+          aim for a working scaffold the learner edits)
+        - Use real values for non-replaceable parts (e.g. the model id
+          `openrouter/moonshotai/kimi-k2-0905` IS the right answer; don't
+          parameterize it)
+        - Mark fill-in spots inline with comments
+          (e.g. `- (your team's convention here)`) AND list them in
+          `placeholder_regions` so the renderer can highlight them
+
+     d. **Schema fields**:
+        - `path` (required) — relative to the course-repo root
+        - `template` (required) — starter content
+        - `language` (optional) — explicit override; renderer infers from
+          extension when missing
+        - `optional` (default false) — `true` for nice-to-have files
+        - `hints` (optional) — short context the renderer shows below
+          the code block
+        - `placeholder_regions` (optional) — `[{start_line, end_line,
+          instruction}]` for inline "fill this in" markers
+        - `mode` (optional) — POSIX file mode (e.g. "0644") for files
+          that need it (.ssh keys, shell scripts)
+
+     e. **Anti-pattern — DO NOT** put authoring commands (`cat > FILE`,
+        `echo ... >> FILE`) in `cli_commands`. cli_commands is for the
+        VERIFICATION phase only. Authoring lives in `template_files`;
+        the renderer handles the copy-paste / open-in-buffer affordance.
+
+     f. **Diagnostic steps stay simple**: `task_kind: "diagnostic"` (or
+        omitted), no `template_files`, just the existing
+        `validation.cli_commands` + `must_contain`. M0.S2 (smoke-test
+        toolchain) is the canonical diagnostic shape — don't add
+        `template_files` to it.
+
+     g. **Heuristic-based retrofit for existing rows** (renderer falls
+        back when `task_kind` is missing):
+        - STRONGEST: `must_contain` references file paths that cli_commands
+          `ls`/`cat`/`grep` against → authoring
+        - STRONG: `cat >` / `tee` / `> path/to/file` appears in any
+          cli_command → authoring
+        - WEAK (tiebreaker only): title verb match using word-boundary
+          regex like `\\b(create|author|write|draft|configure)\\b`
+        - AND not OR: at least one strong signal required to flag as
+          authoring
+        - When unclear, default to diagnostic (safer; doesn't show empty
+          template_files panels)
+
+     This is the structural fix for the M2.S2 / M2.S5 / M5.S2 / capstone-
+     write-CLAUDE.md class of step. Diagnostic steps (M0.S2 etc) are
+     unchanged.
+
+
 COURSE SUBJECT INFERENCE (critical — pick right exercise types):
 - **OPERATIONAL/SANDBOX-FIRST subjects** (SRE, DevOps, SecEng, DataAnalyst, MLops, Accountant, Legal-contract-review, BI): the learner's job is to TOUCH real tools. Use the new sandbox types (see below) heavily. A 2h course on AWS DevOps without `live_sql_playground`, `observability_sandbox`, or `code_exercise_live` is "MCQ cosplay" — reject that design.
 - ENGINEERING subjects (API, backend, ML, DevOps, code, deployment): use code_exercise / code_review / system_build capstones, fill_in_blank for syntax

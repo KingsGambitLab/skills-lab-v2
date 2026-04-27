@@ -139,6 +139,8 @@ export class StepWebViewManager {
     onRunAuto?: () => void;
     onReopenInContainer?: () => void;
     onShowInstallHints?: () => void;
+    onCopyTemplate?: (template: string, path: string) => void;
+    onOpenInBuffer?: (template: string, path: string, language: string) => void;
   } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -152,6 +154,8 @@ export class StepWebViewManager {
     onRunAuto?: () => void,
     onReopenInContainer?: () => void,
     onShowInstallHints?: () => void,
+    onCopyTemplate?: (template: string, path: string) => void,
+    onOpenInBuffer?: (template: string, path: string, language: string) => void,
   ): void {
     // ALWAYS update callbacks BEFORE reveal/render — the listener below
     // reads via `this.callbacks.X?.()` so this swap is what makes the
@@ -164,6 +168,8 @@ export class StepWebViewManager {
       onRunAuto,
       onReopenInContainer,
       onShowInstallHints,
+      onCopyTemplate,
+      onOpenInBuffer,
     };
 
     if (this.panel) {
@@ -189,6 +195,19 @@ export class StepWebViewManager {
           case "runAuto": this.callbacks.onRunAuto?.(); break;
           case "reopenInContainer": this.callbacks.onReopenInContainer?.(); break;
           case "showInstallHints": this.callbacks.onShowInstallHints?.(); break;
+          case "copyTemplate": {
+            const tpl = typeof msg.template === "string" ? msg.template : "";
+            const path = typeof msg.path === "string" ? msg.path : "";
+            this.callbacks.onCopyTemplate?.(tpl, path);
+            break;
+          }
+          case "openInBuffer": {
+            const tpl = typeof msg.template === "string" ? msg.template : "";
+            const path = typeof msg.path === "string" ? msg.path : "";
+            const lang = typeof msg.language === "string" ? msg.language : "";
+            this.callbacks.onOpenInBuffer?.(tpl, path, lang);
+            break;
+          }
         }
       });
     }
@@ -301,7 +320,11 @@ export class StepWebViewManager {
     // the user to understand the task at hand." The briefing prose alone
     // doesn't tell the learner WHICH commands to run or WHAT must appear
     // in the output for it to pass.
-    const specPanel = renderSpecPanel(input.step);
+    // v0.1.14: when this is an authoring step, the spec panel's
+    // "What to do" header is relabeled "We'll verify" (those cli_commands
+    // are GRADING checks, not authoring instructions — the authoring is
+    // in the Files-to-author panel above).
+    const specPanel = renderSpecPanel(input.step, { verifyMode: isAuthoringTerminalExercise(input.step) });
 
     // Feedback panel — most-recent /api/exercises/validate response.
     // Renders at the very top of body so the learner reads it first
@@ -309,6 +332,18 @@ export class StepWebViewManager {
     // should give detailed feedback, similar to terminal." Replaces
     // the toast-only flow that swallowed feedback prose.
     const feedbackPanel = renderFeedbackPanel(input.feedback, accent);
+
+    // v0.1.14 — `📝 Files to author` panel for AUTHORING terminal_exercise
+    // steps. Renders BEFORE the spec/verify panel so the learner sees
+    // "what to write" before "how we'll grade it". Falls back to empty
+    // string for diagnostic steps + courses generated before F5 (no
+    // template_files in DB) UNLESS the retrofit heuristic detects
+    // authoring (must_contain references files cli_commands probe).
+    // User feedback 2026-04-27: "VS code gives no idea about what to do."
+    const isAuthoring = isAuthoringTerminalExercise(input.step);
+    const filesToAuthorPanel = isAuthoring
+      ? renderFilesToAuthorPanel(input.step)
+      : "";
 
     return `<!doctype html>
 <html lang="en">
@@ -435,6 +470,119 @@ export class StepWebViewManager {
       white-space: pre-wrap;
     }
 
+    /* ── Files-to-author panel (v0.1.14) ──
+       Shown for AUTHORING terminal_exercise steps. Per buddy-Opus review:
+       the code blocks must be visually unambiguous as REFERENCE (not editor).
+       No cursor on hover, no edit affordance. Copy-to-clipboard is the
+       primary action; "open in untitled buffer" is the safer alternative
+       to auto-write-to-workspace (avoids dirty-tree / wrong-cwd footguns). */
+    .files-to-author {
+      margin: 16px 0 22px;
+      padding: 14px 18px 18px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+    }
+    .files-to-author > h3 {
+      margin: 0 0 14px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .files-to-author > .panel-intro {
+      font-size: 0.85rem;
+      color: var(--vscode-descriptionForeground);
+      margin: 0 0 14px;
+      line-height: 1.55;
+    }
+    .file-card {
+      margin-bottom: 16px;
+      padding: 0;
+      background: var(--vscode-textBlockQuote-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+      overflow: hidden;
+    }
+    .file-card:last-child { margin-bottom: 0; }
+    .file-card .file-header {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      padding: 8px 12px;
+      background: var(--vscode-editorWidget-background, var(--vscode-sideBar-background));
+      border-bottom: 1px solid var(--vscode-panel-border);
+    }
+    .file-card .file-path {
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+      flex: 1 1 auto;
+    }
+    .file-card .file-language-pill {
+      font-size: 0.7rem;
+      padding: 2px 7px;
+      background: var(--vscode-badge-background);
+      color: var(--vscode-badge-foreground);
+      border-radius: 3px;
+      font-family: var(--vscode-editor-font-family);
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+    }
+    .file-card .file-optional {
+      font-size: 0.72rem;
+      padding: 2px 7px;
+      background: transparent;
+      color: var(--vscode-descriptionForeground);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 3px;
+    }
+    .file-card .file-actions {
+      display: flex;
+      gap: 6px;
+      flex: 0 0 auto;
+    }
+    .file-card .file-actions button {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid transparent;
+      padding: 4px 10px;
+      font-size: 0.78rem;
+      font-weight: 500;
+      border-radius: 3px;
+      cursor: pointer;
+    }
+    .file-card .file-actions button:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+    .file-card pre.file-template {
+      margin: 0;
+      padding: 12px 14px;
+      background: var(--vscode-textCodeBlock-background);
+      color: var(--vscode-editor-foreground);
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.85rem;
+      line-height: 1.55;
+      overflow-x: auto;
+      max-height: 360px;
+      overflow-y: auto;
+      /* Make it visually unambiguous as a REFERENCE, not an editor:
+         no caret on hover, no text-input affordance. Copy/Open buttons
+         in the header are the only ways to interact. */
+      cursor: default;
+      user-select: text;          /* still selectable for manual copy */
+      white-space: pre;
+    }
+    .file-card .file-hints {
+      padding: 10px 14px;
+      font-size: 0.8rem;
+      color: var(--vscode-descriptionForeground);
+      background: var(--vscode-sideBar-background);
+      border-top: 1px solid var(--vscode-panel-border);
+      line-height: 1.5;
+    }
+    .file-card .file-hints strong { color: var(--vscode-foreground); }
+
     /* ── Toolchain status pill (terminal_exercise only, v0.1.5) ── */
     .toolchain-pill {
       display: flex; align-items: center; gap: 10px;
@@ -532,9 +680,11 @@ export class StepWebViewManager {
 
   ${howToRun}
 
-  ${specPanel}
-
   <div class="step-body">${bodyHtml}</div>
+
+  ${filesToAuthorPanel}
+
+  ${specPanel}
 
   <div class="footer-actions">
     ${requiresSubmission ? `<button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>` : ``}
@@ -546,13 +696,28 @@ export class StepWebViewManager {
 
   <script nonce="${nonce}">
     // Wire footer + how-to-run buttons through to the host extension.
+    // v0.1.14: copyTemplate / openInBuffer carry template + path + language
+    // as data-* attributes (URI-encoded so newlines + quotes survive).
     document.addEventListener('click', function(e) {
       const el = e.target.closest && e.target.closest('[data-vsc-msg]');
       if (!el) return;
       e.preventDefault();
       const acquireVsCodeApi = window['acquireVsCodeApi'];
       const vscode = (window.__vscApi = window.__vscApi || (acquireVsCodeApi && acquireVsCodeApi()));
-      if (vscode) vscode.postMessage({ type: el.getAttribute('data-vsc-msg') });
+      if (!vscode) return;
+      const type = el.getAttribute('data-vsc-msg');
+      const msg = { type: type };
+      // For Files-to-author actions, decode the template + path + language
+      // and ship them inline.
+      if (type === 'copyTemplate' || type === 'openInBuffer') {
+        try {
+          const enc = el.getAttribute('data-template-encoded') || '';
+          msg.template = decodeURIComponent(enc);
+        } catch (_) { msg.template = ''; }
+        msg.path = el.getAttribute('data-file-path') || '';
+        msg.language = el.getAttribute('data-file-language') || '';
+      }
+      vscode.postMessage(msg);
     });
     // Re-injected widget runtime (data-action delegator + hoist).
     ${scriptBundle}
@@ -835,11 +1000,151 @@ function renderToolchainPill(
  * Returns "" (empty string) when the step has no spec content; the
  * caller injects that into the HTML where the panel would go.
  */
-function renderSpecPanel(step: StepSummary): string {
+/**
+ * v0.1.14 — detect whether a terminal_exercise step is AUTHORING (learner
+ * writes config/doc files) vs DIAGNOSTIC (learner runs prepared cmds).
+ *
+ * Per CLAUDE.md §"EXECUTION IS GROUND TRUTH" + user directive 2026-04-27
+ * "Make sure to not rely on regex, it is brittle" — we use ONLY the
+ * EXPLICIT signals on the step:
+ *
+ *   1. `step.task_kind === "authoring"` (set by F5+ Creator)
+ *   2. `step.demo_data.template_files` is a non-empty array (the
+ *      structural payload that gates the Files-to-author panel)
+ *
+ * Either is sufficient. NO regex on cli_commands shape, NO heuristic
+ * inference from titles. Existing pre-F5 rows that should render as
+ * authoring need to be regenerated — the regen pass picks up the new
+ * Creator prompt + emits task_kind + template_files explicitly.
+ */
+function isAuthoringTerminalExercise(step: StepSummary): boolean {
+  const stepAny = step as any;
+  if ((stepAny.task_kind || "").toString().toLowerCase() === "authoring") {
+    return true;
+  }
+  const dd = stepAny.demo_data || {};
+  return Array.isArray(dd.template_files) && dd.template_files.length > 0;
+}
+
+/**
+ * Render the FILES-TO-AUTHOR panel (v0.1.14, per F5 Creator schema +
+ * buddy-Opus tightenings). Reads `step.demo_data.template_files`. For
+ * each file: path + language pill + non-editable code block (visually
+ * unambiguous as a REFERENCE, not an editor — no caret on hover, no
+ * edit affordance) + Copy-to-clipboard + Open-in-buffer buttons +
+ * optional hints below.
+ *
+ * Returns "" if no template_files are present (renderer falls back to
+ * the existing spec panel only — preserves behavior for diagnostic
+ * steps + pre-F5 courses).
+ */
+function renderFilesToAuthorPanel(step: StepSummary): string {
+  const stepAny = step as any;
+  const dd = stepAny.demo_data || {};
+  const files: any[] = Array.isArray(dd.template_files) ? dd.template_files : [];
+  if (files.length === 0) return "";
+
+  // Infer language from extension when override is absent.
+  const inferLang = (path: string): string => {
+    const ext = (path.split(".").pop() || "").toLowerCase();
+    const map: Record<string, string> = {
+      md: "markdown",
+      yml: "yaml",
+      yaml: "yaml",
+      json: "json",
+      toml: "toml",
+      conf: "ini",
+      cfg: "ini",
+      py: "python",
+      ts: "typescript",
+      js: "javascript",
+      sh: "bash",
+      txt: "plaintext",
+    };
+    return map[ext] || "plaintext";
+  };
+
+  const cards = files
+    .map((f, idx) => {
+      const path = String(f.path || `file-${idx + 1}`);
+      const template = String(f.template ?? f.contents ?? ""); // back-compat
+      const language = String(f.language || inferLang(path));
+      const optional = !!f.optional;
+      const hints = f.hints ? String(f.hints) : "";
+      const placeholders: any[] = Array.isArray(f.placeholder_regions)
+        ? f.placeholder_regions
+        : [];
+      // Inline placeholder hint summary (top-of-card guidance).
+      const placeholderHint = placeholders
+        .map(
+          (pr) =>
+            `<li>Lines ${escapeAttr(String(pr.start_line || "?"))}–${escapeAttr(String(pr.end_line || "?"))}: ${escapeAttr(String(pr.instruction || ""))}</li>`,
+        )
+        .join("");
+
+      // The template content is HTML-escaped + wrapped in <pre><code> so
+      // it visually reads as code. Non-editable styling enforced via CSS.
+      // The data-template attribute carries the raw template for the
+      // copy/open postMessage handlers (encoded so newlines + quotes
+      // survive HTML attribute escaping).
+      const encoded = encodeURIComponent(template);
+      return `
+        <div class="file-card">
+          <div class="file-header">
+            <span class="file-path">${escapeAttr(path)}</span>
+            <span class="file-language-pill">${escapeAttr(language)}</span>
+            ${optional ? `<span class="file-optional">optional</span>` : ""}
+            <div class="file-actions">
+              <button data-vsc-msg="copyTemplate"
+                      data-template-encoded="${encoded}"
+                      title="Copy this template to your clipboard">Copy</button>
+              <button data-vsc-msg="openInBuffer"
+                      data-template-encoded="${encoded}"
+                      data-file-path="${escapeAttr(path)}"
+                      data-file-language="${escapeAttr(language)}"
+                      title="Open in a new untitled VS Code editor (paste-and-save yourself)">Open in editor</button>
+            </div>
+          </div>
+          <pre class="file-template">${escapeAttr(template)}</pre>
+          ${
+            hints || placeholderHint
+              ? `<div class="file-hints">
+                   ${hints ? `<div>${escapeAttr(hints)}</div>` : ""}
+                   ${placeholderHint ? `<div style="margin-top:6px;"><strong>Fill-in spots:</strong><ul style="margin:4px 0 0; padding-left:18px;">${placeholderHint}</ul></div>` : ""}
+                 </div>`
+              : ""
+          }
+        </div>`;
+    })
+    .join("");
+
+  return `
+    <div class="files-to-author">
+      <h3>📝 Files to author</h3>
+      <p class="panel-intro">
+        These are the files this step asks you to write. Each card below shows a
+        starter template — <strong>copy or open in a new editor</strong>, then
+        edit + save in your workspace. The "We'll verify" panel further down
+        shows what we'll check after you save.
+      </p>
+      ${cards}
+    </div>`;
+}
+
+function renderSpecPanel(
+  step: StepSummary,
+  opts?: { verifyMode?: boolean },
+): string {
   const v = (step.validation || {}) as any;
   const sections: string[] = [];
+  // v0.1.14: when called from an AUTHORING terminal_exercise context
+  // (Files-to-author panel above), the cli_commands header relabels to
+  // "🔍 We'll verify" — those commands ARE the grading probes, not
+  // authoring instructions.
+  const verifyMode = !!(opts && opts.verifyMode);
+  const cliHeader = verifyMode ? "🔍 We'll verify" : "📋 What to do";
 
-  // ── What to do — cli_commands list (terminal_exercise) ──
+  // ── cli_commands list (terminal_exercise) ──
   const cliCmds: any[] = Array.isArray(v.cli_commands) ? v.cli_commands : [];
   if (cliCmds.length > 0) {
     const items = cliCmds
@@ -855,7 +1160,7 @@ function renderSpecPanel(step: StepSummary): string {
       })
       .join("");
     sections.push(
-      `<div class="spec-section"><h3>📋 What to do</h3><ol>${items}</ol></div>`,
+      `<div class="spec-section"><h3>${cliHeader}</h3><ol>${items}</ol></div>`,
     );
   }
 

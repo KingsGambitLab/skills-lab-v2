@@ -291,6 +291,59 @@ def step_to_markdown(
     # html_to_markdown converter we use on the main body so the section
     # actually renders.
     demo = step.get("demo_data") or {}
+
+    # ── v0.1.14 (F5 schema) — "## Files to author" section ──
+    # User feedback (2026-04-27): "Terminal is too verbose and still does not
+    # give a step by step way." For AUTHORING terminal_exercise steps, render
+    # template_files BEFORE "What to do" so the learner sees the actual
+    # starter content for each file they need to write — same parity as the
+    # VS Code Files-to-author panel.
+    template_files = demo.get("template_files") if isinstance(demo, dict) else None
+    if template_files and isinstance(template_files, list) and len(template_files) > 0:
+        parts += ["", "## Files to author", ""]
+        parts += [
+            "These are the files this step asks you to write. Each block below "
+            "is a starter template — copy it into your editor, fill in the "
+            "placeholder spots, save in your repo, then run `skillslab check`.",
+            "",
+        ]
+        for i, tf in enumerate(template_files, 1):
+            if not isinstance(tf, dict):
+                continue
+            path = str(tf.get("path") or f"file-{i}")
+            template = str(tf.get("template") or tf.get("contents") or "")
+            language = str(tf.get("language") or "")
+            optional = bool(tf.get("optional"))
+            hints = str(tf.get("hints") or "")
+            placeholders = tf.get("placeholder_regions") or []
+
+            # Infer language from extension when missing (mirrors webview's logic)
+            if not language and "." in path:
+                ext = path.rsplit(".", 1)[-1].lower()
+                language = {
+                    "md": "markdown", "yml": "yaml", "yaml": "yaml",
+                    "json": "json", "toml": "toml", "conf": "ini",
+                    "cfg": "ini", "py": "python", "ts": "typescript",
+                    "js": "javascript", "sh": "bash",
+                }.get(ext, "")
+
+            opt_label = " _(optional)_" if optional else ""
+            parts += [f"### {i}. `{path}`{opt_label}", ""]
+            if hints:
+                parts += [hints, ""]
+            fence = f"```{language}" if language else "```"
+            parts += [fence, template.rstrip(), "```", ""]
+            if isinstance(placeholders, list) and placeholders:
+                parts += ["**Fill-in spots:**"]
+                for pr in placeholders:
+                    if not isinstance(pr, dict):
+                        continue
+                    s = pr.get("start_line", "?")
+                    e = pr.get("end_line", "?")
+                    instr = pr.get("instruction") or ""
+                    parts += [f"- Lines {s}–{e}: {instr}"]
+                parts += [""]
+
     instructions = demo.get("instructions") if isinstance(demo, dict) else None
     if instructions:
         rendered_lines: list[str] = []

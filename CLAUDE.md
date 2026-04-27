@@ -1105,6 +1105,99 @@ The highest-difficulty exercise type. Learners build a real system and deploy it
 3. **Introduction Engagement (>90%)** — The intro of every course must hook learners. Highly interactive, no verbose content, creative approaches.
 4. **Production Readiness** — Every course must end with the learner having built something deployable. Not a notebook, not a script — a system with an API, infra config, monitoring, and the ability to handle real-world scale and edge cases.
 
+## 🛠️ PREFER `terminal_exercise` / `system_build` / `code_exercise` — hands-on > read-and-answer (2026-04-27)
+
+**User directive (verbatim, 2026-04-27):** *"Add a note to CLAUDE.md - use
+terminal / vscode exercises when possible. They help learners apply
+hands-on knowledge the most."*
+
+### The rule
+
+**For every step in every course, the Creator's first instinct should be
+"can a learner DO this on their own machine?" — not "can a learner
+PICK the right answer from a list?"** Hands-on exercise types
+(`terminal_exercise`, `system_build`, `code_exercise`, `code_review`,
+`fill_in_blank`) build muscle memory that transfers to real work.
+MCQ / SJT / scenario_branch are for genuinely subjective dilemmas (soft
+skills, judgment calls), not as the default.
+
+### Why hands-on wins
+
+Per CLAUDE.md's North Star: "Once a learner completes a course, they
+should be competent enough to take a real-life scenario at their
+workplace, build a system that integrates with others, and use the
+skill to deliver results." Reading about `aider --message ...` and
+picking the right option from a 4-option MCQ is NOT the same as TYPING
+that command in a terminal, watching it execute, debugging when it
+fails, and re-running. The latter is what they'll do at work.
+
+### Exercise-type preference order (Creator picks the FIRST that fits)
+
+For a given step's pedagogy, walk this list top to bottom; pick the
+first type that genuinely fits the skill:
+
+1. **`terminal_exercise`** — learner runs commands on their own
+   machine (CLI tools, scripts, shell workflows). Now distinguishes
+   AUTHORING vs DIAGNOSTIC via `task_kind` (per F5 §below).
+2. **`system_build`** — capstones where the learner builds + deploys
+   a real system. GHA-graded (`gha_workflow_check`) or live-endpoint-
+   graded (`endpoint_check`).
+3. **`code_exercise`** — write code that hidden_tests run against.
+   Docker-isolated, real test framework.
+4. **`code_review`** — spot bugs in real production-shape code.
+5. **`fill_in_blank`** — when syntax recall is the actual skill
+   (rare; usually a code_exercise is better).
+6. **`adaptive_roleplay` / `voice_mock_interview`** — when the skill
+   IS verbal/written exchange (negotiation, interviews, sales calls).
+7. **`incident_console` / `simulator_loop`** — for evolving-state
+   scenarios (SRE pages, K8s drills, fintech simulations).
+8. **`scenario_branch` / `sjt`** — when the skill is genuinely about
+   ranking soft-skill responses or branching decisions with social
+   consequences. NOT a default for "the learner picks A/B/C/D."
+9. **`mcq`** — last resort. Per CLAUDE.md §"Course Design Principles":
+   "Objective questions (MCQ) are lowest priority." If a step's only
+   plausible exercise is MCQ, ask whether the step is even worth
+   shipping.
+10. **`concept`** — pure teaching content (no grading). Use sparingly;
+    every concept step is a step the learner doesn't actually DO
+    anything. Maximum 1 concept step per module.
+
+### What this means for course design
+
+- Every BYO-key course (Kimi/AIE/jspring class) should be ≥80%
+  `terminal_exercise` + `system_build`. If the Creator emits a 5-module
+  course with 4 modules of MCQs, that's a regression to read-and-answer.
+- Operational subjects (SRE, DevOps, SecEng, DataAnalyst, MLops,
+  Accountant, Legal-contract-review) should pair `terminal_exercise`
+  with the new sandbox types (`live_sql_playground`,
+  `observability_sandbox`, `incident_console`). MCQ on Splunk SPL is
+  cosplay; making the learner type SPL into a sandbox IS the skill.
+- Non-coder courses (PM/CS/HR/Marketing) lose `terminal_exercise` but
+  should still default to hands-on shapes — `adaptive_roleplay` for
+  conversation skills, `system_build` zero-code variants for prompt
+  authoring (rubric-graded paste of real prompts they'd use).
+
+### Anti-pattern
+
+A course step that boils down to "read this paragraph and pick the
+correct answer to 'what does pytest do?'" is a course-design failure
+even if it's technically gradable. The right framing is: "open your
+terminal, run `pytest tests/` against the included fixture, paste the
+output. We'll check it ran + the right tests fired." That's the same
+factual content but in the shape that builds skill.
+
+### Enforcement
+
+Per the Creator system prompt's `EXERCISE-TYPE PICKER` (already in
+backend/main.py), the Creator must justify why a given type was
+chosen. When the choice is MCQ for a step that COULD have been
+terminal_exercise, the prompt's anti-pattern rule should reject it.
+Add to the next prompt-tightening pass: "If you emitted MCQ for a step
+about a CLI tool / database / framework / code, STOP and rewrite as
+terminal_exercise or code_exercise."
+
+---
+
 ## 🎨 Teaching Philosophy — Be Creative, Ship Real Experiences
 
 Be creative and novel about how you teach. Do not default to "read a paragraph, then answer a multiple-choice." Examples of what GOOD teaching looks like:

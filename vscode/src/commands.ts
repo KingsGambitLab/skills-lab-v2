@@ -794,7 +794,61 @@ export class CommandHandlers {
       () => void this.runAndAutoSubmit(courseId, moduleId, detailedStep),
       () => void this.reopenInContainer(),
       () => void this.showInstallHintsForStep(detailedStep),
+      (template: string, path: string) => void this.copyTemplateToClipboard(template, path),
+      (template: string, path: string, language: string) =>
+        void this.openTemplateInBuffer(template, path, language),
     );
+  }
+
+  /**
+   * v0.1.14 — copy a Files-to-author template to clipboard. Surfaces a
+   * brief toast confirming the path so the learner knows what was copied
+   * (since the panel has multiple cards).
+   */
+  async copyTemplateToClipboard(template: string, path: string): Promise<void> {
+    try {
+      await vscode.env.clipboard.writeText(template);
+      vscode.window.showInformationMessage(
+        `Copied ${path || "template"} to clipboard. Paste into your editor + save.`,
+      );
+    } catch (e: any) {
+      vscode.window.showErrorMessage(`Could not copy to clipboard: ${e?.message || e}`);
+    }
+  }
+
+  /**
+   * v0.1.14 — open a Files-to-author template in a NEW UNTITLED VS Code
+   * editor. Per buddy-Opus review (2026-04-27): we do NOT auto-write to
+   * the workspace filesystem (footgun: dirty git tree, wrong cwd, file
+   * already exists). The learner pastes-and-saves themselves, retaining
+   * agency over where + when the file lands.
+   */
+  async openTemplateInBuffer(
+    template: string,
+    path: string,
+    language: string,
+  ): Promise<void> {
+    try {
+      // Normalize language to a VS Code language id (the WebView already
+      // does this via inferLang; pass it through).
+      const lang = language || "plaintext";
+      const doc = await vscode.workspace.openTextDocument({
+        content: template,
+        language: lang,
+      });
+      await vscode.window.showTextDocument(doc, {
+        viewColumn: vscode.ViewColumn.Active,
+        preview: false,
+      });
+      vscode.window.showInformationMessage(
+        `Opened ${path || "template"} in a new editor. ` +
+          `Edit + save it as ${path || "<your-path>"} in your workspace.`,
+      );
+    } catch (e: any) {
+      vscode.window.showErrorMessage(
+        `Could not open template in editor: ${e?.message || e}`,
+      );
+    }
   }
 
   /**
