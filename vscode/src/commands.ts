@@ -90,38 +90,41 @@ type InstallHint = {
 
 const INSTALL_HINTS: Record<string, InstallHint> = {
   aider: {
-    what: "Aider — open-source AI pair-programmer CLI. Needs Python 3.10+.",
+    what: "Aider — open-source AI pair-programmer CLI. Official upstream installer (uv-based, handles Python + PATH automatically).",
     macos:
-      "brew install python@3.11 && python3.11 -m pip install aider-chat\n" +
-      "  # or with pyenv: pyenv install 3.11 && pyenv global 3.11 && pip install aider-chat",
+      "curl -LsSf https://aider.chat/install.sh | sh\n" +
+      "  # The official installer handles Python version + PATH for you.\n" +
+      "  # Fallback if curl is blocked: brew install python@3.11 && python3.11 -m pip install aider-chat",
     linux:
-      "sudo apt update && sudo apt install -y python3.11 python3-pip\n" +
-      "python3.11 -m pip install --user aider-chat",
+      "curl -LsSf https://aider.chat/install.sh | sh\n" +
+      "  # Fallback: sudo apt install python3.11 python3-pip && python3.11 -m pip install --user aider-chat",
     windows:
-      "winget install Python.Python.3.11\n" +
-      "python -m pip install aider-chat",
+      "PowerShell: powershell -ExecutionPolicy ByPass -c \"irm https://aider.chat/install.ps1 | iex\"\n" +
+      "  # Fallback: winget install Python.Python.3.11 && python -m pip install aider-chat",
     troubleshoot:
-      "If `aider --version` says command not found AFTER install:\n" +
-      "  - macOS: add `~/Library/Python/3.11/bin` to PATH (echo into ~/.zshrc)\n" +
-      "  - Linux: add `~/.local/bin` to PATH (echo into ~/.bashrc)\n" +
-      "  - Windows: `python -m pip show aider-chat` shows the install dir; add Scripts to PATH\n" +
-      "  - Verify Python: `python3 --version` should be 3.10 or higher",
+      "If `aider --version` says command not found AFTER the curl-installer ran:\n" +
+      "  - Open a NEW terminal — installer adds aider to PATH but the running shell may not have re-sourced .zshrc/.bashrc yet.\n" +
+      "  - Verify install dir: `ls ~/.local/bin/aider` (Linux) or `ls ~/Library/Python/*/bin/aider` (macOS pip fallback path).\n" +
+      "  - Check Python: `python3 --version` should be 3.10+ — the installer needs this.\n" +
+      "  - If curl was blocked (corporate proxy): use the per-OS pip fallback above + ensure `~/.local/bin` is on PATH (`echo 'export PATH=\"$HOME/.local/bin:$PATH\"' >> ~/.zshrc`).",
     docs: "https://aider.chat/docs/install.html",
   },
   claude: {
-    what: "Claude Code — Anthropic's official CLI. Drop-in replacement for cursor/copilot.",
+    what: "Claude Code — Anthropic's official CLI. Official upstream installer.",
     macos:
       "curl -fsSL https://claude.ai/install.sh | sh\n" +
-      "  # or: brew install anthropic/tap/claude (when published)",
+      "  # Official Anthropic installer. Run `claude /login` on first launch.",
     linux: "curl -fsSL https://claude.ai/install.sh | sh",
     windows:
-      "Run in PowerShell: irm https://claude.ai/install.ps1 | iex\n" +
-      "  # or download installer from https://docs.anthropic.com/en/docs/claude-code/setup",
+      "PowerShell: irm https://claude.ai/install.ps1 | iex\n" +
+      "  # Or download the Windows installer from docs.anthropic.com/en/docs/claude-code/setup",
     troubleshoot:
       "After install:\n" +
-      "  - Run `claude /login` to authenticate (browser opens)\n" +
-      "  - Or set ANTHROPIC_API_KEY env var with your key from console.anthropic.com\n" +
-      "  - Verify: `claude --version` should print '2.x.y (Claude Code)'",
+      "  - Open a NEW terminal so PATH refreshes.\n" +
+      "  - Run `claude /login` to authenticate (browser opens for OAuth).\n" +
+      "  - Or skip the browser flow: export ANTHROPIC_API_KEY with your key from console.anthropic.com.\n" +
+      "  - Verify: `claude --version` should print '2.x.y (Claude Code)'.\n" +
+      "  - If `claude /login` browser doesn't open: copy the auth URL it prints + paste in your browser manually.",
     docs: "https://docs.anthropic.com/en/docs/claude-code/setup",
   },
   gh: {
@@ -141,16 +144,27 @@ const INSTALL_HINTS: Record<string, InstallHint> = {
     docs: "https://github.com/cli/cli#installation",
   },
   python3: {
-    what: "Python 3.10+ — required by aider and most Python-based courses.",
-    macos: "brew install python@3.11   # macOS often ships 3.9, you want 3.10+",
-    linux: "sudo apt install python3.11 python3-pip   # or python3.10/3.12 per distro",
-    windows: "winget install Python.Python.3.11",
+    what: "Python 3.10+ — required by aider and most Python-based courses. Recommended: install uv (Astral's Python version manager) which handles Python install + virtualenvs cross-platform.",
+    macos:
+      "curl -LsSf https://astral.sh/uv/install.sh | sh\n" +
+      "uv python install 3.11\n" +
+      "  # Then: uv run python --version  → Python 3.11.x\n" +
+      "  # Fallback: brew install python@3.11  (macOS often ships 3.9, you want 3.10+)",
+    linux:
+      "curl -LsSf https://astral.sh/uv/install.sh | sh\n" +
+      "uv python install 3.11\n" +
+      "  # Fallback: sudo apt install python3.11 python3-pip",
+    windows:
+      "PowerShell: powershell -ExecutionPolicy ByPass -c \"irm https://astral.sh/uv/install.ps1 | iex\"\n" +
+      "uv python install 3.11\n" +
+      "  # Fallback: winget install Python.Python.3.11",
     troubleshoot:
-      "If `python3 --version` shows < 3.10:\n" +
+      "If `python3 --version` shows < 3.10 AFTER install:\n" +
+      "  - With uv: `uv run python --version` (uv-managed Python)\n" +
       "  - macOS: alias python3 to brew's: `echo 'alias python3=python3.11' >> ~/.zshrc`\n" +
       "  - Linux: use `update-alternatives` to point python3 to 3.11\n" +
-      "  - Or install pyenv and set local version per project",
-    docs: "https://www.python.org/downloads/",
+      "  - Open a NEW terminal so PATH refreshes after the curl installer.",
+    docs: "https://docs.astral.sh/uv/",
   },
   python: { what: "", macos: "", linux: "", windows: "", docs: "" }, // alias of python3
   pytest: {
@@ -161,11 +175,22 @@ const INSTALL_HINTS: Record<string, InstallHint> = {
     troubleshoot: "If `pytest --version` not found, ensure Python's bin dir is on PATH (see python3 hints).",
   },
   npm: {
-    what: "Node.js + npm — for Claude Code's npm-distributed installer + JS courses.",
-    macos: "brew install node@20",
-    linux: "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt install -y nodejs",
-    windows: "winget install OpenJS.NodeJS.LTS",
-    docs: "https://nodejs.org",
+    what: "Node.js + npm — recommended via fnm (faster than nvm, cross-platform).",
+    macos:
+      "curl -fsSL https://fnm.vercel.app/install | bash\n" +
+      "fnm install 20 && fnm use 20\n" +
+      "  # Fallback: brew install node@20",
+    linux:
+      "curl -fsSL https://fnm.vercel.app/install | bash\n" +
+      "fnm install 20 && fnm use 20\n" +
+      "  # Fallback: curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt install -y nodejs",
+    windows:
+      "PowerShell: winget install Schniz.fnm\n" +
+      "fnm install 20\n" +
+      "  # Fallback: winget install OpenJS.NodeJS.LTS",
+    troubleshoot:
+      "After fnm install, open a NEW terminal so the shell sources fnm's setup (added to ~/.zshrc / ~/.bashrc / PowerShell profile).",
+    docs: "https://github.com/Schniz/fnm",
   },
   node: { what: "", macos: "", linux: "", windows: "", docs: "" }, // alias of npm
   go: {
@@ -176,18 +201,31 @@ const INSTALL_HINTS: Record<string, InstallHint> = {
     docs: "https://go.dev/dl",
   },
   java: {
-    what: "JDK 21+ — for Spring Boot / jspring courses.",
-    macos: "brew install openjdk@21 && sudo ln -sfn /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-21.jdk",
-    linux: "sudo apt install openjdk-21-jdk",
-    windows: "winget install EclipseAdoptium.Temurin.21.JDK",
-    docs: "https://adoptium.net",
+    what: "JDK 21+ — for Spring Boot / jspring courses. Recommended via sdkman (manages JDK + Maven + Gradle versions).",
+    macos:
+      "curl -s 'https://get.sdkman.io' | bash\n" +
+      "source ~/.sdkman/bin/sdkman-init.sh\n" +
+      "sdk install java 21-tem\n" +
+      "  # Fallback: brew install openjdk@21",
+    linux:
+      "curl -s 'https://get.sdkman.io' | bash\n" +
+      "source ~/.sdkman/bin/sdkman-init.sh\n" +
+      "sdk install java 21-tem\n" +
+      "  # Fallback: sudo apt install openjdk-21-jdk",
+    windows:
+      "PowerShell: winget install EclipseAdoptium.Temurin.21.JDK\n" +
+      "  # sdkman supports Windows via WSL — see sdkman.io/install for details",
+    troubleshoot:
+      "After sdkman install, open a NEW terminal so .sdkman/bin/sdkman-init.sh is sourced.\n" +
+      "Verify: `java --version` should print openjdk 21.x or temurin-21.x.",
+    docs: "https://sdkman.io/install",
   },
   mvn: {
-    what: "Maven — Spring Boot / jspring build tool.",
-    macos: "brew install maven",
-    linux: "sudo apt install maven",
-    windows: "winget install Apache.Maven",
-    docs: "https://maven.apache.org/install.html",
+    what: "Maven — Spring Boot / jspring build tool. Recommended via sdkman (paired with Java install above).",
+    macos: "sdk install maven   # if sdkman is already installed (see java entry)\n  # Fallback: brew install maven",
+    linux: "sdk install maven   # if sdkman is already installed\n  # Fallback: sudo apt install maven",
+    windows: "PowerShell: winget install Apache.Maven",
+    docs: "https://sdkman.io/sdks#maven",
   },
   docker: {
     what: "Docker Desktop — for the optional 'Reopen in Container' escape hatch.",
@@ -225,6 +263,12 @@ function renderInstallHintsToChannel(
   channel.appendLine(``);
   channel.appendLine(
     `Per CLAUDE.md: the install journey IS the skill. Setting up these tools on YOUR machine is part of becoming production-ready — same path you'd take at work. The Reopen-in-Container option is an escape hatch, not the primary path.`,
+  );
+  channel.appendLine(``);
+  channel.appendLine(
+    `Recommended path per tool: lead with the upstream curl-installer when one exists ` +
+      `(handles cross-platform install + PATH binding). Fall back to platform package ` +
+      `managers (brew/apt/winget) only when no upstream installer is available.`,
   );
   channel.appendLine(``);
   for (const tool of missingTools) {

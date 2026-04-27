@@ -117,6 +117,110 @@ ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
 
 ---
 
+## 🛠️ TOOLCHAIN INSTALL PREFERENCE — upstream curl-installer first (2026-04-27)
+
+**User directive (verbatim, 2026-04-27):** *"Add to CLAUDE.md, instructions
+like `curl -LsSf https://aider.chat/install.sh | sh` would be preferred for
+installation."*
+
+### The principle
+
+> **When a tool offers an OFFICIAL upstream `curl | sh` installer, that's the
+> recommended install path — across course briefings, the VS Code extension's
+> install hints, and any deployment docs. Per-OS package-manager commands
+> (brew / apt / winget) are the FALLBACK, not the front door. `pip install` /
+> `npm install -g` paths are LAST resort because they're failure-prone (PATH
+> issues, version mismatches, platform-specific binary locations).**
+
+### Why this matters
+
+We were shipping per-OS install blocks like:
+
+```
+macOS: brew install python@3.11 && pip3.11 install aider-chat
+Linux: sudo apt install python3.11 python3-pip && pip3 install aider-chat --user
+Windows: winget install Python.Python.3.11 && python -m pip install aider-chat
+```
+
+Three problems:
+1. **PATH gotchas** — `pip install --user` puts binaries at
+   `~/Library/Python/3.X/bin` (macOS) / `~/.local/bin` (Linux) / Scripts dir
+   (Windows). Each OS needs different PATH-fix instructions. The #1 install
+   failure is "I ran the install line but `<tool> --version` says command
+   not found."
+2. **Version drift** — `brew install python@3.11` vs `apt install python3` vs
+   `winget install Python.Python.3.11` give different Python versions. Aider
+   needs ≥ 3.10, so the matrix has to be tested per OS per course.
+3. **Multi-step variability** — every course's install lesson has to teach
+   `pip` / `brew` / `apt` / `winget` *plus* PATH troubleshooting. The
+   teaching surface gets huge.
+
+The upstream `curl | sh` installer (when one exists) collapses all three:
+the publisher already solved the cross-OS install + PATH binding + version
+choice. We point at one URL; the install just works on macOS/Linux (and
+sometimes Windows via PowerShell variant).
+
+### Canonical installers — known-good URLs (prefer these)
+
+| Tool | Recommended install | Notes |
+|---|---|---|
+| **Aider** | `curl -LsSf https://aider.chat/install.sh \| sh` | Official, uv-based, cross-platform (macOS/Linux). PATH handled. |
+| **Claude Code** | `curl -fsSL https://claude.ai/install.sh \| sh` | Official Anthropic installer. `claude /login` on first run. |
+| **Python (via uv)** | `curl -LsSf https://astral.sh/uv/install.sh \| sh` then `uv python install 3.11` | uv manages Python versions cross-platform. Replaces pyenv. |
+| **Rust toolchain** | `curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \| sh` | Canonical rustup installer. |
+| **Node.js (via fnm)** | `curl -fsSL https://fnm.vercel.app/install \| bash` | fnm is faster than nvm, better Windows story. |
+| **Java (via sdkman)** | `curl -s "https://get.sdkman.io" \| bash` then `sdk install java 21-tem` | sdkman handles JDK + Maven + Gradle versions. |
+| **GitHub CLI (gh)** | macOS: `brew install gh`<br>Linux: official apt repo (multi-line)<br>Windows: `winget install GitHub.cli` | No upstream curl-installer — fall back to package manager. |
+| **Go** | macOS: `brew install go`<br>Linux: download from go.dev/dl<br>Windows: `winget install GoLang.Go` | No upstream curl-installer. |
+
+When a tool isn't in this table, follow the same hierarchy:
+1. Check for an upstream `curl | sh` installer at the tool's official site
+2. Fall back to platform package managers (brew / apt / winget)
+3. Avoid pip / npm-only install paths unless that's what the upstream actively recommends
+
+### The "trust" sub-rule
+
+`curl | sh` from a random URL is a security smell. Restrict to KNOWN-TRUSTED
+upstream sources only:
+
+- The tool's official domain (`aider.chat`, `claude.ai`, `rustup.rs`, `astral.sh`, `sdkman.io`, `fnm.vercel.app`, `nodejs.org`, `cli.github.com`)
+- Or the canonical GitHub Releases URL of the publishing org
+
+NEVER curl-install from arbitrary GitHub gists, third-party "convenience
+installers", or anonymously-published mirrors. The course content should
+quote the URL verbatim from the tool's own install docs — same rule as F1
+(no invented CLI commands).
+
+### Where this propagates
+
+This rule applies to three surfaces; keep them in sync:
+
+1. **Creator prompt F4** in `backend/main.py` — references this section
+   when generating course briefings. New M0 install lessons follow the
+   curl-installer-first pattern.
+2. **VS Code extension `INSTALL_HINTS`** in `vscode/src/commands.ts` —
+   the per-tool hint blocks rendered via `renderInstallHintsToChannel`.
+   Updated 2026-04-27 v0.1.11 to lead with curl-installers where they
+   exist.
+3. **Course-repo M0 briefings** — once existing courses regen, the new
+   install content propagates automatically. Per "Don't regen course
+   content for now" (2026-04-27), this is forward-looking.
+
+### When to add a new tool to the table
+
+If a course adds a new toolchain dependency (e.g. `terraform`, `kubectl`,
+`docker compose v2`):
+
+1. Check the tool's official docs for an upstream installer URL
+2. If one exists → add to the table above + to `INSTALL_HINTS` in the
+   extension
+3. If none exists → add the package-manager-per-OS fallback set + note
+   the absence in this file's "Notes" column
+
+Don't reinvent install advice. Quote upstream verbatim.
+
+---
+
 ## 📦 VSCODE EXT BUNDLED-VSIX DEPLOY — `/dl/skillslab.vsix` from prod (2026-04-27 v0.1.9)
 
 **Problem.** The Skillslab VS Code extension isn't published to the

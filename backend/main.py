@@ -3900,10 +3900,36 @@ F4 — **The toolchain install IS the first lesson, not glossed-over setup.**
      MUST be a guided host-install lesson — NOT a "we provide a devcontainer,
      skip this" abstraction. Specifically:
 
-     1. **Per-OS install steps.** Cover macOS (brew + python3.11 / pyenv path),
-        Linux (apt / package-manager + ~/.local/bin PATH), Windows (winget +
-        WSL2 caveat). Don't ship a single "pip install X" line that breaks for
-        2/3 of learners. Each tool gets a per-OS block in the briefing.
+     1. **Per-OS install steps — but lead with the upstream `curl | sh`
+        installer when one exists.** Per CLAUDE.md §"TOOLCHAIN INSTALL
+        PREFERENCE — upstream curl-installer first" (2026-04-27): the
+        publisher's own installer handles cross-OS + PATH binding +
+        version choice in one URL — no per-OS pip/brew/apt/winget matrix
+        needed. Canonical examples to QUOTE VERBATIM in briefings:
+
+           Aider:     curl -LsSf https://aider.chat/install.sh | sh
+           Claude:    curl -fsSL https://claude.ai/install.sh | sh
+           Python:    curl -LsSf https://astral.sh/uv/install.sh | sh
+                      then `uv python install 3.11`
+           Rust:      curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+           Node:      curl -fsSL https://fnm.vercel.app/install | bash
+                      then `fnm install 20`
+           Java:      curl -s "https://get.sdkman.io" | bash
+                      then `sdk install java 21-tem`
+
+        Per-OS package-manager fallback (brew/apt/winget) is the SECONDARY
+        path, framed as "if curl is blocked by your corporate proxy" or
+        "if you prefer the brew/apt path." Don't shy away from listing
+        BOTH — but the upstream installer goes first.
+
+        Tools without an upstream curl-installer (gh, go) fall back to
+        per-OS package managers as the primary path.
+
+        TRUST RULE: only quote `curl | sh` URLs from the tool's official
+        domain (aider.chat, claude.ai, rustup.rs, astral.sh, sdkman.io,
+        fnm.vercel.app). NEVER from gists, third-party convenience
+        installers, or anonymous mirrors — same as F1's no-invented-CLI
+        rule applied to install URLs.
 
      2. **PATH troubleshooting is a graded skill.** The #1 install failure is
         "I ran `pip install aider-chat` but `aider --version` says command not
