@@ -117,6 +117,57 @@ ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
 
 ---
 
+## 🛡️ WIDGET RUNTIME — CSP-SAFE BY CONSTRUCTION, NEVER EVAL (2026-04-27 v0.1.2)
+
+**User directive (verbatim, 2026-04-27):** *"don't fix the symptom, fix the root cause please"* — filed against a WebView click failure: `EvalError: Evaluating a string as JavaScript violates Content Security Policy directive because 'unsafe-eval' is not an allowed source of script`.
+
+### The principle
+
+> **The widget runtime MUST NEVER `eval` / `new Function(...)` an attribute string.** Args parsed from DOM attributes go through `JSON.parse` only. Server-side rewriters do whatever JS-literal → JSON coercion is needed in Node (no CSP), so the runtime never has to.
+
+This is correct for THREE independent reasons — any one of which would make it the right call. All three together make it non-negotiable:
+
+1. **CSP correctness.** `script-src 'nonce-X'` (without `'unsafe-eval'`) blocks `Function()` in VS Code WebViews + any future CDN-hosted SPA + any embed-in-app surface. Adding `'unsafe-eval'` defeats the security goal.
+2. **XSS amplification surface.** Even where CSP would permit eval, evaluating attribute strings as JS turns any HTML-injection bug into an arbitrary-code bug. JSON.parse only handles structured data — narrow attack surface, deterministic, no JS execution.
+3. **Determinism.** Eval results depend on closures, scope, runtime config. JSON parses identically everywhere, including in static analysis tools.
+
+### What this means in code
+
+- `vscode/src/widgets.ts` (the WebView delegator port):
+  - Server-side `convertArgsToJson(argsRaw)` converts JS-literal args to canonical JSON (single-quoted strings → double-quoted, unquoted object keys → "quoted"). Runs in Node at rewrite time, not in the browser.
+  - `rewriteOnclicks` emits `data-action="fn" data-args-json='[...]'`. NEVER emits `data-args-raw` (the pre-v0.1.2 shape that the runtime had to eval).
+  - The delegator's runtime body parses via `JSON.parse(argsJson)`. The literal tokens `Function(` and `eval(` MUST NOT appear in the delegator string.
+  - When `convertArgsToJson` returns null (rare arg shape), `rewriteOnclicks` LEAVES the original `onclick=` untouched. WebView CSP then blocks the inline handler entirely — better than emitting a broken data-action that fails at parse-time.
+
+- `frontend/index.html` (the browser SPA): same rule applies once we migrate. Today's `_rewriteOnclicksToDataActions` + delegator still uses `Function(...)` because the browser SPA isn't CSP-locked. It STILL shouldn't, for reasons #2 and #3 above. Migration is queued; until then, treat it as legacy that the WebView surface has already moved past.
+
+### The CONTENT contract going forward (Creator-side rule)
+
+**Interactive widgets in concept content MUST emit `data-action` + `data-args-json` natively. Never `onclick="fn(...)"`.**
+
+Server-side rewriting exists ONLY as a transitional layer for legacy course content. Every new widget the Creator emits should carry the canonical attributes from the start:
+
+```html
+<!-- WRONG (legacy, requires rewriter) -->
+<button onclick="selectScenario('ship_feature')">Ship a New Feature</button>
+
+<!-- RIGHT (CSP-safe by construction) -->
+<button data-action="selectScenario" data-args-json='["ship_feature"]'>Ship a New Feature</button>
+```
+
+Rule for the Creator system prompt (when revising for v8.7+):
+1. Widgets that need click handlers — emit `data-action="<fn>" data-args-json='<JSON>'`. Args ALWAYS a JSON array.
+2. Function definitions go in a single `<script>` block that explicitly assigns `window.<fn> = function() { ... }` (NOT bare `function fn() {}` inside an IIFE — the hoist regex catches most but explicit assignment is grep-able + future-proof).
+3. The `<script>` block contains zero `eval` / `new Function` / `setTimeout(string)` / `setInterval(string)`. All deferred work uses callback functions.
+
+### Shim invariant
+
+`backend/harness/vscode_walk_agent.py` invariant XX (added 2026-04-27): greps `vscode/src/widgets.ts` for `Function(` / `eval(`. Must return ZERO matches inside the delegator. Greps for `data-args-json` / `JSON.parse(argsJson)` / `convertArgsToJson` — all three must appear. Behavioral check B1 verifies the rewrite emits `data-args-json='["..."]'` for `onclick="fn('...')"`.
+
+Run the shim before every WebView-touching merge. If invariant XX fails, the regression is structural; do not patch around it.
+
+---
+
 ## 🖱 WIDGET CLICKS — EVENT DELEGATION, NOT INLINE-ONCLICK RESOLUTION (2026-04-25 v6)
 
 **User directive (verbatim, 2026-04-25):** *"Hoisting issue is repetitive — make sure we fix the root cause and generalise"*

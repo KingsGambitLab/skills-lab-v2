@@ -39,7 +39,7 @@ export function generateNonce(len = 32): string {
  * Extract <script>...</script> bodies + return HTML with all script tags
  * removed. We'll re-inject the bodies inside a single nonce'd wrapper.
  */
-function extractAndStripScripts(html: string): { html: string; scripts: string[] } {
+export function extractAndStripScripts(html: string): { html: string; scripts: string[] } {
   const scripts: string[] = [];
   const stripped = html.replace(
     /<script\b[^>]*>([\s\S]*?)<\/script\s*>/gi,
@@ -55,16 +55,56 @@ function extractAndStripScripts(html: string): { html: string; scripts: string[]
 }
 
 /**
+ * Convert a raw JS-literal argument list (`'a', 1, ['b', 2]`) into a JSON
+ * array string (`["a",1,["b",2]]`) by best-effort regex coercion:
+ *   - single-quoted strings → double-quoted
+ *   - unquoted object keys → "quoted"
+ *
+ * Returns null if the result still doesn't `JSON.parse` (common for
+ * function-call-as-arg, regex literals, template strings, etc.). Caller
+ * should leave the onclick untouched in that case so the delegator's
+ * missing-function path catches the click and logs a clear error.
+ *
+ * Why JSON, not eval? CSP `script-src 'nonce-X'` (without `'unsafe-eval'`)
+ * blocks `new Function(...)` and `eval(...)` in the WebView. Pre-2026-04-27
+ * (v0.1.1) the runtime delegator used `Function('return [' + raw + ']')()`
+ * — fired EvalError on every widget click. The right fix is to do the
+ * parse at SERVER SIDE (here, in Node, no CSP) and emit canonical JSON
+ * for the runtime to JSON.parse — never eval.
+ */
+export function convertArgsToJson(argsRaw: string): string | null {
+  const trimmed = argsRaw.trim();
+  if (trimmed === "") return "[]";
+  let json = "[" + trimmed + "]";
+  // single-quoted strings → double-quoted (preserve escapes)
+  json = json.replace(/'([^'\\]*(?:\\.[^'\\]*)*)'/g, (_m, inner: string) => {
+    return '"' + inner.replace(/\\'/g, "'").replace(/"/g, '\\"') + '"';
+  });
+  // unquoted object keys: { foo: 1 } → { "foo": 1 }
+  json = json.replace(
+    /([{,]\s*)([a-zA-Z_$][\w$]*)\s*:/g,
+    (_m, lead: string, key: string) => `${lead}"${key}":`,
+  );
+  try {
+    JSON.parse(json);
+    return json;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Walk every `onclick="…"` attribute. If it parses as a single function
  * call (`fn(arg1, arg2)`), rewrite to `data-action="fn"` +
- * `data-args-raw="arg1, arg2"`. Multi-statement onclicks are left untouched
- * (they're rare and risky to auto-rewrite; if the page emits them, the
- * delegator will log a missing-function and the human moves on).
+ * `data-args-json='[arg1, arg2]'` (canonical JSON). Multi-statement
+ * onclicks and arg shapes that don't coerce to JSON are left untouched.
  *
  * NB: This is a regex-driven port of the frontend's same-named function.
- * Same regexes, same parsing rules. Tested via `tests/widgets.test.ts`.
+ * The 2026-04-27 v0.1.2 evolution: emit canonical JSON instead of raw JS
+ * source so the WebView delegator can `JSON.parse` (CSP-safe) instead of
+ * `Function(...)` (CSP unsafe-eval, blocked).
  */
-function rewriteOnclicks(html: string): string {
+export function rewriteOnclicks(html: string): string {
   const callRe = /^\s*([a-zA-Z_$][\w$]*)\s*\(([\s\S]*)\)\s*;?\s*$/;
   return html.replace(
     /(<\w+\b[^>]*?)\sonclick\s*=\s*(["'])([\s\S]*?)\2([^>]*>)/gi,
@@ -75,10 +115,16 @@ function rewriteOnclicks(html: string): string {
         return `${before} onclick="${escapeAttr(body)}"${after}`;
       }
       const fn = m[1];
-      const args = m[2];
-      return `${before} data-action="${escapeAttr(fn)}" data-args-raw="${escapeAttr(
-        args,
-      )}"${after}`;
+      const argsJson = convertArgsToJson(m[2]);
+      if (argsJson === null) {
+        // Args don't coerce to JSON (e.g. function-call-as-arg, template
+        // literal, regex). Leave onclick untouched — better than emitting
+        // a broken data-action that fails to parse at runtime.
+        return `${before} onclick="${escapeAttr(body)}"${after}`;
+      }
+      return `${before} data-action="${escapeAttr(
+        fn,
+      )}" data-args-json="${escapeAttr(argsJson)}"${after}`;
     },
   );
 }
@@ -100,7 +146,7 @@ function escapeAttr(s: string): string {
  * defines `fn` at IIFE-scope; the hoist tail's `typeof fn` check at the
  * outer scope can't see it → `window.fn` stays undefined → click silent.
  */
-function stripOuterIife(code: string): string {
+export function stripOuterIife(code: string): string {
   const re = /^[;\s]*\(\s*function\s*\(\s*\)\s*\{([\s\S]*)\}\s*(?:\)\s*\(\s*\)|\(\s*\)\s*\))\s*;?\s*$/;
   const m = code.trim().match(re);
   return m ? m[1] : code;
@@ -112,7 +158,7 @@ function stripOuterIife(code: string): string {
  *   2. Hoists named function decls to `window`.
  *   3. Installs the data-action delegator.
  */
-function buildRuntimeScript(scripts: string[]): string {
+export function buildRuntimeScript(scripts: string[]): string {
   const hoistShapes = [
     /(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
     /(?:^|\n)\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z_$][\w$]*\s*=>)/g,
@@ -141,6 +187,22 @@ function buildRuntimeScript(scripts: string[]): string {
     })();`);
   }
 
+  // Delegator: dispatches data-action clicks. JSON.parse ONLY — never
+  // eval / Function. Two reasons:
+  //   1. CSP: 'unsafe-eval' is not (and must not be) in the WebView's
+  //      script-src. Pre-2026-04-27 (v0.1.1) the delegator ran
+  //      `Function('return ['+argsRaw+'];')()` which fired EvalError on
+  //      every click in the WebView.
+  //   2. Defense-in-depth: even in browser contexts where eval is
+  //      permitted, evaluating arbitrary attribute strings as JS is an
+  //      XSS amplifier. JSON.parse only handles structured data; narrow
+  //      attack surface; deterministic.
+  //
+  // Args MUST arrive as canonical JSON in `data-args-json`. The
+  // server-side rewriter (rewriteOnclicks above) does the JS-literal →
+  // JSON conversion exactly once, in Node, where there's no CSP. If a
+  // widget's onclick can't be coerced to JSON, the rewriter leaves the
+  // onclick raw and this delegator never sees it.
   const delegator = `
     document.addEventListener('click', function(e) {
       const el = e.target.closest && e.target.closest('[data-action]');
@@ -151,10 +213,14 @@ function buildRuntimeScript(scripts: string[]): string {
         console.error('[skillslab widget action] "' + name + '" is not on window. Check the widget script defines it via window.' + name + ' = ... or function ' + name + '() {} at top scope.');
         return;
       }
-      const argsRaw = el.getAttribute('data-args-raw') || '';
+      const argsJson = el.getAttribute('data-args-json') || '[]';
       let args = [];
-      try { args = Function('"use strict"; return [' + argsRaw + '];')(); }
-      catch (err) { console.error('[skillslab widget action] failed to parse args for "' + name + '":', err); return; }
+      try { args = JSON.parse(argsJson); }
+      catch (err) {
+        console.error('[skillslab widget action] data-args-json malformed for "' + name + '":', err, '— raw:', argsJson);
+        return;
+      }
+      if (!Array.isArray(args)) args = [args];
       try { fn.apply(null, args); }
       catch (err) { console.error('[skillslab widget action] "' + name + '" threw:', err); }
     }, true);

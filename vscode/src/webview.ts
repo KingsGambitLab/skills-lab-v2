@@ -21,7 +21,7 @@
  */
 import * as vscode from "vscode";
 import { rewriteForWebview } from "./widgets";
-import { StepSummary } from "./api";
+import { StepSummary, ValidateResponse } from "./api";
 
 export interface StepRenderInput {
   courseId: string;
@@ -32,6 +32,15 @@ export interface StepRenderInput {
   attemptCount: number;     // 0 if never submitted
   themeAccent: string;      // hex/CSS color from getThemeForCourse
   webBaseUrl: string;       // for "Open in browser" links
+  /**
+   * Most-recent grader feedback for THIS step. Populated by
+   * commands.ts:submitAndContinue immediately after /api/exercises/validate
+   * returns. Renders as a panel at the top of the WebView with score,
+   * pass/fail badge, full feedback prose, per-item correctness, and
+   * explanations — same level of detail the CLI surfaces post-`check`.
+   * Null on the initial open / after navigating away.
+   */
+  feedback?: ValidateResponse | null;
 }
 
 /**
@@ -58,9 +67,36 @@ const BROWSER_WIDGET_TYPES = new Set([
   "voice_mock_interview",
 ]);
 
+/**
+ * Exercise types that have NO submission to grade — purely read-then-advance.
+ * For these, hide the "Submit & Continue" button entirely; the "Next ▸"
+ * button becomes the primary action and (on the host side) auto-marks the
+ * step complete on the way through (mirrors submitAndContinue's concept
+ * branch). User feedback 2026-04-27: "Keep submit & continue only for
+ * exercises which requires submission."
+ */
+const NO_SUBMIT_TYPES = new Set(["concept"]);
+
 /** Open or focus the step-card panel for a given step. */
 export class StepWebViewManager {
   private panel: vscode.WebviewPanel | null = null;
+
+  /**
+   * Callbacks for the CURRENT step. Updated on every show() so a panel
+   * that's already open re-binds to the new step's handlers. The
+   * onDidReceiveMessage listener (registered ONCE at panel creation)
+   * reads from this.callbacks lazily, so it always invokes the latest
+   * step's handler, never a stale closure from when the panel was first
+   * created. (Pre-v0.1.2 bug: clicking "Open Terminal" on M0.S2 invoked
+   * M0.S1's runInTerminal handler — toast read "S1 has no cli_commands"
+   * even though the panel showed M0.S2.)
+   */
+  private callbacks: {
+    onCheck?: () => void;
+    onNext?: () => void;
+    onPrev?: () => void;
+    onRunInTerminal?: () => void;
+  } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
@@ -71,6 +107,11 @@ export class StepWebViewManager {
     onRunInTerminal: () => void,
     onPrev: () => void,
   ): void {
+    // ALWAYS update callbacks BEFORE reveal/render — the listener below
+    // reads via `this.callbacks.X?.()` so this swap is what makes the
+    // already-open panel route to the new step.
+    this.callbacks = { onCheck, onNext, onPrev, onRunInTerminal };
+
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
     } else {
@@ -80,14 +121,17 @@ export class StepWebViewManager {
         { viewColumn: vscode.ViewColumn.Beside, preserveFocus: false },
         { enableScripts: true, retainContextWhenHidden: true },
       );
-      this.panel.onDidDispose(() => { this.panel = null; });
+      this.panel.onDidDispose(() => {
+        this.panel = null;
+        this.callbacks = {};
+      });
       this.panel.webview.onDidReceiveMessage((msg) => {
         if (!msg || typeof msg !== "object") return;
         switch (msg.type) {
-          case "submit": onCheck(); break;
-          case "next": onNext(); break;
-          case "prev": onPrev(); break;
-          case "runInTerminal": onRunInTerminal(); break;
+          case "submit": this.callbacks.onCheck?.(); break;
+          case "next": this.callbacks.onNext?.(); break;
+          case "prev": this.callbacks.onPrev?.(); break;
+          case "runInTerminal": this.callbacks.onRunInTerminal?.(); break;
         }
       });
     }
@@ -165,6 +209,28 @@ export class StepWebViewManager {
     const footerBrowserLink = showFooterBrowserLink
       ? `<a class="footer-link" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">view in browser ↗</a>`
       : "";
+
+    // Submit & Continue only renders for steps that actually grade a
+    // submission. For pure-read steps (concept), the Next button is
+    // promoted to primary + the host auto-marks the step complete on
+    // its way through.
+    const requiresSubmission = !NO_SUBMIT_TYPES.has(exType);
+
+    // Spec panel — for terminal_exercise (and any step with cli_commands
+    // / must_contain / rubric in validation), render the SAME spec the
+    // CLI surfaces post-2026-04-25 (CLI-walk fix). User feedback
+    // 2026-04-27: "Spec needs to be shown here as in the terminal for
+    // the user to understand the task at hand." The briefing prose alone
+    // doesn't tell the learner WHICH commands to run or WHAT must appear
+    // in the output for it to pass.
+    const specPanel = renderSpecPanel(input.step);
+
+    // Feedback panel — most-recent /api/exercises/validate response.
+    // Renders at the very top of body so the learner reads it first
+    // after submitting. User feedback 2026-04-27: "Submit & Continue
+    // should give detailed feedback, similar to terminal." Replaces
+    // the toast-only flow that swallowed feedback prose.
+    const feedbackPanel = renderFeedbackPanel(input.feedback, accent);
 
     return `<!doctype html>
 <html lang="en">
@@ -259,6 +325,79 @@ export class StepWebViewManager {
     pre { background: var(--vscode-textCodeBlock-background); padding: 12px;
           border-radius: 4px; overflow-x: auto; }
     code { font-family: var(--vscode-editor-font-family); }
+
+    /* ── Spec panel — cli_commands / must_contain / rubric ── */
+    .spec-panel {
+      margin: 16px 0 22px;
+      padding: 14px 18px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+    }
+    .spec-section { margin-bottom: 14px; }
+    .spec-section:last-child { margin-bottom: 0; }
+    .spec-section h3 { margin: 0 0 8px 0; font-size: 0.92rem;
+                       font-weight: 600;
+                       color: var(--vscode-foreground); }
+    .spec-section ol, .spec-section ul {
+      margin: 0; padding-left: 22px;
+    }
+    .spec-section li {
+      margin-bottom: 5px; font-size: 0.88rem;
+      line-height: 1.5;
+    }
+    .spec-section code {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 6px; border-radius: 3px;
+      font-size: 0.85rem;
+    }
+    .spec-section pre.rubric {
+      max-height: 180px; overflow: auto;
+      font-size: 0.82rem; padding: 10px 12px;
+      white-space: pre-wrap;
+    }
+
+    /* ── Feedback panel (post-Submit) ── */
+    .feedback-panel {
+      margin: 0 0 22px;
+      padding: 14px 18px;
+      border-radius: 4px;
+      border-left: 4px solid var(--vscode-panel-border);
+    }
+    .feedback-panel.pass {
+      background: var(--vscode-inputValidation-infoBackground);
+      border-left-color: var(--vscode-testing-iconPassed,
+                                var(--vscode-charts-green));
+    }
+    .feedback-panel.fail {
+      background: var(--vscode-inputValidation-warningBackground);
+      border-left-color: var(--vscode-testing-iconFailed,
+                                var(--vscode-charts-red));
+    }
+    .feedback-panel .fb-header {
+      display: flex; align-items: center; gap: 10px;
+      font-size: 1rem; font-weight: 600;
+      margin-bottom: 8px;
+    }
+    .feedback-panel .fb-score {
+      font-variant-numeric: tabular-nums;
+      font-size: 0.92rem;
+      opacity: 0.85;
+    }
+    .feedback-panel .fb-prose {
+      font-size: 0.9rem; line-height: 1.55;
+      white-space: pre-wrap;
+    }
+    .feedback-panel .fb-items {
+      margin: 10px 0 0; padding-left: 22px;
+      font-size: 0.85rem;
+    }
+    .feedback-panel .fb-items li { margin-bottom: 4px; }
+    .feedback-panel .fb-items li.fb-correct::marker { content: "✓ "; color: var(--vscode-charts-green); }
+    .feedback-panel .fb-items li.fb-wrong::marker { content: "✗ "; color: var(--vscode-charts-red); }
+    .feedback-panel details { margin-top: 8px; font-size: 0.85rem; }
+    .feedback-panel details summary { cursor: pointer; opacity: 0.8; }
+
     .step-body { font-size: 0.95rem; }
     .step-body h2, .step-body h3, .step-body h4 { margin-top: 28px; }
     .step-body p { margin: 0 0 14px; }
@@ -279,14 +418,18 @@ export class StepWebViewManager {
     </div>
   </div>
 
+  ${feedbackPanel}
+
   ${howToRun}
+
+  ${specPanel}
 
   <div class="step-body">${bodyHtml}</div>
 
   <div class="footer-actions">
-    <button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>
+    ${requiresSubmission ? `<button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>` : ``}
     <button class="secondary" data-vsc-msg="prev" title="Go to previous step">◂ Previous</button>
-    <button class="secondary" data-vsc-msg="next" title="Skip without submitting">Skip ▸</button>
+    <button class="${requiresSubmission ? `secondary` : `primary`}" data-vsc-msg="next" title="Go to next step">Next ▸</button>
     <span class="footer-spacer"></span>
     ${footerBrowserLink}
   </div>
@@ -319,4 +462,186 @@ function escapeAttr(s: string): string {
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+/**
+ * Render the SPEC PANEL — same shape the CLI surfaces post-2026-04-25
+ * for `terminal_exercise` (and any step whose `validation` carries
+ * cli_commands / must_contain / rubric). Without this panel the
+ * learner reads the briefing prose but doesn't know which commands to
+ * run or what tokens must appear in the output for the step to pass.
+ *
+ * Returns "" (empty string) when the step has no spec content; the
+ * caller injects that into the HTML where the panel would go.
+ */
+function renderSpecPanel(step: StepSummary): string {
+  const v = (step.validation || {}) as any;
+  const sections: string[] = [];
+
+  // ── What to do — cli_commands list (terminal_exercise) ──
+  const cliCmds: any[] = Array.isArray(v.cli_commands) ? v.cli_commands : [];
+  if (cliCmds.length > 0) {
+    const items = cliCmds
+      .map((c: any) => {
+        const cmd = typeof c === "string" ? c : (c.cmd || c.command || "");
+        const label =
+          typeof c === "object"
+            ? c.label || c.description || c.why || ""
+            : "";
+        return `<li><code>${escapeAttr(String(cmd))}</code>${
+          label ? ` <span class="muted">— ${escapeAttr(String(label))}</span>` : ""
+        }</li>`;
+      })
+      .join("");
+    sections.push(
+      `<div class="spec-section"><h3>📋 What to do</h3><ol>${items}</ol></div>`,
+    );
+  }
+
+  // ── Must contain — token-based pass criteria ──
+  const mustContain: any[] = Array.isArray(v.must_contain) ? v.must_contain : [];
+  if (mustContain.length > 0) {
+    const items = mustContain
+      .map((m: any) => {
+        const tok =
+          typeof m === "string" ? m : (m.token || m.text || m.value || "");
+        const desc =
+          typeof m === "object" ? m.description || m.why || m.reason || "" : "";
+        return `<li><code>${escapeAttr(String(tok))}</code>${
+          desc ? ` <span class="muted">— ${escapeAttr(String(desc))}</span>` : ""
+        }</li>`;
+      })
+      .join("");
+    sections.push(
+      `<div class="spec-section"><h3>✅ Must contain</h3><ul>${items}</ul></div>`,
+    );
+  }
+
+  // ── Rubric — LLM-grader rubric prose (truncated, scroll-capped) ──
+  if (typeof v.rubric === "string" && v.rubric.trim().length > 0) {
+    const r = v.rubric.length > 1200 ? v.rubric.slice(0, 1200) + "…" : v.rubric;
+    sections.push(
+      `<div class="spec-section"><h3>📐 Grading rubric</h3><pre class="rubric">${escapeAttr(r)}</pre></div>`,
+    );
+  }
+
+  // ── Endpoint check — for system_build steps ──
+  if (v.endpoint_check && typeof v.endpoint_check === "object") {
+    const ep = v.endpoint_check;
+    const url = ep.url || ep.endpoint || "";
+    const expected = ep.expected_status || ep.expected || "";
+    if (url) {
+      sections.push(
+        `<div class="spec-section"><h3>🌐 Endpoint check</h3><ul><li><code>${escapeAttr(
+          String(url),
+        )}</code>${
+          expected ? ` <span class="muted">— expects ${escapeAttr(String(expected))}</span>` : ""
+        }</li></ul></div>`,
+      );
+    }
+  }
+
+  // ── GHA workflow check — for capstone deploy steps ──
+  if (v.gha_workflow_check && typeof v.gha_workflow_check === "object") {
+    const gh = v.gha_workflow_check;
+    const repo = gh.repo_template || gh.repo || "";
+    const wf = gh.workflow_file || "lab-grade.yml";
+    if (repo) {
+      sections.push(
+        `<div class="spec-section"><h3>⚡ GitHub Actions check</h3><ul><li>Fork <code>${escapeAttr(
+          String(repo),
+        )}</code>, push your solution, paste the run URL — workflow <code>${escapeAttr(
+          String(wf),
+        )}</code> must report <code>success</code>.</li></ul></div>`,
+      );
+    }
+  }
+
+  if (sections.length === 0) return "";
+  return `<div class="spec-panel">${sections.join("")}</div>`;
+}
+
+/**
+ * Render the FEEDBACK PANEL — most-recent /api/exercises/validate response.
+ * Replaces the toast-only flow with a rich in-WebView card showing pass/fail,
+ * score percentage, full feedback prose, per-item correctness (when
+ * item_results[] is present), explanations, and the canonical correct
+ * answer if the grader returned one.
+ *
+ * Returns "" when no feedback is set (initial step open / post-navigation).
+ */
+function renderFeedbackPanel(
+  feedback: ValidateResponse | null | undefined,
+  _accent: string,
+): string {
+  if (!feedback) return "";
+  const pass = !!feedback.correct;
+  const pct = Math.round((feedback.score ?? 0) * 100);
+  const headerIcon = pass ? "✓" : "✗";
+  const headerText = pass ? "Submission accepted" : "Not quite — keep iterating";
+  const cls = pass ? "pass" : "fail";
+
+  const proseHtml = feedback.feedback
+    ? `<div class="fb-prose">${escapeAttr(String(feedback.feedback))}</div>`
+    : "";
+
+  // Per-item results — common shape across categorization / ordering /
+  // sjt / mcq / code_review. Each item has correct: bool + optional
+  // user_/expected_ fields + explanation.
+  let itemsHtml = "";
+  const items = (feedback.item_results || []) as any[];
+  if (Array.isArray(items) && items.length > 0) {
+    itemsHtml =
+      `<ul class="fb-items">` +
+      items
+        .map((it: any, idx: number) => {
+          const ok = !!it.correct;
+          const lbl =
+            it.label || it.text || it.id || it.token || `Item ${idx + 1}`;
+          const yours =
+            it.user_answer ?? it.user_category ?? it.user_position ?? it.user_rank ?? null;
+          const expected =
+            it.correct_answer ?? it.correct_category ?? it.correct_position ?? it.correct_rank ?? null;
+          const ex = it.explanation || "";
+          let detail = "";
+          if (!ok && (yours !== null || expected !== null)) {
+            detail = ` <span class="muted">(your: ${escapeAttr(
+              String(yours),
+            )} → correct: ${escapeAttr(String(expected))})</span>`;
+          }
+          const exHtml = ex
+            ? `<div class="muted" style="margin-top:2px;font-size:0.82rem;">${escapeAttr(
+                String(ex),
+              )}</div>`
+            : "";
+          return `<li class="${ok ? "fb-correct" : "fb-wrong"}">${escapeAttr(
+            String(lbl),
+          )}${detail}${exHtml}</li>`;
+        })
+        .join("") +
+      `</ul>`;
+  }
+
+  // Canonical correct answer — collapsed by default to avoid spoiling
+  // before the learner has tried; only useful on a FAIL submission.
+  let canonicalHtml = "";
+  if (!pass && feedback.correct_answer !== undefined && feedback.correct_answer !== null) {
+    const ca =
+      typeof feedback.correct_answer === "object"
+        ? JSON.stringify(feedback.correct_answer, null, 2)
+        : String(feedback.correct_answer);
+    canonicalHtml = `<details><summary>Canonical answer</summary><pre>${escapeAttr(
+      ca,
+    )}</pre></details>`;
+  }
+
+  return `<div class="feedback-panel ${cls}">
+    <div class="fb-header">
+      <span>${headerIcon} ${headerText}</span>
+      <span class="fb-score">${pct}%</span>
+    </div>
+    ${proseHtml}
+    ${itemsHtml}
+    ${canonicalHtml}
+  </div>`;
 }

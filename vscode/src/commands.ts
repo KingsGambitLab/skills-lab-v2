@@ -18,7 +18,7 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
-import { LmsClient, StepSummary } from "./api";
+import { LmsClient, StepSummary, ValidateResponse } from "./api";
 import { AuthManager } from "./auth";
 import { StateManager } from "./state";
 import { CourseTree } from "./tree";
@@ -129,7 +129,19 @@ export class CommandHandlers {
 
   // ── Step open / submit / next ───────────────────────────────────
 
-  async openStep(courseId: string, moduleId: number, step: StepSummary): Promise<void> {
+  async openStep(
+    courseId: string,
+    moduleId: number,
+    step: StepSummary,
+    /**
+     * Optional grader feedback to display IN the WebView panel above the
+     * briefing. Set by submitAndContinue() after /api/exercises/validate
+     * returns; null/undefined for fresh opens (sidebar click, URI deep
+     * link, palette navigate). User feedback 2026-04-27: detailed
+     * feedback should render here, not as a transient toast.
+     */
+    feedback?: ValidateResponse | null,
+  ): Promise<void> {
     // Refetch the full step (the tree only carries summary fields)
     const full = await this.api.getModule(courseId, moduleId);
     const detailedStep = full.steps.find((s) => s.id === step.id) || step;
@@ -153,11 +165,12 @@ export class CommandHandlers {
       attemptCount,
       themeAccent: accent,
       webBaseUrl: this.cfg().webUrl,
+      feedback: feedback ?? null,
     };
     this.webview.show(
       input,
       () => void this.submitAndContinue(courseId, moduleId, detailedStep),
-      () => void this.next(courseId, moduleId, detailedStep),
+      () => void this.nextOrComplete(courseId, moduleId, detailedStep),
       () => void this.runStepInTerminal(detailedStep),
       () => void this.previous(courseId, moduleId, detailedStep),
     );
@@ -246,37 +259,61 @@ export class CommandHandlers {
       }
     }
 
+    // Mark complete on PASS — fire-and-forget; tree refresh handles the
+    // ✓ icon. Don't auto-advance; the user explicitly asked for detailed
+    // feedback to be visible (matches CLI's `check`-then-`next` flow).
     if (validated.correct) {
-      const score = validated.score || 1.0;
+      const score = validated.score ?? 1.0;
       try {
         await this.api.markComplete(step.id, Math.round(score * 100));
       } catch (e: any) {
-        // Already-complete is fine; surface other errors
         if (e.status !== 409) {
           vscode.window.showWarningMessage(`Pass detected, sync warning: ${e.message || e}`);
         }
       }
-      vscode.window.showInformationMessage(
-        `✓ ${labelOf(step)} complete — score ${Math.round(score * 100)}%.`,
-      );
-      // Advance cursor + open next step
-      const cursor = this.state.getCursor(slug);
-      if (cursor) {
-        this.state.setCursor(slug, courseId, cursor.stepIdx + 1);
-      }
       this.tree.refresh();
-      await this.next(courseId, moduleId, step);
-    } else {
-      const pct = Math.round((validated.score || 0) * 100);
-      const fb = validated.feedback || "Try again — re-read the briefing + iterate.";
-      vscode.window.showWarningMessage(
-        `${pct}% — ${fb.slice(0, 120)}`,
-        "Open WebView",
+      // Brief celebratory toast — full feedback lives in the panel below.
+      vscode.window.showInformationMessage(
+        `✓ ${labelOf(step)} complete — score ${Math.round(score * 100)}%. Click Next ▸ when ready.`,
       );
     }
+
+    // Re-render the WebView with the validate() response embedded as a
+    // feedback panel above the briefing. PASS or FAIL — the panel shows
+    // the full grader prose, per-item correctness, and (on FAIL) a
+    // collapsed canonical-answer details element. User then clicks
+    // Next ▸ (advance) or Submit & Continue (retry) themselves.
+    await this.openStep(courseId, moduleId, step, validated as ValidateResponse);
   }
 
-  /** Advance cursor + open next step (skip without submit). */
+  /**
+   * "Next" button handler — context-aware. For pure-read step types
+   * (concept), Next IS the completion action: mark the step complete
+   * on the way through, then advance. For all other step types, this
+   * is a pure skip-forward (no markComplete) — same semantics as the
+   * previous "Skip" button (renamed Next per user feedback 2026-04-27).
+   *
+   * Note: submitAndContinue() already calls next() directly after a
+   * passing submission, so this wrapper is ONLY hooked to the WebView's
+   * Next button — never to the post-submit advance path. That keeps
+   * markComplete idempotent.
+   */
+  async nextOrComplete(courseId: string, moduleId: number, step: StepSummary): Promise<void> {
+    const exType = (step.exercise_type || "concept").toLowerCase();
+    if (exType === "concept") {
+      try {
+        await this.api.markComplete(step.id, 100);
+      } catch (e: any) {
+        // 409 already-complete: fine. Other errors: still advance —
+        // the user's read-and-continue intent shouldn't block on a
+        // mark-complete failure (e.g. browsing un-enrolled).
+      }
+    }
+    await this.next(courseId, moduleId, step);
+  }
+
+  /** Advance cursor + open next step (no markComplete; called by both
+   * the post-submit success path and nextOrComplete's tail). */
   async next(courseId: string, moduleId: number, _step: StepSummary): Promise<void> {
     const slug = courseId;
     const cursor = this.state.getCursor(slug);

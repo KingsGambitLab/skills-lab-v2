@@ -72,6 +72,34 @@ endpoints (NO backend changes). Per CLAUDE.md hard rule: "we never
 handle learner API keys" — bearer + ANTHROPIC_API_KEY + GITHUB_TOKEN
 all live in OS keychain via VS Code SecretStorage.
 
+## SANITY GATE — run BEFORE the per-invariant grep checks
+
+Per user directive 2026-04-27 ("shim should ideally not rely on grep as
+it can be brittle, rely on higher level functions like click and
+execute"), the most load-bearing invariants are now verified by
+RUNNING the actual code via Node-based unit tests, not by grepping
+source. Run this first; if any test fails, the shim has caught a real
+regression that source-grep would likely miss.
+
+```bash
+cd {repo_root}/vscode && npm test 2>&1 | tail -30
+```
+
+Must end with `ℹ fail 0`. The test suite covers (with verbatim code
+execution, no source grep):
+  - convertArgsToJson — JS-literal → canonical JSON, all common shapes
+  - rewriteOnclicks — emits data-args-json (not data-args-raw), strips inline onclicks
+  - stripOuterIife — Crockford / alt / leading-semicolon shapes; preserves IIFEs with args
+  - buildRuntimeScript — ZERO Function/eval in output; uses JSON.parse; hoists fn decls
+  - rewriteForWebview — full pipeline on realistic widget HTML; data-args-json round-trips through JSON.parse
+
+If `npm test` greens, you've already verified invariants IV (CSP strict),
+V (IIFE unwrap), XX (no eval/Function), and behavioral check B1 (server
+HTML rewrite). Continue with the grep-level checks below for the rest
+(file structure, package.json contents, command registrations) — those
+are still source-level since the corresponding code paths don't
+naturally execute in a unit-test harness.
+
 ## EXPLICIT INVARIANTS
 
 ### I. TypeScript compiles cleanly
@@ -200,6 +228,224 @@ it, terminal-shy learners read the briefing, click Submit, and bounce.
 grep -nE 'Open Terminal|runInTerminal|How to run' {repo_root}/vscode/src/webview.ts
 ```
 
+## POST-LAUNCH UX INVARIANTS (rounds 1-3 user feedback, 2026-04-27)
+
+These invariants codify bugs the user filed AFTER first install. Every
+time a regression slips past, add a new invariant here so the next
+shim run catches it. Goal: never ship the same UX bug twice.
+
+### XI. Previous-button wiring (Round 1 Fix 1)
+
+User feedback: "No button to go back." A `◂ Previous` button must be
+present in the WebView footer + a palette command `Skillslab: Previous Step`
++ a `previous(...)` method on `CommandHandlers`.
+
+```bash
+grep -nE 'data-vsc-msg="prev"|case "prev":|◂ Previous' {repo_root}/vscode/src/webview.ts
+grep -nE 'async previous\\(|this\\.previous\\(' {repo_root}/vscode/src/commands.ts
+grep -nE 'skillslab\\.previousStep' {repo_root}/vscode/src/extension.ts {repo_root}/vscode/package.json
+```
+
+All three greps must match. FAIL if any returns zero results.
+
+### XII. Course accent toned down to ≤ 3 sites (Round 1 Fix 2)
+
+User feedback: "Red theme is overwhelming, make it easier on the eyes."
+The theme accent (`${{accent}}`) must appear ONLY in three CSS
+declarations: 3px header stripe, header label color, primary CTA fill.
+Everything else MUST use `var(--vscode-*)` semantic colors.
+
+```bash
+grep -cE '\\$\\{{accent\\}}' {repo_root}/vscode/src/webview.ts   # expect exactly 3
+```
+
+FAIL if count > 3 (regression — accent leaked back into a badge,
+secondary button, link, or border). Specifically forbid these patterns:
+
+```bash
+grep -nE '\\$\\{{accent\\}}22|\\$\\{{accent\\}}33|border:.*\\$\\{{accent\\}}|color:.*\\$\\{{accent\\}}.*border' {repo_root}/vscode/src/webview.ts
+```
+
+Should return ZERO matches. (`{{accent}}22` was the badge tint hex
+suffix; `border: 1px solid {{accent}}` was the secondary button.)
+
+### XIII. Conditional 'Open in Browser' (Round 1 Fix 3)
+
+User feedback: "Reduce the visibility of Open In Browser, as it is not
+important." Primary "Open in Browser" CTA must render ONLY for browser-
+widget exercise types (where the dashboard widget IS the work). For
+other steps, demote to a subtle footer link.
+
+```bash
+grep -nE 'BROWSER_WIDGET_TYPES|showFooterBrowserLink|footer-link' {repo_root}/vscode/src/webview.ts
+```
+
+`BROWSER_WIDGET_TYPES` set must include at least: scenario_branch,
+simulator_loop, incident_console, categorization, parsons, sjt, mcq,
+fill_in_blank, ordering, code_review, adaptive_roleplay,
+voice_mock_interview. Verify by grepping the set definition.
+
+### XIV. Submit-only-when-required gate (Round 2 Fix A)
+
+User feedback: "Keep submit & continue only for exercises which requires
+submission." The Submit & Continue button must NOT render for `concept`-
+type steps (or any future no-submit type). A `NO_SUBMIT_TYPES` set must
+gate the render via a `requiresSubmission` flag.
+
+```bash
+grep -nE 'NO_SUBMIT_TYPES|requiresSubmission' {repo_root}/vscode/src/webview.ts
+```
+
+Both names must appear. The footer-actions must wrap the Submit button
+in a `${{requiresSubmission ? ... : ``}}` ternary (zero-render for
+no-submit steps).
+
+### XV. Skip → Next rename (Round 2 Fix B)
+
+User feedback: "Instead of skip - rename to next." The secondary
+forward button must read "Next ▸", not "Skip ▸". Verify the literal
+string is gone.
+
+```bash
+grep -nE 'Skip ▸|Skip\\b.*data-vsc-msg' {repo_root}/vscode/src/webview.ts
+```
+
+Must return ZERO matches. Conversely:
+
+```bash
+grep -nE 'Next ▸' {repo_root}/vscode/src/webview.ts   # expect ≥1
+```
+
+### XVI. nextOrComplete handler (Round 2 Fix C)
+
+When Submit is hidden (concept), Next becomes the completion action —
+the host handler must mark the step complete on its way through, NOT
+just advance the cursor.
+
+```bash
+grep -nE 'async nextOrComplete\\(|this\\.nextOrComplete\\(' {repo_root}/vscode/src/commands.ts
+```
+
+Both occurrences must be present (definition + wire-up in `openStep`).
+
+### XVII. Stale-closure fix in WebView message handler (Round 3 Fix D)
+
+User feedback (verbatim, screenshot-evidenced): "Open Terminal & Run
+Steps => no cli commands error" — toast read "S1 has no cli_commands"
+on M0.S2. Root cause: `onDidReceiveMessage` was registered ONCE at
+panel creation with closures over the FIRST step's callbacks; later
+`show()` calls re-rendered HTML but never re-bound the listener.
+
+The fix MUST store callbacks on `this` and have the listener use lazy
+lookup, never closure capture:
+
+```bash
+grep -nE 'private callbacks:|this\\.callbacks =|this\\.callbacks\\.' {repo_root}/vscode/src/webview.ts
+```
+
+Must show: a `private callbacks:` field declaration, an assignment
+`this.callbacks = {{ ... }}` in `show()` (BEFORE the `if (this.panel)`
+branch so it fires on every show), and dispatch via `this.callbacks.X?.()`
+in the listener body. FAIL if the listener body still uses
+`onCheck()` / `onNext()` / `onRunInTerminal()` directly (those are
+the captured closures from the first call).
+
+### XVIII. Detailed feedback panel rendered IN WebView (Round 3 Fix E)
+
+User feedback: "Submit & Continue => should give detailed feedback,
+similar to terminal." Replaces the toast-only flow with a rich panel
+showing pass/fail + score + grader prose + per-item correctness +
+canonical answer (collapsed) — same depth the CLI surfaces.
+
+```bash
+grep -nE 'renderFeedbackPanel|feedback-panel|fb-prose|fb-items' {repo_root}/vscode/src/webview.ts
+grep -nE 'feedback\\?: ValidateResponse|input\\.feedback' {repo_root}/vscode/src/webview.ts
+```
+
+Both blocks must match. Additionally, `commands.ts:submitAndContinue`
+must re-call `openStep(...)` with the validated response (not just
+toast):
+
+```bash
+grep -nE 'this\\.openStep\\(.*validated' {repo_root}/vscode/src/commands.ts
+```
+
+Must match. FAIL if `submitAndContinue` only calls `showWarningMessage`
+without re-rendering the WebView with feedback.
+
+### XX. No eval / Function() in WebView runtime (Round 3 Fix G — root-cause)
+
+User feedback (verbatim, WebView console 2026-04-27): "VM16:177
+[skillslab widget action] failed to parse args for "selectScenario":
+EvalError: Evaluating a string as JavaScript violates the following
+Content Security Policy directive because 'unsafe-eval' is not an
+allowed source of script."
+
+ROOT CAUSE: pre-v0.1.2 the delegator parsed args via
+`Function('return ['+argsRaw+'];')()`. CSP blocks. Beyond CSP, evaluating
+arbitrary attribute strings as JS is an XSS amplifier — narrow that
+surface to JSON.parse only.
+
+**Verification: execute, don't grep.** Per user directive 2026-04-27:
+"shim should ideally not rely on grep as it can be brittle, rely on
+higher level functions like click and execute."
+
+`vscode/tests/widgets.test.ts` runs the actual code paths via Node's
+built-in test runner and asserts on real outputs (the runtime string
+that gets embedded in the WebView's nonce'd `<script>`). Zero source
+grep — comment-text mentions of historical `Function(` don't
+false-positive because we measure behavior, not source.
+
+```bash
+cd {repo_root}/vscode && npm test 2>&1 | tail -25
+```
+
+Expected output ends with `ℹ pass 20\\nℹ fail 0` (or higher pass count).
+FAIL on any failed test. The relevant assertions (each runs the actual
+code path, no grep on source):
+
+  - `buildRuntimeScript: zero Function( or eval( in delegator output`
+    → calls `buildRuntimeScript([...])` and asserts the returned
+    string contains neither `Function(` nor `eval(`. This is the
+    runtime's actual delegator body, byte-for-byte what runs in the
+    WebView under CSP `script-src 'nonce-X'`.
+  - `buildRuntimeScript: delegator parses args via JSON.parse` →
+    asserts the runtime explicitly uses `JSON.parse(argsJson)`.
+  - `rewriteOnclicks: emits data-args-json (NOT data-args-raw)` →
+    feeds `<button onclick="selectScenario('ship_feature')">` to the
+    rewriter and asserts the output contains the canonical JSON shape,
+    not the v0.1.1 eval-blocked shape.
+  - `rewriteForWebview: data-args-json values round-trip through
+    JSON.parse` → strong regression test: extracts every
+    `data-args-json="..."` value from the rewriter output and verifies
+    each is valid JSON. If a future widget arg shape can't coerce,
+    this fails loudly instead of failing silently at click time.
+
+If `npm test` reports any failure, the regression is structural; do
+not patch around it.
+
+### XIX. Spec panel for terminal_exercise (Round 3 Fix F)
+
+User feedback: "Spec needs to be shown here as in the terminal for the
+user to understand the task at hand." For terminal_exercise (and any
+step with cli_commands / must_contain / rubric / endpoint_check /
+gha_workflow_check in `validation`), the WebView must render a SPEC
+PANEL between the briefing and the footer — same shape the CLI surfaces.
+
+```bash
+grep -nE 'renderSpecPanel|spec-panel|spec-section' {repo_root}/vscode/src/webview.ts
+```
+
+Must match. The function must handle at minimum: cli_commands (📋 What
+to do), must_contain (✅ Must contain), rubric (📐 Grading rubric).
+Verify by grepping the function body for those strings:
+
+```bash
+grep -nE 'What to do|Must contain|Grading rubric' {repo_root}/vscode/src/webview.ts
+```
+
+All three section headers must be present as literal strings.
+
 ## BEHAVIORAL CHECKS (where possible without launching VS Code)
 
 ### B1. Server HTML rewrite test
@@ -216,9 +462,15 @@ curl -s {base_url}/api/courses/created-e54e7d6f51cf/modules/23201 \\
 Then SIMULATE the rewrite by reading `widgets.ts:rewriteForWebview`'s
 behavior — confirm:
   - `<script>` is stripped
-  - `onclick="generateComparison()"` becomes `data-action="generateComparison" data-args-raw=""`
+  - `onclick="generateComparison()"` becomes `data-action="generateComparison" data-args-json="[]"`
+  - `onclick="selectScenario('ship_feature')"` becomes
+    `data-action="selectScenario" data-args-json='["ship_feature"]'`
+    (NOT `data-args-raw="'ship_feature'"` — that was the v0.1.1 shape
+    that fired CSP EvalError when the delegator's `Function(...)` ran
+    on the args at click time).
   - The bundled runtime script defines `window.generateComparison` AT
-    OUTER SCOPE (after IIFE unwrap)
+    OUTER SCOPE (after IIFE unwrap) and the delegator parses args via
+    `JSON.parse(argsJson)` — never `Function(...)` / `eval(...)`.
 
 This is the load-bearing CSP test. If it fails here, the WebView shows
 inert buttons (the chronic browser bug, ported into VS Code).
