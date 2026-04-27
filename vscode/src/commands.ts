@@ -26,6 +26,26 @@ import { StepWebViewManager, StepRenderInput } from "./webview";
 import { courseThemeAccent } from "./theme";
 
 export class CommandHandlers {
+  /**
+   * Cached integrated terminal — reused across every Skillslab run so we
+   * don't bloat memory + the terminal pane with one terminal per click
+   * (user feedback 2026-04-27 v0.1.4: "Don't start a new terminal
+   * everytime when clicked on submit in vscode, this will bloat up mem").
+   *
+   * Lifecycle:
+   *   - Lazily created on first runStepInTerminal / runAndAutoSubmit call.
+   *   - Reused on every subsequent call (same Skillslab terminal pane,
+   *     scrollback intact so the learner can compare runs).
+   *   - Invalidated when the user closes the terminal manually
+   *     (onDidCloseTerminal listener nulls the cache → next call creates
+   *     a fresh one).
+   *   - Env is set at creation time and not refreshed on reuse — keys
+   *     pulled from SecretStorage on first spawn carry through. To pick
+   *     up new keys, learner closes the terminal; the next click creates
+   *     a fresh one with current env.
+   */
+  private cachedTerminal: vscode.Terminal | null = null;
+
   constructor(
     private readonly api: LmsClient,
     private readonly auth: AuthManager,
@@ -33,7 +53,41 @@ export class CommandHandlers {
     private readonly tree: CourseTree,
     private readonly webview: StepWebViewManager,
     private readonly cfg: () => { apiUrl: string; webUrl: string },
-  ) {}
+  ) {
+    // Invalidate the cached terminal when the user closes it manually
+    // — next run creates a fresh one. Without this, getOrCreateTerminal
+    // would hand back a disposed reference.
+    vscode.window.onDidCloseTerminal((t) => {
+      if (t === this.cachedTerminal) {
+        this.cachedTerminal = null;
+      }
+    });
+  }
+
+  /**
+   * Get the cached Skillslab terminal, or create one if none exists / it
+   * was disposed. ALWAYS .show()s before returning so the learner sees
+   * the terminal pane focused on every run.
+   *
+   * Returning a cached terminal preserves scrollback (learners compare
+   * runs side-by-side) and avoids the memory-bloat / terminal-clutter
+   * problem of one-terminal-per-click.
+   */
+  private async getOrCreateTerminal(name: string): Promise<vscode.Terminal> {
+    // `exitStatus` is undefined for a still-running terminal; populated
+    // when the shell exits. Treat the cache as alive only when exitStatus
+    // is undefined — otherwise it's a zombie reference.
+    if (this.cachedTerminal && this.cachedTerminal.exitStatus === undefined) {
+      this.cachedTerminal.show();
+      return this.cachedTerminal;
+    }
+    this.cachedTerminal = vscode.window.createTerminal({
+      name,
+      env: await this.buildTerminalEnv(),
+    });
+    this.cachedTerminal.show();
+    return this.cachedTerminal;
+  }
 
   // ── Auth ────────────────────────────────────────────────────────
 
@@ -415,15 +469,12 @@ export class CommandHandlers {
       );
       return;
     }
-    const term = vscode.window.createTerminal({
-      name: `Skillslab · ${labelOf(step)}`,
-      env: await this.buildTerminalEnv(),
-    });
-    term.show();
-    // Echo the briefing label, then send each cmd. Don't auto-execute the
-    // last one — let the learner press Enter so they SEE what's about to
-    // happen (no surprise actions).
-    term.sendText(`# ${labelOf(step)} — ${step.title || ""}`, true);
+    // v0.1.4: reuse the single cached Skillslab terminal across runs
+    // instead of spawning fresh per click. Banner separates this run
+    // from prior runs in the scrollback.
+    const term = await this.getOrCreateTerminal(`Skillslab`);
+    term.sendText("", false); // ensure we start on a fresh line
+    term.sendText(`# ───── ${labelOf(step)} — ${step.title || ""} ─────`, true);
     for (let i = 0; i < cmds.length; i++) {
       const c = cmds[i];
       const isLast = i === cmds.length - 1;
@@ -472,11 +523,11 @@ export class CommandHandlers {
     const slug = courseId;
     const attempt = this.state.recordAttempt(slug, step.id);
 
-    const term = vscode.window.createTerminal({
-      name: `Skillslab · ${labelOf(step)} (auto)`,
-      env: await this.buildTerminalEnv(),
-    });
-    term.show();
+    // v0.1.4: reuse the cached terminal — same Skillslab pane across
+    // every run, scrollback preserved so the learner can compare runs.
+    const term = await this.getOrCreateTerminal(`Skillslab`);
+    term.sendText("", false);
+    term.sendText(`# ───── ${labelOf(step)} (auto-run) ─────`, true);
 
     // Wait up to 4s for shell integration to come online. If it doesn't,
     // fall back to manual mode — better to surface that path than to
