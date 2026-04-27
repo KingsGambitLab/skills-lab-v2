@@ -132,6 +132,13 @@ export class CommandHandlers {
    */
   private _toolPathCache = new Map<string, boolean>();
 
+  /**
+   * Title of the most-recently-opened course. Used by reopenInContainer
+   * (v0.1.6) to look up the course-repo URL when the current workspace
+   * has no devcontainer and we need to fall through to clone-and-reopen.
+   */
+  private _activeCourseTitle: string | null = null;
+
   constructor(
     private readonly api: LmsClient,
     private readonly auth: AuthManager,
@@ -472,6 +479,10 @@ export class CommandHandlers {
         ((await this.api.getCourse(courseId)).modules.find((m) => m.id === moduleId)?.position || 1)
       : 1;
     const accent = courseThemeAccent(courseTitle);
+    // Remember which course is active so reopenInContainer (v0.1.6) can
+    // look up its course-repo URL if the current workspace has no
+    // devcontainer.
+    this._activeCourseTitle = courseTitle;
     const attemptCount = this.state.getAttempt(courseId, detailedStep.id);
     // Update cursor to this step's position-index
     this.state.setCursor(courseId, courseId, detailedStep.position - 1);
@@ -502,19 +513,87 @@ export class CommandHandlers {
   }
 
   /**
-   * v0.1.5 Change #3 — handler for the WebView's status pill click
-   * (data-vsc-msg="reopenInContainer"). Triggers the Dev Containers
-   * extension's reopen flow + clears the tool-PATH cache so post-reopen
-   * the pill recomputes correctly.
+   * v0.1.6 — context-aware "Reopen in Container" handler.
+   *
+   * Three cases the button needs to handle:
+   *
+   *   A. Current workspace HAS a `.devcontainer/devcontainer.json`
+   *      → fire `remote-containers.reopenInContainer` (works directly).
+   *
+   *   B. Current workspace has NO devcontainer + we know the active
+   *      course's GitHub repo URL → fire `remote-containers.cloneInVolume`
+   *      to clone the course-repo into a Docker volume + reopen there.
+   *      User never has to do a host-side checkout.
+   *
+   *   C. No devcontainer + course-repo unknown → guide the learner to
+   *      `Cmd-Shift-P → Dev Containers: Clone Repository in Container
+   *      Volume` with a copy-pasteable URL prompt.
+   *
+   * Pre-v0.1.6 the handler always took path A — when the workspace
+   * was unrelated to any course-repo, the Dev Containers extension
+   * popped a folder picker (its "where should I look for a devcontainer?"
+   * fallback). Confusing and not what the learner asked for.
    */
   async reopenInContainer(): Promise<void> {
     this._toolPathCache.clear();
-    try {
-      await vscode.commands.executeCommand("remote-containers.reopenInContainer");
-    } catch (e: any) {
-      vscode.window.showErrorMessage(
-        `Dev Containers extension required. Install: code --install-extension ms-vscode-remote.remote-containers`,
+
+    // Case A — current workspace already has a devcontainer
+    const folders = vscode.workspace.workspaceFolders || [];
+    const folderWithDc = folders.find((f) =>
+      fs.existsSync(path.join(f.uri.fsPath, ".devcontainer", "devcontainer.json")),
+    );
+    if (folderWithDc) {
+      try {
+        await vscode.commands.executeCommand("remote-containers.reopenInContainer");
+      } catch (e: any) {
+        vscode.window.showErrorMessage(
+          `Dev Containers extension required. Install: code --install-extension ms-vscode-remote.remote-containers`,
+        );
+      }
+      return;
+    }
+
+    // Case B — no devcontainer in workspace, but the active course has
+    // a known repo. Clone-into-volume short-circuits the host checkout.
+    const repo = this._activeCourseTitle
+      ? findCourseRepo(this._activeCourseTitle)
+      : null;
+    if (repo) {
+      const choice = await vscode.window.showInformationMessage(
+        `This workspace has no devcontainer config. Clone the course-repo (${repo.repoFolderName}) into a Docker volume and reopen there?`,
+        "Clone & Reopen in Container",
+        "Cancel",
       );
+      if (choice !== "Clone & Reopen in Container") return;
+      try {
+        await vscode.commands.executeCommand(
+          "remote-containers.cloneInVolume",
+          vscode.Uri.parse(repo.repoUrl),
+        );
+        return;
+      } catch (e: any) {
+        vscode.window.showWarningMessage(
+          `Auto-clone unavailable. Run manually: Cmd-Shift-P → "Dev Containers: Clone Repository in Container Volume" → paste ${repo.repoUrl}`,
+        );
+        return;
+      }
+    }
+
+    // Case C — no devcontainer + course unknown. Surface the manual path.
+    const choice = await vscode.window.showInformationMessage(
+      `This workspace has no devcontainer config and no course-repo URL is registered for the active course. Use the manual clone-into-volume flow?`,
+      "Open Clone Command",
+      "Cancel",
+    );
+    if (choice === "Open Clone Command") {
+      // Surface the canonical command-palette entry; user pastes their repo URL.
+      try {
+        await vscode.commands.executeCommand("remote-containers.cloneInVolume");
+      } catch (e: any) {
+        vscode.window.showErrorMessage(
+          `Run manually: Cmd-Shift-P → "Dev Containers: Clone Repository in Container Volume" → paste your course-repo URL.`,
+        );
+      }
     }
   }
 
