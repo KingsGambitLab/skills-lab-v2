@@ -421,27 +421,62 @@ export class CommandHandlers {
   }
 
   /**
-   * Synchronous PATH check via `command -v <tool>` (POSIX) — falls back
-   * to `where <tool>` on Windows. Cached per-tool for the session so we
-   * don't re-spawn for every step open. ~30ms first call, ~0ms cached.
+   * Synchronous PATH check, login-shell-aware (v0.1.12 fix).
+   *
+   * Why login shell: the extension host inherits VS Code app's PATH, NOT
+   * the user's interactive-shell PATH. On macOS, `pip install --user`
+   * puts binaries at `~/Library/Python/3.x/bin/aider` which the user's
+   * `.zshrc` adds to PATH — but VS Code app doesn't pick that up
+   * automatically. Without `bash -lc`, the check would say "aider not
+   * found" even when the user's terminal sees aider just fine. The
+   * symptom: 🔴 toolchain pill rendered persistently even after a
+   * successful auto-run that captured aider's output.
+   *
+   * `bash -lc 'command -v X'` forces a login shell that sources
+   * /etc/profile + ~/.profile + (Debian: ~/.bashrc via .profile chain).
+   * On macOS this picks up Homebrew + pip-user-site additions to PATH.
+   * On Linux, similar story for ~/.local/bin from `pip install --user`.
+   *
+   * Falls back to plain `command -v` if `bash` itself isn't found
+   * (rare — Linux/macOS always have bash; Windows uses `where`).
+   *
+   * Cached per-tool for the session. ~50ms first call (login-shell
+   * startup is slower than dash), ~0ms cached.
    */
   private isToolOnPath(tool: string): boolean {
     if (!tool) return true;
     if (this._toolPathCache.has(tool)) return this._toolPathCache.get(tool)!;
-    const probe = process.platform === "win32" ? `where ${tool}` : `command -v ${tool}`;
     let ok = false;
     try {
-      cp.execSync(probe, {
-        stdio: "ignore",
-        timeout: 2000,
-        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
-      } as cp.ExecSyncOptions);
+      if (process.platform === "win32") {
+        cp.execSync(`where ${tool}`, {
+          stdio: "ignore",
+          timeout: 2000,
+          shell: "cmd.exe",
+        } as cp.ExecSyncOptions);
+      } else {
+        // Login-shell PATH lookup — sees what the user's terminal sees.
+        cp.execSync(`bash -lc 'command -v ${tool}' >/dev/null 2>&1`, {
+          stdio: "ignore",
+          timeout: 3000,
+          shell: "/bin/sh",
+        } as cp.ExecSyncOptions);
+      }
       ok = true;
     } catch {
       ok = false;
     }
     this._toolPathCache.set(tool, ok);
     return ok;
+  }
+
+  /**
+   * Invalidate the per-tool PATH cache. Call after any operation that
+   * might add/remove tools from the user's shell (install, container
+   * reopen). Triggers a fresh login-shell lookup on next isToolOnPath.
+   */
+  clearToolchainCache(): void {
+    this._toolPathCache.clear();
   }
 
   /**
@@ -1058,9 +1093,10 @@ export class CommandHandlers {
       }
     }
 
-    // Mark complete on PASS — fire-and-forget; tree refresh handles the
-    // ✓ icon. Don't auto-advance; the user explicitly asked for detailed
-    // feedback to be visible (matches CLI's `check`-then-`next` flow).
+    // v0.1.12 — restore auto-advance on PASS (the button is named
+    // "Submit & Continue" — auto-advance is the natural semantic).
+    // On FAIL, stay on the step + render the feedback panel so the
+    // learner can iterate.
     if (validated.correct) {
       const score = validated.score ?? 1.0;
       try {
@@ -1071,17 +1107,24 @@ export class CommandHandlers {
         }
       }
       this.tree.refresh();
-      // Brief celebratory toast — full feedback lives in the panel below.
       vscode.window.showInformationMessage(
-        `✓ ${labelOf(step)} complete — score ${Math.round(score * 100)}%. Click Next ▸ when ready.`,
+        `✓ ${labelOf(step)} complete — score ${Math.round(score * 100)}%. Advancing.`,
       );
+      // Advance the cursor + open the next step. The learner can hit
+      // ◂ Previous from the next step's WebView if they want to revisit
+      // the feedback they just got.
+      const cursor = this.state.getCursor(slug);
+      if (cursor) {
+        this.state.setCursor(slug, courseId, cursor.stepIdx + 1);
+      }
+      await this.next(courseId, moduleId, step);
+      return;
     }
 
-    // Re-render the WebView with the validate() response embedded as a
-    // feedback panel above the briefing. PASS or FAIL — the panel shows
-    // the full grader prose, per-item correctness, and (on FAIL) a
-    // collapsed canonical-answer details element. User then clicks
-    // Next ▸ (advance) or Submit & Continue (retry) themselves.
+    // FAIL — re-render the current step with the feedback panel embedded
+    // above the briefing. Pass-or-retry is the learner's call; they
+    // click Submit & Continue again to retry, or ◂ Previous / Next ▸
+    // to navigate elsewhere.
     await this.openStep(courseId, moduleId, step, validated as ValidateResponse);
   }
 
@@ -1216,13 +1259,23 @@ export class CommandHandlers {
     // v0.1.4: reuse the single cached Skillslab terminal across runs
     // instead of spawning fresh per click. Banner separates this run
     // from prior runs in the scrollback.
+    //
+    // v0.1.12: use `echo` instead of `# ...` for the banner. zsh
+    // (default macOS shell) does NOT enable INTERACTIVE_COMMENTS by
+    // default → `#` at the prompt fails with "command not found: #".
+    // `echo "..."` prints the same banner text and works in every shell.
     const term = await this.getOrCreateTerminal(`Skillslab`);
     term.sendText("", false); // ensure we start on a fresh line
-    term.sendText(`# ───── ${labelOf(step)} — ${step.title || ""} ─────`, true);
+    term.sendText(
+      `echo "───── ${labelOf(step)} — ${(step.title || "").replace(/"/g, "\\\"")} ─────"`,
+      true,
+    );
     for (let i = 0; i < cmds.length; i++) {
       const c = cmds[i];
       const isLast = i === cmds.length - 1;
-      term.sendText(`# ${i + 1}/${cmds.length}: ${c.label || ""}`, true);
+      const label = (c.label || "").replace(/"/g, "\\\"");
+      // v0.1.12: echo (not #) so zsh without INTERACTIVE_COMMENTS doesn't error.
+      term.sendText(`echo "  ${i + 1}/${cmds.length}: ${label}"`, true);
       term.sendText(c.cmd, !isLast); // last one: don't auto-press Enter
     }
   }
@@ -1276,9 +1329,11 @@ export class CommandHandlers {
 
     // v0.1.4: reuse the cached terminal — same Skillslab pane across
     // every run, scrollback preserved so the learner can compare runs.
+    // v0.1.12: echo banners (not # comments) — zsh without
+    // INTERACTIVE_COMMENTS fails on `# foo` at the prompt.
     const term = await this.getOrCreateTerminal(`Skillslab`);
     term.sendText("", false);
-    term.sendText(`# ───── ${labelOf(step)} (auto-run) ─────`, true);
+    term.sendText(`echo "───── ${labelOf(step)} (auto-run) ─────"`, true);
 
     // Wait up to 4s for shell integration to come online. If it doesn't,
     // fall back to manual mode — better to surface that path than to
@@ -1290,11 +1345,15 @@ export class CommandHandlers {
           `Falling back to manual mode — run the commands yourself, then click Submit & Continue.`,
       );
       // Type the commands so the learner can run them manually.
-      term.sendText(`# ${labelOf(step)} — manual mode (shell integration unavailable)`, true);
+      term.sendText(
+        `echo "${labelOf(step)} — manual mode (shell integration unavailable)"`,
+        true,
+      );
       for (let i = 0; i < cmds.length; i++) {
         const c = cmds[i];
         const isLast = i === cmds.length - 1;
-        term.sendText(`# ${i + 1}/${cmds.length}: ${c.label || ""}`, true);
+        const label = (c.label || "").replace(/"/g, "\\\"");
+        term.sendText(`echo "  ${i + 1}/${cmds.length}: ${label}"`, true);
         term.sendText(c.cmd, !isLast);
       }
       return;
@@ -1346,6 +1405,7 @@ export class CommandHandlers {
       return;
     }
 
+    // v0.1.12 — auto-advance on PASS, same as submitAndContinue.
     if (validated.correct) {
       const score = validated.score ?? 1.0;
       try {
@@ -1357,13 +1417,20 @@ export class CommandHandlers {
       }
       this.tree.refresh();
       vscode.window.showInformationMessage(
-        `✓ ${labelOf(step)} passed — score ${Math.round(score * 100)}%. Click Next ▸ when ready.`,
+        `✓ ${labelOf(step)} passed — score ${Math.round(score * 100)}%. Advancing.`,
       );
-    } else {
-      vscode.window.showWarningMessage(
-        `${Math.round((validated.score ?? 0) * 100)}% — see feedback in the step panel.`,
-      );
+      const cursor = this.state.getCursor(slug);
+      if (cursor) {
+        this.state.setCursor(slug, courseId, cursor.stepIdx + 1);
+      }
+      await this.next(courseId, moduleId, step);
+      return;
     }
+
+    // FAIL — stay on step, surface feedback in the WebView.
+    vscode.window.showWarningMessage(
+      `${Math.round((validated.score ?? 0) * 100)}% — see feedback in the step panel.`,
+    );
 
     // Re-render the WebView with the validated response so the feedback
     // panel (v0.1.2) shows pass/fail + grader prose + per-token results
