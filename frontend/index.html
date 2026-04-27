@@ -9928,6 +9928,10 @@ async function creatorStart() {
   const statusEl = document.getElementById('creatorUploadStatus');
   btn.disabled = true;
   btn.textContent = 'Starting...';
+  // v3 2026-04-27: sticky busy banner — visible regardless of scroll
+  // position, so the learner doesn't watch a frozen footer button while
+  // waiting on the API.
+  if (typeof _setCreatorBusy === 'function') _setCreatorBusy('Generating clarifying questions…', '~10–15s');
 
   try {
     // Combine all source material: typed text + uploaded files + fetched URLs.
@@ -9937,6 +9941,7 @@ async function creatorStart() {
     if (files.length > 0) {
       btn.textContent = 'Extracting text...';
       if (statusEl) statusEl.textContent = `Uploading ${files.length} file(s)...`;
+      if (typeof _setCreatorBusy === 'function') _setCreatorBusy(`Extracting text from ${files.length} file(s)…`, '~5s');
       const fd = new FormData();
       files.forEach(f => fd.append('files', f));
       const uploadRes = await fetch(`${API}/creator/upload`, { method: 'POST', body: fd });
@@ -10069,8 +10074,14 @@ async function creatorStart() {
       enqueueData = await enqueueRes.json();
       const sid = enqueueData.session_id;
       if (!sid) throw new Error('No session_id returned');
+      // v3 2026-04-27: feed the sticky busy banner with phase progression
+      // so the learner sees ETAs while polling (rather than a frozen UI).
+      if (typeof _setCreatorBusy === 'function') _setCreatorBusy('Drafting the initial outline…', '~10s');
       finalResp = await _pollCreatorTaskUntilDone(sid);
-    } finally { _stopStartPhases(); }
+    } finally {
+      _stopStartPhases();
+      if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
+    }
 
     creatorState.sessionId = enqueueData.session_id;
     // F1 v2 (2026-04-27): persist Step-1 inputs onto creatorState so later
@@ -10093,6 +10104,7 @@ async function creatorStart() {
     btn.disabled = false;
     btn.textContent = 'Start \u2192';
     if (statusEl) statusEl.textContent = 'Error: ' + e.message;
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     alert('Failed to start creator session: ' + e.message);
   }
 }
@@ -10170,6 +10182,8 @@ async function creatorRefine(isRetry) {
   const btn = document.getElementById('creatorRefineBtn');
   btn.disabled = true;
   btn.textContent = isRetry ? 'Retrying...' : 'Refining...';
+  // v3 2026-04-27: sticky busy banner — visible regardless of scroll position.
+  if (typeof _setCreatorBusy === 'function') _setCreatorBusy('Refining outline based on your answers…', '~30–60s');
 
   // Clear any previous inline error
   let errEl = document.getElementById('creatorRefineError');
@@ -10211,6 +10225,7 @@ async function creatorRefine(isRetry) {
     });
 
     _stopRefinePhases();
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     creatorState.refinedOutline = data.outline || { modules: [] };
     creatorState.followUpQuestions = data.follow_up_questions || null;
     creatorState.step = 3;
@@ -10218,6 +10233,7 @@ async function creatorRefine(isRetry) {
     renderCreatorWizard();
   } catch (e) {
     _stopRefinePhases();
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     btn.disabled = false;
     btn.textContent = 'Submit Answers \u2192';
     const parent = btn.parentElement;
@@ -10302,6 +10318,8 @@ async function creatorReRefine() {
   const btn = document.getElementById('creatorReRefineBtn');
   btn.disabled = true;
   btn.textContent = 'Refining...';
+  // v3 2026-04-27: sticky busy banner.
+  if (typeof _setCreatorBusy === 'function') _setCreatorBusy('Re-refining outline with your feedback…', '~30–60s');
 
   // Collect follow-up answers if any
   const fqEls = document.querySelectorAll('.creator-followup-answer');
@@ -10324,6 +10342,7 @@ async function creatorReRefine() {
     });
     if (!res.ok) throw new Error(`Failed: ${res.status}`);
     const data = await res.json();
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
 
     creatorState.refinedOutline = data.outline || creatorState.refinedOutline;
     creatorState.followUpQuestions = data.follow_up_questions || null;
@@ -10335,6 +10354,7 @@ async function creatorReRefine() {
     creatorState._activeModuleIdx = 0;
     renderCreatorWizard();
   } catch (e) {
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     btn.disabled = false;
     btn.textContent = 'Refine Again';
     alert('Failed to refine. Please try again.');
@@ -10346,6 +10366,12 @@ async function creatorGenerate() {
   if (btn) {
     btn.disabled = true;
     btn.textContent = 'Generating...';
+  }
+  // v3 2026-04-27: sticky busy banner. The progress UI further down has
+  // its own per-step feed, but this banner stays visible at the top of
+  // the body even when the learner scrolls away from the progress card.
+  if (typeof _setCreatorBusy === 'function') {
+    _setCreatorBusy('Generating your course… (this takes 5–15 min for full courses)', 'live progress below');
   }
 
   const body = document.getElementById('creatorBody');
@@ -10441,11 +10467,13 @@ async function creatorGenerate() {
     creatorState.generatedCourse = null;
     creatorState.step = 4;
     _clearCreatorDraft();  // 2026-04-21: course persisted, drop the in-progress draft
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     renderCreatorWizard();
     // Product feature 2026-04-20: kick off the auto-review banner poller.
     try { startReviewStatusPolling(courseId); } catch (_) {}
   } catch (e) {
     stopPolling = true;
+    if (typeof _setCreatorBusy === 'function') _setCreatorBusy(null);
     const errMsg = String(e && e.message || e);
     body.innerHTML = `<div class="creator-loading" style="color:var(--error)">
       <p>Failed to generate course: ${esc(errMsg)}</p>

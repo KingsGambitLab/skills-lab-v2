@@ -97,10 +97,63 @@
 
 .creator-page .creator-body {
   flex: 1 1 auto;
-  padding: 18px 40px 88px;  /* tighter top — chrome is now compact, no need for breathing space */
+  /* User feedback 2026-04-27: "Add a small buffer b/w header and q&A divs"
+     — bumped top padding from 18px → 32px so the topbar (sticky border)
+     and the first content section have a clear visual gap. */
+  padding: 32px 40px 88px;
   max-width: none;
   margin: 0;
   background: var(--bg-primary);
+}
+
+/* ── Sticky busy-banner (shows during async API waits — v3, 2026-04-27) ──
+   User feedback: "Since API req. takes time and the CTA is out of fold at
+   times, can we show an interactive loader somewhere with more visibility
+   once the step data has been provided and the creator is waiting for
+   next steps."
+
+   Banner mounts just below the topbar (sticky top:0 inside the body's
+   scroll context) so it's always visible regardless of whether the
+   footer CTA scrolled below the fold. Full-width strip with spinner +
+   live status text. Hidden by default; _setCreatorBusy(text) toggles. */
+.creator-busy-banner {
+  position: sticky;
+  top: 0;
+  z-index: 9;
+  margin: -32px -40px 24px;  /* negative margins = extend to viewport edges; offset undoes the body padding */
+  padding: 14px 40px;
+  background: linear-gradient(180deg, rgba(74, 124, 255, 0.15), rgba(74, 124, 255, 0.05));
+  border-bottom: 1px solid rgba(74, 124, 255, 0.4);
+  display: none;  /* JS toggles to flex */
+  align-items: center;
+  gap: 14px;
+  font-size: 0.92rem;
+  color: var(--text-primary);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.18);
+}
+.creator-busy-banner.visible { display: flex; }
+.creator-busy-banner .creator-busy-spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(74, 124, 255, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: creator-busy-spin 0.8s linear infinite;
+  flex: 0 0 auto;
+}
+.creator-busy-banner .creator-busy-text {
+  flex: 1 1 auto;
+  font-weight: 500;
+}
+.creator-busy-banner .creator-busy-eta {
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-weight: 500;
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+@keyframes creator-busy-spin {
+  to { transform: rotate(360deg); }
 }
 
 /* ── Two-column shell (Steps 1, 2, 3) ────────────────────────────── */

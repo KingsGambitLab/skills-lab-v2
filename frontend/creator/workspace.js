@@ -100,7 +100,15 @@
           <div class="creator-steps-bar" id="creatorStepsBar"></div>
           <span class="creator-page-savepill" id="creatorPageSavePill">Drafts auto-save</span>
         </div>
-        <div class="creator-body" id="creatorBody"></div>
+        <div class="creator-body" id="creatorBody">
+          <!-- v3 2026-04-27: sticky busy banner — visible during API waits
+               regardless of scroll position. Toggled via _setCreatorBusy. -->
+          <div class="creator-busy-banner" id="creatorBusyBanner" role="status" aria-live="polite">
+            <div class="creator-busy-spinner" aria-hidden="true"></div>
+            <span class="creator-busy-text" id="creatorBusyText">Working...</span>
+            <span class="creator-busy-eta" id="creatorBusyEta"></span>
+          </div>
+        </div>
         <div class="creator-page-footer" id="creatorPageFooter"></div>
       </div>`;
 
@@ -112,9 +120,60 @@
     }
   };
 
+  // ── Sticky busy banner (v3, 2026-04-27) ───────────────────────────
+  // Visible loader during async API waits. Mounts as the first child of
+  // .creator-body so it's sticky to the top of the body's scroll context
+  // — visible no matter where the user is on the page. Re-injected on
+  // every renderCreatorWizard since `body.innerHTML = ...` clobbers it.
+
+  function _ensureBusyBanner() {
+    const body = document.getElementById('creatorBody');
+    if (!body) return null;
+    let banner = document.getElementById('creatorBusyBanner');
+    if (!banner) {
+      banner = document.createElement('div');
+      banner.id = 'creatorBusyBanner';
+      banner.className = 'creator-busy-banner';
+      banner.setAttribute('role', 'status');
+      banner.setAttribute('aria-live', 'polite');
+      banner.innerHTML = `
+        <div class="creator-busy-spinner" aria-hidden="true"></div>
+        <span class="creator-busy-text" id="creatorBusyText">Working...</span>
+        <span class="creator-busy-eta" id="creatorBusyEta"></span>`;
+      body.insertBefore(banner, body.firstChild);
+    }
+    return banner;
+  }
+
+  /**
+   * Toggle the sticky busy banner.
+   *   _setCreatorBusy('Generating outline...', '~10s')  → show with text + ETA
+   *   _setCreatorBusy('Generating...')                  → show with text, no ETA
+   *   _setCreatorBusy(null)                             → hide
+   */
+  window._setCreatorBusy = function _setCreatorBusy(text, eta) {
+    const banner = _ensureBusyBanner();
+    if (!banner) return;
+    if (text) {
+      const t = document.getElementById('creatorBusyText');
+      const e = document.getElementById('creatorBusyEta');
+      if (t) t.textContent = text;
+      if (e) e.textContent = eta || '';
+      banner.classList.add('visible');
+    } else {
+      banner.classList.remove('visible');
+    }
+  };
+
   // ── Wizard dispatcher ──────────────────────────────────────────────
 
   window.renderCreatorWizard = function renderCreatorWizard() {
+    // v3 2026-04-27 fix #3 — save current step's DOM values BEFORE we
+    // clobber innerHTML. Otherwise navigating step3→step1 (or any
+    // back-nav after typing) destroys the in-progress text. _saveCreatorDraft
+    // reads from the live DOM into localStorage; safe to call repeatedly.
+    if (typeof _saveCreatorDraft === 'function') _saveCreatorDraft();
+
     if (typeof renderCreatorStepsBar === 'function') renderCreatorStepsBar();
     const body = document.getElementById('creatorBody');
     if (!body) return;
@@ -136,6 +195,16 @@
     else if (creatorState.step === 4) body.innerHTML = renderCreatorStep4();
 
     renderCreatorFooter();
+
+    // v3 2026-04-27 fix #3 — re-mount the sticky busy banner (innerHTML
+    // wiped it) and re-apply any persisted draft into the freshly-rendered
+    // inputs. Without this, navigating step3→step1 lands on empty fields
+    // even though the data is in localStorage and creatorState.
+    _ensureBusyBanner();
+    const draft = (typeof _loadCreatorDraft === 'function') ? _loadCreatorDraft() : null;
+    if (draft && draft.fields && typeof _applyCreatorDraftToDOM === 'function') {
+      _applyCreatorDraftToDOM(draft);
+    }
   };
 
   window.renderCreatorFooter = function renderCreatorFooter() {
