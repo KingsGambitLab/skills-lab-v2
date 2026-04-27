@@ -41,6 +41,9 @@ from rich.table import Table
 from . import api, state, __version__
 from .check import run_check
 from .render import step_to_markdown
+from . import theme as _theme
+from .views import render_step_card, render_celebration, render_toc
+from .rules import section_rule, step_boundary_rule
 
 console = Console()
 
@@ -398,6 +401,11 @@ def start(slug: str):
     # content. Fresh start = fresh attempt counts.
     state.reset_attempts(slug)
 
+    # 2026-04-27 — set the iTerm tab title so multi-tab users see which
+    # course is loaded. Emits OSC 0 only on iTerm (no-op elsewhere).
+    th = _theme.theme_for(slug)
+    _theme.emit_tab_title(console, f"skillslab · {slug}")
+
     console.print(f"[green]✓ Wrote {written} step files to[/green] {cdir / 'steps'}")
     console.print(f"[dim]ls {cdir / 'steps'}[/dim]")
     # Don't dump every module's discovered repo here — earlier iteration did,
@@ -646,6 +654,48 @@ def _next_action(slug: str, meta: dict, step: dict | None,
     return actions
 
 
+def _print_step_card(slug: str, step: dict | None, meta: dict | None = None) -> None:
+    """Print the unified step opening card (theme-accented Panel).
+
+    Replaces the previous per-command inline header blocks. Threaded
+    through `status`, `spec`, `now`, `next`. The card carries:
+      - M.S label + step title
+      - surface badge (TERMINAL ⌨ / WEB 🌐)
+      - exercise type
+      - attempt counter (n+1) when the learner has previously submitted
+
+    Also emits the iTerm tab title (no-op elsewhere) and an OSC SetMark
+    so cmd-shift-↑/↓ in iTerm jumps between step boundaries.
+
+    Per buddy-Opus 2026-04-27: theme-first, capability-declared. Plain-
+    ASCII fallback handled inside render_step_card itself.
+    """
+    if step is None:
+        return
+    th = _theme.theme_for(slug)
+    caps = _theme.current(console)
+    # Attempt count — feed the per-step counter from state so the
+    # card shows "attempt 2" / "attempt 3" appropriately.
+    sid = step.get("id") or step.get("step_id")
+    attempt_count = state.get_attempt(slug, sid) if sid is not None else 0
+    course_label = (meta or {}).get("course_title") or th.label
+    panel = render_step_card(
+        step=step,
+        theme=th,
+        caps=caps,
+        attempt_count=attempt_count,
+        course_label=course_label,
+    )
+    # Tab title — instant breadcrumb in multi-tab terminals
+    mod_pos = int(step.get("module_pos", 1) or 1)
+    step_pos = int(step.get("step_pos", 1) or 1)
+    label = f"M{mod_pos - 1}.S{step_pos}"
+    _theme.emit_tab_title(console, f"skillslab · {slug} · {label}")
+    # Step boundary mark (cmd-shift-↑ in iTerm)
+    _theme.emit_set_mark(console)
+    console.print(panel)
+
+
 def _print_next_actions(actions: list[tuple[str, str]]) -> None:
     """Render the (verb, command) list as a HIGHLIGHTED 'Next' panel.
 
@@ -808,13 +858,11 @@ def status(ctx, course):
         border_style="cyan", box=box.ROUNDED,
     ))
     if step:
-        m_pos = step.get("module_pos", 0)
-        s_pos = step.get("step_pos", 0)
-        label = f"M{m_pos - 1}.S{s_pos}"
+        # 2026-04-27 — unified step card replaces the inline header. Theme-
+        # accented Panel; attempt counter; iTerm marks + tab title; same
+        # visual language across status / spec / now / next.
+        _print_step_card(slug, step, meta)
         surface = _step_surface(step)
-        console.print(f"\n▸ [bold cyan]{label}[/bold cyan] — {step.get('title','')}")
-        console.print(f"  type: [yellow]{step.get('exercise_type')}[/yellow]    "
-                      f"surface: [{'magenta' if surface == 'web' else 'green'}]{surface.upper()}[/]")
         # Module-repo context (same data the browser banner shows). Captured
         # at start time + cached in meta.json's per-step entries.
         if step.get("module_repo_url"):
@@ -863,29 +911,19 @@ def spec(ctx, course, no_pager):
     # surface a tidy header from `step` instead.
     md_body = _strip_frontmatter(md)
 
-    # Build the styled header (replaces the YAML wall of escapes).
-    m_pos = step.get("module_pos", 0)
-    s_pos = step.get("step_pos", 0)
-    label = f"M{m_pos - 1}.S{s_pos}"
+    # 2026-04-27 — unified step card. Theme-accented Panel + iTerm marks
+    # + tab title + attempt counter. Replaces the previous inline header.
+    console.print()
+    _print_step_card(slug, step, meta)
+    # Module-repo context (still useful on spec — clone hint right after card)
     repo_url = step.get("module_repo_url")
     repo_ref = step.get("module_repo_ref")
-    header_lines = [
-        f"[bold cyan]{label}[/bold cyan] — [bold]{step.get('title','')}[/bold]",
-        f"[dim]module:[/dim] {step.get('module_title','')}    "
-        f"[dim]type:[/dim] [yellow]{step.get('exercise_type','concept')}[/yellow]    "
-        f"[dim]step id:[/dim] [cyan]{step.get('id')}[/cyan]",
-    ]
     if repo_url:
         ref_str = f"  (branch: [yellow]{repo_ref}[/yellow])" if repo_ref else ""
-        header_lines.append(
+        console.print(
             f"[dim]📦 Module repo:[/dim] [cyan]{repo_url}[/cyan]{ref_str}\n"
-            f"[dim]Clone:[/dim]  [bold]git clone {repo_url}.git[/bold]"
+            f"[dim]Clone:[/dim]  [bold]git clone {repo_url}.git[/bold]\n"
         )
-    console.print()
-    console.print(Panel(
-        "\n".join(header_lines),
-        border_style="cyan", box=box.ROUNDED, padding=(0, 1),
-    ))
 
     if surface == "web":
         # For web steps, only show first heading + first paragraph (the
@@ -943,20 +981,17 @@ def now_cmd(ctx, course):
     meta, cur, step = _load_cursor(slug)
     _check_content_etag(slug, meta)  # warn if local cache is stale
     total = len(meta.get("steps", []))
-    label = f"M{step.get('module_pos', 1) - 1}.S{step.get('step_pos', 0)}" if step else "—"
-    surface = _step_surface(step) if step else "?"
-    surface_color = "magenta" if surface == "web" else "green"
-    title_line = (
-        f"[bold]{meta.get('course_title','')}[/bold]\n"
-        f"[dim]cursor:[/dim] step [bold]{cur + 1}[/bold] of {total}    "
-        f"[dim]current:[/dim] [bold cyan]{label}[/bold cyan] "
-        f"([{surface_color}]{surface.upper()}[/])\n"
-        f"[bold]{step.get('title','—')}[/bold]"
-    )
-    if step.get("module_repo_url"):
-        title_line += f"\n[dim]📦 module repo:[/dim] [cyan]{step['module_repo_url']}[/cyan]"
+    # Course progress one-liner (cursor position + total)
     console.print()
-    console.print(Panel(title_line, border_style="cyan", box=box.ROUNDED, padding=(0, 1)))
+    console.print(
+        f"[dim]cursor:[/dim] step [bold]{cur + 1}[/bold] of {total}    "
+        f"[bold]{meta.get('course_title','')}[/bold]"
+    )
+    # 2026-04-27 — unified step card replaces the inline title-line.
+    # Theme accent + attempt counter + iTerm marks + tab title.
+    _print_step_card(slug, step, meta)
+    if step and step.get("module_repo_url"):
+        console.print(f"[dim]📦 module repo:[/dim] [cyan]{step['module_repo_url']}[/cyan]")
     # caller="now" — `now` is itself an "answer the question" cmd, so we
     # don't prune `now`, but we still pass the kwarg for symmetry/clarity.
     actions = _next_action(slug, meta, step, caller="now")
@@ -982,23 +1017,15 @@ def next_cmd(ctx, course):
     meta["last_active_at"] = _now_iso()
     state.write_meta(slug, meta)
     s = steps[cur + 1]
+    th = _theme.theme_for(slug)
     label = f"M{s['module_pos']-1}.S{s['step_pos']}"
-    surface = _step_surface(s)
-    surface_color = "magenta" if surface == "web" else "green"
-    # 2026-04-25 v3 — visual separator so learners can SEE where the next
-    # assignment starts in their scrollback. User-filed live walk request:
-    # "let's add line breaks where needed... after every skillslab next
-    # command, let's add linebreaks and formatting to make it easy to
-    # understand where next assignment started".
+    # 2026-04-25 v3 → 2026-04-27: visual separator + step boundary mark
+    # so iTerm cmd-shift-↑ jumps between step boundaries. Replaces the
+    # plain Rule + 3-line meta block with a unified step card.
     console.print()
-    console.print(Rule(f"[bold cyan]{label}[/bold cyan] — {s['title']}",
-                       style="cyan"))
+    step_boundary_rule(console, label=label, title=s.get("title", ""), theme=th)
     console.print()
-    console.print(
-        f"[dim]surface:[/dim] [{surface_color}]{surface.upper()}[/]    "
-        f"[dim]type:[/dim] [yellow]{s.get('exercise_type','concept')}[/yellow]    "
-        f"[dim]step id:[/dim] [cyan]{s.get('id') or s.get('step_id')}[/cyan]"
-    )
+    _print_step_card(slug, s, meta)
     # 2026-04-25 — replaced the dim-grey hint with a highlighted CTA panel.
     # caller="next" prunes "Advance → skillslab next" (they just advanced).
     actions = _next_action(slug, meta, s, caller="next")
@@ -1023,6 +1050,51 @@ def prev_cmd(ctx, course):
     state.write_meta(slug, meta)
     s = meta["steps"][cur - 1]
     console.print(f"[green]←[/green] M{s['module_pos']-1}.S{s['step_pos']} — {s['title']}")
+
+
+@cli.command(name="toc")
+@click.option("--course", default=None)
+@click.pass_context
+def toc_cmd(ctx, course):
+    """Print a course outline — what's done, what's active, what's next.
+
+    \b
+    Examples:
+      skillslab toc                # for the default / most-recent course
+      skillslab toc --course kimi  # for a specific course
+
+    Three-state per step:
+      ✓  done       — graded correct + advanced past
+      ▶  active     — the cursor is here right now
+      ◯  pending    — not yet reached
+
+    Score appears next to graded steps. Use this any time you want a
+    bird's-eye view of where you are without losing your place.
+    """
+    slug = course or ctx.obj.get("course") or _resolve_course(None)[0]
+    meta = state.read_meta(slug)
+    if not meta:
+        console.print(f"[red]No active state for {slug}. Run [bold]skillslab start {slug}[/bold] first.[/red]")
+        sys.exit(2)
+    # Cursor-based "done" inference: every step at index < cursor is done.
+    # Cursor index = active. Index > cursor = pending. Live LMS scores
+    # would be ideal but the cli api doesn't surface them yet; the cursor
+    # is good-enough for the bird's-eye view this command provides.
+    cursor_idx = int(meta.get("cursor", 0) or 0)
+    progress: dict = {}
+    for idx, s in enumerate(meta.get("steps", []) or []):
+        sid = s.get("id") or s.get("step_id")
+        if sid is None:
+            continue
+        progress[str(sid)] = {
+            "completed": idx < cursor_idx,
+            "score": None,
+        }
+    th = _theme.theme_for(slug)
+    caps = _theme.current(console)
+    panel = render_toc(meta=meta, progress=progress, theme=th, caps=caps)
+    console.print()
+    console.print(panel)
 
 
 @cli.command()
@@ -1132,27 +1204,45 @@ def check(ctx, course, paste, cwd, verbose):
         score = result.get("score") or 1.0
         try:
             api.mark_step_complete(step.get("step_id"), score=int(round(score * 100)) if isinstance(score, float) else score)
-            console.print(f"[green]✓ Step complete[/green] — synced to dashboard")
-            # Advance
+            # Advance the cursor BEFORE rendering the celebration so the
+            # course-progress bar reflects the just-passed step.
+            advanced_to_next = False
+            nxt = None
             if cur + 1 < len(meta.get("steps", [])):
                 meta["cursor"] = cur + 1
                 meta["last_active_at"] = _now_iso()
                 state.write_meta(slug, meta)
                 nxt = meta["steps"][cur + 1]
-                label = f"M{nxt['module_pos']-1}.S{nxt['step_pos']}"
-                console.print(f"\n[green]→[/green] [bold cyan]{label}[/bold cyan] — [bold]{nxt['title']}[/bold]")
-                # 2026-04-25 v3 — CLI-walk v2 caught: this branch was the
-                # last "flat dim CTA" remnant after v2 upgraded next / now /
-                # status / spec to Panel. Same one-line fix as P1-5 — the
-                # post-pass message is one of the most-rewarded moments
-                # (learner just succeeded), so keeping it visually
-                # consistent reinforces the loop.
-                # caller="check" prunes "Run + grade → skillslab check" —
-                # they just passed it; show the NEW step's actions.
-                actions = _next_action(slug, meta, nxt, caller="check")
-                _print_next_actions(actions)
-            else:
-                console.print(f"\n[bold green]🎉 Course complete![/bold green]")
+                advanced_to_next = True
+            # 2026-04-27 — earned-it celebration replaces the flat "✓ Step
+            # complete" + "→ Next: M.S — title" lines. Theme-accented
+            # Panel with score + course progress bar + next-step pointer.
+            # Per-buddy-Opus: this renderer is independent + reverts
+            # cleanly via views/celebration.py.
+            th = _theme.theme_for(slug)
+            caps = _theme.current(console)
+            total_steps = len(meta.get("steps", []) or [])
+            completed_count = (cur + 1) if advanced_to_next else total_steps
+            console.print()
+            celeb = render_celebration(
+                step=step,
+                theme=th,
+                caps=caps,
+                score=float(result.get("score") or 1.0),
+                elapsed_seconds=None,  # TODO: track step-open timestamp
+                course_completed=completed_count,
+                course_total=total_steps,
+                next_step_label=(f"M{nxt['module_pos']-1}.S{nxt['step_pos']}" if nxt else None),
+                next_step_title=(nxt.get("title") if nxt else None),
+            )
+            console.print(celeb)
+            # Tab title flips to the next step (so the multi-tab user
+            # sees they advanced).
+            if nxt:
+                _theme.emit_tab_title(
+                    console,
+                    f"skillslab · {slug} · M{nxt['module_pos']-1}.S{nxt['step_pos']}",
+                )
         except api.ApiError as e:
             console.print(f"[yellow]Pass detected, but sync failed:[/yellow] {e}")
     else:

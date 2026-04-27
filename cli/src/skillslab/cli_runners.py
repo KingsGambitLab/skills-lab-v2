@@ -162,8 +162,15 @@ def run_cli_commands(
                         console.print()
 
     if console:
-        console.print()
-        console.print(f"[bold cyan]▶ Running {len(normalized)} command{'s' if len(normalized)!=1 else ''} from validation.cli_commands[/bold cyan]")
+        # 2026-04-27 — replaced the bold-cyan one-liner with a section_rule
+        # so the boundary is visible in scrollback (and OSC-marked for iTerm
+        # users — cmd-shift-↑ jumps between rules).
+        from .rules import section_rule
+        section_rule(
+            console,
+            f"Running {len(normalized)} command{'s' if len(normalized)!=1 else ''} from validation.cli_commands",
+            mark=True,
+        )
         console.print(f"[dim]Working directory: {cwd}[/dim]")
         console.print()
 
@@ -226,6 +233,10 @@ def run_cli_commands(
     if console:
         passed = sum(1 for r in summary.results if r.exit_code == 0)
         total = len(summary.results)
+        # 2026-04-27 — section_rule before the summary so the run/summary
+        # boundary is visible in scrollback.
+        from .rules import section_rule
+        section_rule(console, f"Run summary — {passed}/{total} commands passed")
         line = f"[bold]Summary:[/bold] {passed}/{total} commands ran successfully"
         if summary.all_passed:
             console.print(f"[green]{line} ✓[/green]")
