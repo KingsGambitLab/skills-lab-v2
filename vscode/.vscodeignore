@@ -1,0 +1,7 @@
+**/*.ts
+**/*.map
+**/tsconfig.json
+**/.eslintrc*
+**/node_modules
+**/tests/**
+**/.git/**

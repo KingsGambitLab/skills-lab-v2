@@ -9,6 +9,7 @@ Current modules:
 """
 from .beginner_agent import build_prompt, ARTIFACT_DIR, default_artifact_path
 from . import cli_walk_agent
+from . import vscode_walk_agent
 from . import domain_expert
 
 __all__ = [
@@ -16,5 +17,6 @@ __all__ = [
     "ARTIFACT_DIR",
     "default_artifact_path",
     "cli_walk_agent",
+    "vscode_walk_agent",
     "domain_expert",
 ]

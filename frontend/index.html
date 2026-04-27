@@ -4658,9 +4658,32 @@ function renderTerminalNativePanel(rawStep, index) {
       </div>
       ` : ''}
 
-      <div style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:24px; color:#e8ecf4;">
+      <!-- 2026-04-27 — additive picker: same step, two ways to work it.
+           Buttons let the learner pick TERMINAL or VS Code without touching
+           any core LMS — both link to existing entry points. -->
+      <div style="display:flex; gap:12px; flex-wrap:wrap; margin-top:24px;">
+        <button onclick="document.getElementById('skl-mode-terminal').scrollIntoView({behavior:'smooth'})"
+                style="flex:1; min-width:200px; background:linear-gradient(180deg,#1e2538,#161b26); border:1px solid #2dd4bf; border-radius:10px; padding:16px 20px; color:#e8ecf4; cursor:pointer; text-align:left;">
+          <div style="font-size:11px; color:#2dd4bf; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;">⌨  Terminal</div>
+          <div style="font-weight:600; font-size:14px;">Use the skillslab CLI</div>
+          <div style="font-size:12px; color:#8892a8; margin-top:4px;">docker compose run · pure shell</div>
+        </button>
+        <a href="vscode://tusharbisht1391.skillslab/course/${esc(state.currentCourse && state.currentCourse.id || '')}?step=${esc(String(rawStep.id || ''))}"
+           style="flex:1; min-width:200px; background:linear-gradient(180deg,#1e2538,#161b26); border:1px solid #4a7cff; border-radius:10px; padding:16px 20px; color:#e8ecf4; cursor:pointer; text-align:left; text-decoration:none; display:block;">
+          <div style="font-size:11px; color:#4a7cff; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:6px;">●  VS Code</div>
+          <div style="font-weight:600; font-size:14px;">Open in VS Code</div>
+          <div style="font-size:12px; color:#8892a8; margin-top:4px;">extension required · install once</div>
+        </a>
+      </div>
+      <div style="margin-top:8px; font-size:12px; color:#8892a8;">
+        Don't have the VS Code extension yet?
+        <a href="https://github.com/KingsGambitLab/skills-lab-v2/releases" target="_blank" style="color:#4a7cff;">Download .vsix</a>
+        or <a href="https://github.com/KingsGambitLab/skills-lab-v2/blob/main/vscode/README.md" target="_blank" style="color:#4a7cff;">read the docs</a>.
+      </div>
+
+      <div id="skl-mode-terminal" style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:24px; margin-top:24px; color:#e8ecf4;">
         <div style="font-size:12px; color:#a3d8ff; text-transform:uppercase; letter-spacing:0.5px; margin-bottom:12px;">
-          ▶ How to do this step
+          ▶ How to do this step (terminal)
         </div>
         <p style="margin:0 0 14px 0; line-height:1.6;">
           The work happens in <strong>your terminal</strong>, not the browser. The
