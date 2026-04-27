@@ -4744,6 +4744,27 @@ function _runWidgetScripts(container) {
       const domReadyRegex = /(?:document|window)\s*\.\s*addEventListener\s*\(\s*['"]DOMContentLoaded['"]\s*,\s*(?:function\s*\(\s*\)\s*|\(\s*\)\s*=>\s*)\{([\s\S]*)\}\s*\)\s*;?\s*$/;
       const m = code.trim().match(domReadyRegex);
       if (m) code = `(function(){${m[1]}})();`;
+      // 2026-04-27 v7 — Outer-IIFE unwrap. The Creator sometimes emits
+      // `(function(){ function fn(){...} })();` patterns. The hoist regex
+      // below DOES find `fn` by name, BUT the resulting `typeof fn`
+      // check at the outer scope can't see fn (it's IIFE-scoped),
+      // so the hoist silently no-ops and inline `onclick="fn()"` fails.
+      // Strip the OUTERMOST IIFE wrapper so function decls land at the
+      // top scope where typeof can find them. Catches all 3 shapes:
+      //   (function(){...})();
+      //   (function(){...}());
+      //   ;(function(){...})();
+      // Idempotent — only strips when the WHOLE script is one IIFE.
+      // (User caught: jspring M0.S1 generateComparison button silent
+      // because the script was `(function(){ function generateComparison(){...} })();`.)
+      // Match BOTH IIFE call shapes:
+      //   (function(){...})()    — call AFTER close-paren (Crockford style)
+      //   (function(){...}())    — call INSIDE close-paren (Douglas Crockford alt)
+      // The alternation `(?:\)\s*\(\s*\)|\(\s*\)\s*\))` covers both.
+      const _outerIIFE = code
+        .trim()
+        .match(/^[;\s]*\(\s*function\s*\(\s*\)\s*\{([\s\S]*)\}\s*(?:\)\s*\(\s*\)|\(\s*\)\s*\))\s*;?\s*$/);
+      if (_outerIIFE) code = _outerIIFE[1];
       const _hoistShapes = [
         /(?:^|\n)\s*function\s+([a-zA-Z_$][\w$]*)\s*\(/g,
         /(?:^|\n)\s*(?:const|let|var)\s+([a-zA-Z_$][\w$]*)\s*=\s*(?:async\s+)?(?:function\b|\([^)]*\)\s*=>|[a-zA-Z_$][\w$]*\s*=>)/g,
