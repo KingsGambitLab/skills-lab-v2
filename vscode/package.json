@@ -2,7 +2,7 @@
   "name": "skillslab",
   "displayName": "Skillslab — AI-Augmented Engineering Courses",
   "description": "Walk Claude Code / Aider / Spring Boot courses in VS Code without leaving the editor. Same BYO-key model as the CLI — your Anthropic key stays in OS keychain; we never see it.",
-  "version": "0.1.6",
+  "version": "0.1.7",
   "publisher": "tusharbisht1391",
   "engines": {
     "vscode": "^1.85.0"

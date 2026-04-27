@@ -403,18 +403,9 @@ export class CommandHandlers {
           "Continue in current workspace",
         );
         if (choice === "Clone & Reopen in Container") {
-          try {
-            this._toolPathCache.clear();
-            await vscode.commands.executeCommand(
-              "remote-containers.cloneInVolume",
-              vscode.Uri.parse(repo.repoUrl),
-            );
-            return; // VS Code reloads the window post-clone; rest of flow runs there
-          } catch (e: any) {
-            vscode.window.showWarningMessage(
-              `Auto-clone unavailable (Dev Containers extension required). Manually: git clone ${repo.repoUrl} && code <folder>`,
-            );
-          }
+          this._toolPathCache.clear();
+          await this.invokeCloneInVolume(repo.repoUrl);
+          return; // VS Code reloads the window post-clone; rest of flow runs there
         }
       } else {
         // Already in the right folder — just nudge "Reopen in Container"
@@ -565,18 +556,8 @@ export class CommandHandlers {
         "Cancel",
       );
       if (choice !== "Clone & Reopen in Container") return;
-      try {
-        await vscode.commands.executeCommand(
-          "remote-containers.cloneInVolume",
-          vscode.Uri.parse(repo.repoUrl),
-        );
-        return;
-      } catch (e: any) {
-        vscode.window.showWarningMessage(
-          `Auto-clone unavailable. Run manually: Cmd-Shift-P → "Dev Containers: Clone Repository in Container Volume" → paste ${repo.repoUrl}`,
-        );
-        return;
-      }
+      await this.invokeCloneInVolume(repo.repoUrl);
+      return;
     }
 
     // Case C — no devcontainer + course unknown. Surface the manual path.
@@ -587,13 +568,80 @@ export class CommandHandlers {
     );
     if (choice === "Open Clone Command") {
       // Surface the canonical command-palette entry; user pastes their repo URL.
-      try {
-        await vscode.commands.executeCommand("remote-containers.cloneInVolume");
-      } catch (e: any) {
-        vscode.window.showErrorMessage(
-          `Run manually: Cmd-Shift-P → "Dev Containers: Clone Repository in Container Volume" → paste your course-repo URL.`,
+      await this.invokeCloneInVolume(undefined);
+    }
+  }
+
+  /**
+   * v0.1.7 — single canonical entry point for invoking the Dev Containers
+   * extension's "Clone Repository in Container Volume" command. Handles:
+   *
+   *   1. Extension-not-installed detection — surfaces an Install CTA
+   *      pointing at `ms-vscode-remote.remote-containers` instead of
+   *      letting the executeCommand call throw with an opaque error.
+   *
+   *   2. Arg-shape variations — the command accepts a STRING URL
+   *      (verified against Dev Containers v0.454.0). v0.1.6 passed a
+   *      `vscode.Uri.parse(...)` object which the command rejected
+   *      → caught, fired the unhelpful "Auto-clone unavailable" toast.
+   *      Now we pass the raw string; if that still fails, fall through
+   *      to invoking without args so the extension prompts for the URL.
+   *
+   *   3. Manual-fallback message that's actually copy-pasteable —
+   *      includes the verbatim Cmd-Shift-P command and the URL on
+   *      separate lines so the learner doesn't have to parse a
+   *      run-on toast.
+   */
+  private async invokeCloneInVolume(repoUrl: string | undefined): Promise<void> {
+    const ext = vscode.extensions.getExtension("ms-vscode-remote.remote-containers");
+    if (!ext) {
+      const choice = await vscode.window.showWarningMessage(
+        `The "Dev Containers" extension (ms-vscode-remote.remote-containers) is required for clone-and-reopen. Install it?`,
+        "Install Dev Containers",
+        "Cancel",
+      );
+      if (choice === "Install Dev Containers") {
+        await vscode.commands.executeCommand(
+          "workbench.extensions.installExtension",
+          "ms-vscode-remote.remote-containers",
+        );
+        vscode.window.showInformationMessage(
+          `Dev Containers installed. Click "Clone & Reopen in Container" again to retry.`,
         );
       }
+      return;
+    }
+    // Extension is installed. Try with the URL string first; on failure,
+    // fall through to no-arg (extension shows its own URL prompt).
+    if (repoUrl) {
+      try {
+        await vscode.commands.executeCommand(
+          "remote-containers.cloneInVolume",
+          repoUrl,
+        );
+        return;
+      } catch (e: any) {
+        // String arg didn't take — log + fall through to no-arg variant.
+        // Don't surface the raw error to the learner; the no-arg path
+        // gives them the URL prompt they need.
+        console.warn("[skillslab] cloneInVolume(string) failed:", e);
+      }
+    }
+    try {
+      await vscode.commands.executeCommand("remote-containers.cloneInVolume");
+      // The command's own UI takes over; if learner needs the URL,
+      // surface it as a separate copy-pasteable message.
+      if (repoUrl) {
+        vscode.window.showInformationMessage(
+          `Paste this URL when prompted: ${repoUrl}`,
+        );
+      }
+    } catch (e: any) {
+      vscode.window.showErrorMessage(
+        `Could not invoke Dev Containers clone command: ${e?.message || e}. ` +
+          `Run manually: Cmd-Shift-P → "Dev Containers: Clone Repository in Container Volume"` +
+          (repoUrl ? ` → paste ${repoUrl}` : ""),
+      );
     }
   }
 
