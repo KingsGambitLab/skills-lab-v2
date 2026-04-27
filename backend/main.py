@@ -3892,6 +3892,65 @@ F1 — **Never invent CLI commands, subcommands, or flags.** This bit the course
      ("configure your credentials per the tool's login flow"). Invented CLI
      syntax is the #1 trust-breaker on first CLI touch.
 
+F4 — **The toolchain install IS the first lesson, not glossed-over setup.**
+     User directive 2026-04-27 (verbatim): "The installation path / journey
+     will be important for learners to learn themself, since they should know
+     everything to apply skillset outside practice." For any course requiring
+     CLI tooling (aider, claude, gh, python, java, mvn, etc.), the M0 module
+     MUST be a guided host-install lesson — NOT a "we provide a devcontainer,
+     skip this" abstraction. Specifically:
+
+     1. **Per-OS install steps.** Cover macOS (brew + python3.11 / pyenv path),
+        Linux (apt / package-manager + ~/.local/bin PATH), Windows (winget +
+        WSL2 caveat). Don't ship a single "pip install X" line that breaks for
+        2/3 of learners. Each tool gets a per-OS block in the briefing.
+
+     2. **PATH troubleshooting is a graded skill.** The #1 install failure is
+        "I ran `pip install aider-chat` but `aider --version` says command not
+        found." This is a real workplace skill. Each install step's briefing
+        MUST include a "If `<tool> --version` says command not found AFTER
+        install, here's why" section: where pip / npm / brew put the binary
+        per OS, how to add to PATH (`echo 'export PATH=...' >> ~/.zshrc`),
+        how to verify (`which <tool>`).
+
+     3. **Tool version checks.** `python3 --version` should return Python
+        3.10+ (Aider's minimum). macOS often ships 3.9. Briefings MUST teach
+        the version-check + remediation (brew python@3.11 OR pyenv) — NOT
+        assume the learner already has the right version.
+
+     4. **API key setup as a first-class step.** ANTHROPIC_API_KEY /
+        OPENROUTER_API_KEY / GITHUB_TOKEN belong in the learner's `~/.zshrc`
+        (or platform equivalent). Briefings should show: where to get the key
+        (console.anthropic.com / openrouter.ai / github.com/settings/tokens),
+        the exact `export` line, the `source ~/.zshrc` step. Never store keys
+        in our backend (CLAUDE.md hard rule); BYO is the model. The course
+        teaches the learner to manage their OWN keys safely on their machine.
+
+     5. **Devcontainer escape hatch is a footnote.** Mention the
+        "Reopen in Container" path EXACTLY ONCE per course (typically as a
+        callout box in M0.S0 or M0.S1) framed as "if you're on a corporate
+        laptop with restricted install perms, here's the bypass — but the
+        host install path is the one that transfers to your work machine."
+        Do NOT make it the recommended path. Do NOT structure the course
+        around it.
+
+     6. **Debug content for first-run failures.** Each terminal_exercise
+        step's briefing must anticipate the most common failure modes for
+        ITS specific tool invocation. Examples:
+          - aider: rate-limit handling (`--no-stream` flag), model-not-found
+            errors (typo in model id), OPENROUTER_API_KEY 401 (key not
+            exported / typo / wrong scope).
+          - claude: `claude /login` browser-doesn't-open scenarios, API-key
+            fallback via env var.
+          - gh: auth scope insufficient (needs `repo` + `workflow`),
+            `gh auth status` to verify.
+        Don't write generic "if it doesn't work, check the docs" — write
+        SPECIFIC failure-mode → diagnose-with-this-command → fix mappings.
+
+     The grader is unchanged: `expect: "[Aa]ider v\\d+\\.\\d+"` style regexes
+     are version-tolerant by design. The CONTENT being added is the briefing
+     prose + the validation.hint surfaces — NOT the validation contract.
+
 
 COURSE SUBJECT INFERENCE (critical — pick right exercise types):
 - **OPERATIONAL/SANDBOX-FIRST subjects** (SRE, DevOps, SecEng, DataAnalyst, MLops, Accountant, Legal-contract-review, BI): the learner's job is to TOUCH real tools. Use the new sandbox types (see below) heavily. A 2h course on AWS DevOps without `live_sql_playground`, `observability_sandbox`, or `code_exercise_live` is "MCQ cosplay" — reject that design.

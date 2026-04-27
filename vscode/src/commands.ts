@@ -65,31 +65,208 @@ function findCourseRepo(courseTitle: string): { repoUrl: string; repoFolderName:
 }
 
 /**
- * Install hints surfaced by the pre-flight tool-check picker (Change #1)
+ * Install hints surfaced by the pre-flight tool-check picker (v0.1.10)
  * when a learner is on the host shell + clicks Run This Step + a required
- * tool is missing from PATH. The "right" answer is almost always "Reopen
- * in Container" (we ship a known-good toolchain) but for learners who
- * insist on running locally, this gives them a copy-pasteable starting
- * point per tool. Unknown tools fall through to a generic "see <tool>
- * docs" line — better than silence.
+ * tool is missing from PATH.
+ *
+ * v0.1.10 reframe (per user 2026-04-27): the install journey IS the
+ * skill. Host-install is the recommended path; devcontainer is the
+ * escape hatch. So these hints are first-class teaching content, not
+ * a fallback. Per-OS variants + a `troubleshoot` block for PATH issues
+ * (the #1 failure mode for `pip install --user` flows).
  */
-const INSTALL_HINTS: Record<string, string> = {
-  aider: "pip install aider-chat   # https://aider.chat/docs/install.html",
-  claude:
-    "see https://docs.anthropic.com/en/docs/claude-code/setup for the Claude Code CLI installer",
-  gh: "macOS: brew install gh   |   Linux: see https://github.com/cli/cli#installation",
-  python3: "Python 3.10+ — macOS: pre-installed   |   Linux: apt install python3",
-  python: "Python 3.10+ — macOS: pre-installed   |   Linux: apt install python3 + alias",
-  pytest: "pip install pytest",
-  npm: "install Node.js 20+: https://nodejs.org",
-  node: "install Node.js 20+: https://nodejs.org",
-  go: "install Go 1.22+: https://go.dev/dl",
-  java: "install JDK 21+: https://adoptium.net",
-  mvn: "install Maven: https://maven.apache.org/install.html",
-  docker: "install Docker Desktop: https://docker.com/products/docker-desktop",
-  cargo: "install Rust toolchain: https://rustup.rs",
-  rustc: "install Rust toolchain: https://rustup.rs",
+type InstallHint = {
+  /** One-line "what is this tool" intro */
+  what: string;
+  /** Per-OS install commands (copy-pasteable) */
+  macos: string;
+  linux: string;
+  windows: string;
+  /** Common-cause troubleshooting after install */
+  troubleshoot?: string;
+  /** Canonical docs link */
+  docs?: string;
 };
+
+const INSTALL_HINTS: Record<string, InstallHint> = {
+  aider: {
+    what: "Aider — open-source AI pair-programmer CLI. Needs Python 3.10+.",
+    macos:
+      "brew install python@3.11 && python3.11 -m pip install aider-chat\n" +
+      "  # or with pyenv: pyenv install 3.11 && pyenv global 3.11 && pip install aider-chat",
+    linux:
+      "sudo apt update && sudo apt install -y python3.11 python3-pip\n" +
+      "python3.11 -m pip install --user aider-chat",
+    windows:
+      "winget install Python.Python.3.11\n" +
+      "python -m pip install aider-chat",
+    troubleshoot:
+      "If `aider --version` says command not found AFTER install:\n" +
+      "  - macOS: add `~/Library/Python/3.11/bin` to PATH (echo into ~/.zshrc)\n" +
+      "  - Linux: add `~/.local/bin` to PATH (echo into ~/.bashrc)\n" +
+      "  - Windows: `python -m pip show aider-chat` shows the install dir; add Scripts to PATH\n" +
+      "  - Verify Python: `python3 --version` should be 3.10 or higher",
+    docs: "https://aider.chat/docs/install.html",
+  },
+  claude: {
+    what: "Claude Code — Anthropic's official CLI. Drop-in replacement for cursor/copilot.",
+    macos:
+      "curl -fsSL https://claude.ai/install.sh | sh\n" +
+      "  # or: brew install anthropic/tap/claude (when published)",
+    linux: "curl -fsSL https://claude.ai/install.sh | sh",
+    windows:
+      "Run in PowerShell: irm https://claude.ai/install.ps1 | iex\n" +
+      "  # or download installer from https://docs.anthropic.com/en/docs/claude-code/setup",
+    troubleshoot:
+      "After install:\n" +
+      "  - Run `claude /login` to authenticate (browser opens)\n" +
+      "  - Or set ANTHROPIC_API_KEY env var with your key from console.anthropic.com\n" +
+      "  - Verify: `claude --version` should print '2.x.y (Claude Code)'",
+    docs: "https://docs.anthropic.com/en/docs/claude-code/setup",
+  },
+  gh: {
+    what: "GitHub CLI — for fork/clone/PR/Actions interaction.",
+    macos: "brew install gh",
+    linux:
+      "Debian/Ubuntu:\n" +
+      "  curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg | sudo dd of=/usr/share/keyrings/githubcli-archive-keyring.gpg\n" +
+      "  echo \"deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main\" | sudo tee /etc/apt/sources.list.d/github-cli.list\n" +
+      "  sudo apt update && sudo apt install gh",
+    windows: "winget install --id GitHub.cli",
+    troubleshoot:
+      "After install:\n" +
+      "  - Run `gh auth login` to authenticate (browser opens)\n" +
+      "  - Or export GITHUB_TOKEN with a PAT (scopes: repo, workflow)\n" +
+      "  - Verify scopes: `gh auth status`",
+    docs: "https://github.com/cli/cli#installation",
+  },
+  python3: {
+    what: "Python 3.10+ — required by aider and most Python-based courses.",
+    macos: "brew install python@3.11   # macOS often ships 3.9, you want 3.10+",
+    linux: "sudo apt install python3.11 python3-pip   # or python3.10/3.12 per distro",
+    windows: "winget install Python.Python.3.11",
+    troubleshoot:
+      "If `python3 --version` shows < 3.10:\n" +
+      "  - macOS: alias python3 to brew's: `echo 'alias python3=python3.11' >> ~/.zshrc`\n" +
+      "  - Linux: use `update-alternatives` to point python3 to 3.11\n" +
+      "  - Or install pyenv and set local version per project",
+    docs: "https://www.python.org/downloads/",
+  },
+  python: { what: "", macos: "", linux: "", windows: "", docs: "" }, // alias of python3
+  pytest: {
+    what: "pytest — Python test runner. Used by Skillslab's Python course graders.",
+    macos: "python3 -m pip install pytest",
+    linux: "python3 -m pip install --user pytest",
+    windows: "python -m pip install pytest",
+    troubleshoot: "If `pytest --version` not found, ensure Python's bin dir is on PATH (see python3 hints).",
+  },
+  npm: {
+    what: "Node.js + npm — for Claude Code's npm-distributed installer + JS courses.",
+    macos: "brew install node@20",
+    linux: "curl -fsSL https://deb.nodesource.com/setup_20.x | sudo bash - && sudo apt install -y nodejs",
+    windows: "winget install OpenJS.NodeJS.LTS",
+    docs: "https://nodejs.org",
+  },
+  node: { what: "", macos: "", linux: "", windows: "", docs: "" }, // alias of npm
+  go: {
+    what: "Go toolchain — for Go-based courses.",
+    macos: "brew install go",
+    linux: "sudo apt install golang-go   # or download from go.dev/dl for newer versions",
+    windows: "winget install GoLang.Go",
+    docs: "https://go.dev/dl",
+  },
+  java: {
+    what: "JDK 21+ — for Spring Boot / jspring courses.",
+    macos: "brew install openjdk@21 && sudo ln -sfn /opt/homebrew/opt/openjdk@21/libexec/openjdk.jdk /Library/Java/JavaVirtualMachines/openjdk-21.jdk",
+    linux: "sudo apt install openjdk-21-jdk",
+    windows: "winget install EclipseAdoptium.Temurin.21.JDK",
+    docs: "https://adoptium.net",
+  },
+  mvn: {
+    what: "Maven — Spring Boot / jspring build tool.",
+    macos: "brew install maven",
+    linux: "sudo apt install maven",
+    windows: "winget install Apache.Maven",
+    docs: "https://maven.apache.org/install.html",
+  },
+  docker: {
+    what: "Docker Desktop — for the optional 'Reopen in Container' escape hatch.",
+    macos: "Download from docker.com (free for personal use)",
+    linux: "https://docs.docker.com/engine/install/ — pick your distro",
+    windows: "Download Docker Desktop from docker.com",
+    docs: "https://docker.com/products/docker-desktop",
+  },
+  cargo: {
+    what: "Rust toolchain (cargo + rustc).",
+    macos: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+    linux: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+    windows: "Download rustup-init.exe from rustup.rs",
+    docs: "https://rustup.rs",
+  },
+  rustc: { what: "", macos: "", linux: "", windows: "", docs: "" }, // alias of cargo
+};
+
+/** Detect the OS for install-hints rendering. */
+function detectOs(): "macos" | "linux" | "windows" {
+  if (process.platform === "darwin") return "macos";
+  if (process.platform === "win32") return "windows";
+  return "linux";
+}
+
+/** Render an install-hints OutputChannel for the missing tools. */
+function renderInstallHintsToChannel(
+  channel: vscode.OutputChannel,
+  missingTools: string[],
+  stepLabel: string,
+): void {
+  const os = detectOs();
+  const osLabel = os === "macos" ? "macOS" : os === "linux" ? "Linux" : "Windows";
+  channel.appendLine(`# ${stepLabel} — toolchain install hints (detected OS: ${osLabel})`);
+  channel.appendLine(``);
+  channel.appendLine(
+    `Per CLAUDE.md: the install journey IS the skill. Setting up these tools on YOUR machine is part of becoming production-ready — same path you'd take at work. The Reopen-in-Container option is an escape hatch, not the primary path.`,
+  );
+  channel.appendLine(``);
+  for (const tool of missingTools) {
+    let hint = INSTALL_HINTS[tool];
+    // Resolve aliases (python → python3, node → npm, rustc → cargo)
+    if (hint && !hint.what) {
+      const aliasMap: Record<string, string> = {
+        python: "python3",
+        node: "npm",
+        rustc: "cargo",
+      };
+      const target = aliasMap[tool];
+      if (target) hint = INSTALL_HINTS[target];
+    }
+    channel.appendLine(`────────────────────────────────────────────────────`);
+    channel.appendLine(`## ${tool}`);
+    if (!hint) {
+      channel.appendLine(
+        `(No install hint registered for "${tool}". Try \`brew/apt/winget search ${tool}\` for your platform.)`,
+      );
+      continue;
+    }
+    channel.appendLine(`${hint.what}`);
+    channel.appendLine(``);
+    channel.appendLine(`### Install (${osLabel}):`);
+    channel.appendLine(hint[os] || "(no per-OS recipe — see docs link below)");
+    channel.appendLine(``);
+    if (hint.troubleshoot) {
+      channel.appendLine(`### Troubleshoot:`);
+      channel.appendLine(hint.troubleshoot);
+      channel.appendLine(``);
+    }
+    if (hint.docs) {
+      channel.appendLine(`### Docs: ${hint.docs}`);
+      channel.appendLine(``);
+    }
+  }
+  channel.appendLine(`────────────────────────────────────────────────────`);
+  channel.appendLine(
+    `After installing, click ▸ Run This Step again. The toolchain pill will turn 🟢 when all tools are on PATH.`,
+  );
+}
 import { StateManager } from "./state";
 import { CourseTree } from "./tree";
 import { StepWebViewManager, StepRenderInput } from "./webview";
@@ -270,27 +447,38 @@ export class CommandHandlers {
   }
 
   /**
-   * Pre-flight gate before runAndAutoSubmit (Change #1). When the
-   * learner is on the host shell + tools are missing, surface a 3-button
-   * picker: Reopen in Container (recommended) / Install hints / Run anyway.
+   * Pre-flight gate before runAndAutoSubmit (v0.1.10 reframe). Host
+   * install is now the recommended path — installing the toolchain on
+   * the learner's own machine IS the skill being taught (per user
+   * directive 2026-04-27). The devcontainer escape hatch stays
+   * available for corporate-machine / time-pressured learners but is
+   * NOT promoted as the default.
    *
    * Returns:
    *   - "proceed" → caller continues into auto-run
-   *   - "abort" → caller returns early (we either reopened in container,
-   *     showed install hints, or learner cancelled)
+   *   - "abort" → caller returns early (we showed install hints,
+   *     reopened in container, or learner cancelled)
    */
   private async preflightToolchainGate(step: StepSummary): Promise<"proceed" | "abort"> {
     const status = this.computeToolchainStatus(step);
     if (status.status !== "host-missing") return "proceed";
     const missingList = status.missingTools.join(", ");
     const choice = await vscode.window.showWarningMessage(
-      `${labelOf(step)} needs ${missingList} on PATH. The course's devcontainer has these pre-installed — recommended over a local install.`,
+      `${labelOf(step)} needs ${missingList} on PATH. ` +
+        `Setting up these tools is part of the course — same skill you'd apply at work. ` +
+        `Or fall back to the devcontainer if you're time-pressured.`,
       { modal: false },
-      "Reopen in Container (recommended)",
-      "Install hints",
+      "Show install steps",
       "Run anyway",
+      "Use devcontainer instead",
     );
-    if (choice === "Reopen in Container (recommended)") {
+    if (choice === "Show install steps") {
+      const ch = vscode.window.createOutputChannel("Skillslab Install Hints");
+      renderInstallHintsToChannel(ch, status.missingTools, labelOf(step));
+      ch.show();
+      return "abort";
+    }
+    if (choice === "Use devcontainer instead") {
       try {
         await vscode.commands.executeCommand("remote-containers.reopenInContainer");
       } catch (e: any) {
@@ -300,22 +488,9 @@ export class CommandHandlers {
       }
       return "abort";
     }
-    if (choice === "Install hints") {
-      const ch = vscode.window.createOutputChannel("Skillslab Install Hints");
-      ch.appendLine(`# ${labelOf(step)} — missing on PATH: ${missingList}`);
-      ch.appendLine(``);
-      for (const t of status.missingTools) {
-        ch.appendLine(`${t}: ${INSTALL_HINTS[t] || "see " + t + " docs"}`);
-      }
-      ch.appendLine(``);
-      ch.appendLine(
-        `Tip: the cleaner path is "Reopen in Container" — the skillslab devcontainer has every tool above pre-installed. See: https://github.com/tusharbisht/kimi-eng-course-repo`,
-      );
-      ch.show();
-      return "abort";
-    }
     // "Run anyway" or null (dismissed) → proceed; the auto-run will fail
-    // gracefully when `aider --version` returns command-not-found.
+    // gracefully when `aider --version` returns command-not-found, and the
+    // grader's regex miss surfaces a clear signal in the feedback panel.
     return choice ? "proceed" : "abort";
   }
 
@@ -381,15 +556,16 @@ export class CommandHandlers {
     );
     if (!pick) return;
 
-    // v0.1.5 Change #4 — auto-suggest cloning the course-repo + reopening
-    // in its devcontainer. Fires when:
-    //   - The picked course is one of the known BYO-key courses (kimi /
-    //     aie / jspring) per KNOWN_COURSE_REPOS lookup
-    //   - The learner is NOT already inside a devcontainer
-    //   - No open workspace folder is the course's repo
-    // We never block — "Continue without" lets the learner stay where
-    // they are. The clone-into-volume command short-circuits the
-    // host-side checkout entirely (Path B from the runbook).
+    // v0.1.10 reframe of v0.1.5 Change #4 — host install is now the
+    // recommended path. The devcontainer is offered as an escape hatch,
+    // not the primary suggestion. Per user directive 2026-04-27: the
+    // install journey IS the skill; learners should set up the
+    // toolchain on their own machine to transfer the skill to work.
+    //
+    // We probe a small canonical toolset to see if the learner is
+    // ready to run on host. If yes → offer to clone the repo into
+    // ~/code via VS Code's git.clone (host checkout). If no → show
+    // the install-hints panel + offer the devcontainer as escape hatch.
     const repo = findCourseRepo(pick.course.title);
     if (repo && !this.isInsideDevContainer()) {
       const folderNames = (vscode.workspace.workspaceFolders || []).map((f) =>
@@ -397,20 +573,58 @@ export class CommandHandlers {
       );
       const alreadyInRepo = folderNames.some((n) => n === repo.repoFolderName);
       if (!alreadyInRepo) {
+        // Heuristic toolset shared across the BYO-key courses. We don't
+        // have the step's cli_commands here yet (course not loaded);
+        // probe what's universal across kimi/aie/jspring.
+        const probe = ["aider", "claude", "python3", "git", "gh"];
+        const missing = probe.filter((t) => !this.isToolOnPath(t));
+        const allReady = missing.length === 0;
         const choice = await vscode.window.showInformationMessage(
-          `${pick.course.title} runs inside its devcontainer (aider/claude/python pre-installed). Clone ${repo.repoFolderName} and reopen there?`,
-          "Clone & Reopen in Container",
-          "Continue in current workspace",
+          allReady
+            ? `${pick.course.title}: toolchain ready on host. Clone ${repo.repoFolderName} and continue, or use the devcontainer escape hatch?`
+            : `${pick.course.title}: missing on host PATH: ${missing.join(", ")}. ` +
+                `Setting these up is part of the course (skill transfer to work). ` +
+                `Or use the devcontainer escape hatch if you're time-pressured.`,
+          allReady ? "Clone the repo for me" : "Show install steps",
+          allReady ? "I'll clone manually" : "Continue anyway",
+          "Use devcontainer (escape hatch)",
         );
-        if (choice === "Clone & Reopen in Container") {
+
+        if (choice === "Clone the repo for me") {
+          // Host-side clone via VS Code's built-in git.clone (NOT
+          // clone-into-volume — that's the devcontainer path).
+          try {
+            await vscode.commands.executeCommand("git.clone", repo.repoUrl);
+            return;
+          } catch (e: any) {
+            vscode.window.showWarningMessage(
+              `Auto-clone failed. Manually: git clone ${repo.repoUrl} && code <folder>`,
+            );
+          }
+        }
+        if (choice === "Show install steps") {
+          const ch = vscode.window.createOutputChannel("Skillslab Install Hints");
+          renderInstallHintsToChannel(
+            ch,
+            missing,
+            `${pick.course.title} (host setup)`,
+          );
+          ch.appendLine(``);
+          ch.appendLine(`# After install, clone the course repo:`);
+          ch.appendLine(`git clone ${repo.repoUrl}`);
+          ch.appendLine(`cd ${repo.repoFolderName}`);
+          ch.appendLine(`code .`);
+          ch.show();
+        }
+        if (choice === "Use devcontainer (escape hatch)") {
           this._toolPathCache.clear();
           await this.invokeCloneInVolume(repo.repoUrl);
-          return; // VS Code reloads the window post-clone; rest of flow runs there
+          return; // VS Code reloads post-clone
         }
-      } else {
-        // Already in the right folder — just nudge "Reopen in Container"
-        void this.maybeSuggestDevContainer();
+        // "Continue anyway" / "I'll clone manually" / dismissed → fall through
       }
+      // (If alreadyInRepo: don't proactively prompt — the toolchain
+      // pill (#3) handles the missing-tools case in the WebView.)
     }
 
     // Enroll (idempotent)
@@ -500,7 +714,28 @@ export class CommandHandlers {
       () => void this.previous(courseId, moduleId, detailedStep),
       () => void this.runAndAutoSubmit(courseId, moduleId, detailedStep),
       () => void this.reopenInContainer(),
+      () => void this.showInstallHintsForStep(detailedStep),
     );
+  }
+
+  /**
+   * v0.1.10 — handler for the WebView pill's "Show install steps"
+   * button. Opens an OutputChannel with per-OS install commands +
+   * troubleshooting for each tool the step needs but the host doesn't
+   * have on PATH.
+   */
+  async showInstallHintsForStep(step: StepSummary): Promise<void> {
+    const status = this.computeToolchainStatus(step);
+    const missing = status.status === "host-missing" ? status.missingTools : [];
+    if (missing.length === 0) {
+      vscode.window.showInformationMessage(
+        `Toolchain looks ready for ${labelOf(step)}. No install steps needed.`,
+      );
+      return;
+    }
+    const ch = vscode.window.createOutputChannel("Skillslab Install Hints");
+    renderInstallHintsToChannel(ch, missing, labelOf(step));
+    ch.show();
   }
 
   /**

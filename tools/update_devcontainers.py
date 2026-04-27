@@ -51,22 +51,53 @@ REPOS_BRANCHES = {
 POST_CREATE_TOOLCHAIN_SMOKE = "skillslab --version && claude --version && echo Ready"
 
 POST_ATTACH_INSTALL_SCRIPT = (
-    # Locate the `code` CLI: PATH first, then known dev-container locations.
-    'CODE=$(command -v code 2>/dev/null '
-    '|| ls /vscode/bin/*/bin/remote-cli/code 2>/dev/null | head -1 '
-    '|| ls /home/*/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1 '
-    '|| ls /root/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1); '
+    # v0.1.9.2 — wider search + retry-loop + find-fallback + diagnostics.
+    # The 4-path lookup in v0.1.9.1 still missed `code` on at least one
+    # learner's container. Now we (a) retry every 2s for 30s in case
+    # VS Code Server hadn't bootstrapped yet, (b) check more locations
+    # including `code-tunnel`-style paths, (c) fall back to a depth-bounded
+    # `find` over common parent dirs, (d) on FINAL failure emit
+    # diagnostics so the next iteration can extend the lookup.
+    'find_code() { '
+    '  command -v code 2>/dev/null && return 0; '
+    '  for p in '
+    '    /vscode/bin/*/bin/remote-cli/code '
+    '    /vscode/cli/*/bin/code '
+    '    /vscode/server/*/bin/remote-cli/code '
+    '    /home/*/.vscode-server/bin/*/bin/remote-cli/code '
+    '    /home/*/.vscode-server/cli/*/bin/code '
+    '    /root/.vscode-server/bin/*/bin/remote-cli/code '
+    '    /root/.vscode-server/cli/*/bin/code '
+    '    /opt/vscode-server/bin/code '
+    '    /usr/local/bin/code '
+    '    /usr/bin/code; '
+    '  do ls $p 2>/dev/null | head -1 && return 0; done; '
+    '  find /vscode /opt /root /home -maxdepth 7 -name code -type f -executable 2>/dev/null '
+    '    | grep -E "remote-cli|/bin/code$" | head -1; '
+    '}; '
+    # Retry up to 15 × 2s = 30s in case VS Code Server is still bootstrapping.
+    'CODE=""; '
+    'for try in $(seq 1 15); do '
+    '  CODE=$(find_code); '
+    '  [ -n "$CODE" ] && break; '
+    '  sleep 2; '
+    'done; '
     'if [ -z "$CODE" ]; then '
-    '  echo "[skillslab] code CLI not found (PATH or known dev-container locations); install manually: download http://52.88.255.208/dl/skillslab.vsix and run code --install-extension"; '
+    '  echo "[skillslab] code CLI not found after 30s wait — diagnostics:"; '
+    '  echo "  USER=$(whoami) HOME=$HOME"; '
+    '  echo "  /vscode/* : $(ls /vscode 2>&1 | head -3 | tr \\\\n \\\\  )"; '
+    '  echo "  $HOME/.vscode-server/* : $(ls $HOME/.vscode-server 2>&1 | head -3 | tr \\\\n \\\\  )"; '
+    '  echo "  PATH=$PATH"; '
+    '  echo "  Manual install: download http://52.88.255.208/dl/skillslab.vsix and run code --install-extension <path>"; '
     '  exit 0; '
     'fi; '
     # Idempotency: skip the download if extension is already installed.
     'if "$CODE" --list-extensions 2>/dev/null | grep -qx tusharbisht1391.skillslab; then '
-    '  echo "[skillslab] extension already installed"; '
+    '  echo "[skillslab] extension already installed (using $CODE)"; '
     '  exit 0; '
     'fi; '
     # Fresh install path.
-    'echo "[skillslab] downloading + installing extension..."; '
+    'echo "[skillslab] using $CODE — downloading + installing extension..."; '
     'curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix '
     '&& "$CODE" --install-extension /tmp/skillslab.vsix '
     '|| echo "[skillslab] install failed (network or download issue); install manually"'
@@ -103,17 +134,17 @@ def update_branch(repo: str, branch: str) -> str:
     except json.JSONDecodeError as e:
         return f"error parsing JSON: {e}"
 
-    # Idempotent skip: already has the v0.1.9.1 postAttachCommand pattern.
-    # Note we deliberately CHECK ANEW even if v0.1.9 (string) was applied,
-    # because v0.1.9.1 moves the install out of postCreateCommand and uses
-    # array-form postAttachCommand instead.
+    # Idempotent skip: only if the script body byte-for-byte matches the
+    # current POST_ATTACH_INSTALL_SCRIPT. Lets the script self-update across
+    # bug-fix iterations (v0.1.9 → v0.1.9.1 → v0.1.9.2) without manual
+    # branch surgery — every re-run propagates the latest install logic.
     existing_pac = cfg.get("postAttachCommand")
     if (
         isinstance(existing_pac, list)
         and len(existing_pac) >= 3
-        and "/dl/skillslab.vsix" in existing_pac[2]
+        and existing_pac[2] == POST_ATTACH_INSTALL_SCRIPT
     ):
-        return "skipped (already updated)"
+        return "skipped (already up-to-date)"
 
     # v0.1.9.1 surgery:
     #   1. postCreateCommand → just the toolchain smoke (no .vsix install)

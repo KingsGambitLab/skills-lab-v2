@@ -109,6 +109,7 @@ export class StepWebViewManager {
     onRunInTerminal?: () => void;
     onRunAuto?: () => void;
     onReopenInContainer?: () => void;
+    onShowInstallHints?: () => void;
   } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -121,6 +122,7 @@ export class StepWebViewManager {
     onPrev: () => void,
     onRunAuto?: () => void,
     onReopenInContainer?: () => void,
+    onShowInstallHints?: () => void,
   ): void {
     // ALWAYS update callbacks BEFORE reveal/render — the listener below
     // reads via `this.callbacks.X?.()` so this swap is what makes the
@@ -132,6 +134,7 @@ export class StepWebViewManager {
       onRunInTerminal,
       onRunAuto,
       onReopenInContainer,
+      onShowInstallHints,
     };
 
     if (this.panel) {
@@ -156,6 +159,7 @@ export class StepWebViewManager {
           case "runInTerminal": this.callbacks.onRunInTerminal?.(); break;
           case "runAuto": this.callbacks.onRunAuto?.(); break;
           case "reopenInContainer": this.callbacks.onReopenInContainer?.(); break;
+          case "showInstallHints": this.callbacks.onShowInstallHints?.(); break;
         }
       });
     }
@@ -545,24 +549,31 @@ function renderToolchainPill(
   status: StepRenderInput["toolchainStatus"] | undefined,
 ): string {
   if (!status || status.status === "n/a") return "";
-  if (status.status === "in-container") {
-    return `<div class="toolchain-pill in-container">
-      <span class="pill-icon">🟢</span>
-      <span class="pill-text">Skillslab devcontainer — toolchain ready (aider · python3 · git · gh pre-installed)</span>
-    </div>`;
-  }
   if (status.status === "host-ok") {
+    // v0.1.10 — host-ok is the PRIMARY success state. Host install is
+    // the recommended path; the learner's own machine = the skill they're
+    // taking back to work.
     return `<div class="toolchain-pill host-ok">
       <span class="pill-icon">🟢</span>
-      <span class="pill-text">Host shell — required tools detected on PATH</span>
+      <span class="pill-text">Host toolchain ready — required tools detected on PATH</span>
     </div>`;
   }
-  // host-missing
+  if (status.status === "in-container") {
+    // Devcontainer is now the escape hatch — still "ready" but framed
+    // as a fallback path, not the recommended one.
+    return `<div class="toolchain-pill in-container">
+      <span class="pill-icon">🟢</span>
+      <span class="pill-text">Devcontainer escape hatch active — toolchain pre-installed (aider · python3 · git · gh)</span>
+    </div>`;
+  }
+  // host-missing — primary CTA is "Show install steps" (the install IS
+  // the skill); devcontainer is a secondary escape-hatch link.
   const missing = (status.missingTools || []).map(escapeAttr).join(", ");
   return `<div class="toolchain-pill host-missing">
     <span class="pill-icon">🔴</span>
-    <span class="pill-text">Missing on PATH: <strong>${missing}</strong> — the course's devcontainer has these pre-installed.</span>
-    <button data-vsc-msg="reopenInContainer">Reopen in Container</button>
+    <span class="pill-text">Missing on PATH: <strong>${missing}</strong>. Installing these on your machine is part of the course (skill transfer).</span>
+    <button data-vsc-msg="showInstallHints">Show install steps</button>
+    <a class="footer-link" href="#" data-vsc-msg="reopenInContainer" style="margin-left: 8px; font-size: 0.8rem;">or use devcontainer →</a>
   </div>`;
 }
 
