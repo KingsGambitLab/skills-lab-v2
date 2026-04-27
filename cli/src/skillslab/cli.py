@@ -183,8 +183,19 @@ def whoami():
 @cli.command()
 def courses():
     """List courses you can take + ones you've enrolled in."""
-    enrolled = api.my_courses()
+    # Public catalog first — works without auth so first-time users can
+    # browse before login. `my_courses` (enrollments) is auth-required;
+    # if no token, just show the catalog without "Enrolled" column data.
     catalog = api.all_courses()
+    try:
+        enrolled = api.my_courses()
+    except api.ApiError as e:
+        if e.status == 401:
+            console.print("[dim]Not signed in — showing public catalog only. Run [/dim]"
+                          "[bold]skillslab login[/bold][dim] to see your enrollments + progress.[/dim]")
+            enrolled = []
+        else:
+            raise
 
     e_by_id = {e["course_id"]: e for e in enrolled}
 

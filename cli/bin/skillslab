@@ -1,58 +1,107 @@
 #!/usr/bin/env bash
 #
-# skillslab — host-side launcher.
+# skillslab — host-side launcher (zero-clone install supported).
 #
 # Run from ANY directory. $PWD becomes /work inside the container, so
 # `git clone`, `pytest`, `aider`, `claude` etc all see your real working
 # dir without the cli source files shadowing it.
 #
-# Install (one-line, no clone needed for the image; skillslab itself is
-# pulled from Docker Hub on first run as `tusharbisht1391/skillslab:latest`):
+# ── Install (one-line; no clone) ──────────────────────────────────────
 #
-#     # Get the launcher + compose file (a thin wrapper around docker compose):
+#     mkdir -p ~/.local/bin
 #     curl -fsSL https://raw.githubusercontent.com/KingsGambitLab/skills-lab-v2/main/cli/bin/skillslab \
 #       -o ~/.local/bin/skillslab
-#     curl -fsSL https://raw.githubusercontent.com/KingsGambitLab/skills-lab-v2/main/cli/docker-compose.yml \
-#       -o ~/.local/share/skillslab/docker-compose.yml  # set SKILLSLAB_REPO to this dir's parent
 #     chmod +x ~/.local/bin/skillslab
+#     # ensure ~/.local/bin is on PATH (most shells already include it)
+#     skillslab --help
 #
-#     # OR clone for the launcher (if you also want to contribute):
+# That's it. The launcher uses `docker run` directly with the published
+# image — no compose file needed. First run pulls the image (~700MB,
+# cached forever).
+#
+# ── Power-user install (cloned repo, contributors) ────────────────────
+#
 #     git clone https://github.com/KingsGambitLab/skills-lab-v2.git
 #     ln -sf "$(pwd)/skills-lab-v2/cli/bin/skillslab" ~/.local/bin/skillslab
 #
-# Usage:
+#   When run from a cloned repo, the launcher prefers the repo's
+#   docker-compose.yml (so `git pull` updates take effect via the
+#   bind-mount). Without a clone, it falls back to direct `docker run`.
+#
+# ── Usage ─────────────────────────────────────────────────────────────
 #     cd ~/where/you/want/to/work     # any clean dir
 #     skillslab                       # interactive shell inside container
 #     skillslab status                # one-shot subcommand (no shell)
-#     skillslab login
+#     skillslab login                 # prompt for email + password
 #     gh repo fork <upstream-url> --clone   # native, see step briefing
 #     skillslab spec
 #     skillslab check
 #
-# Auto-detects the repo root by following the symlink → cli/ → repo root.
-# Override with SKILLSLAB_REPO if your install layout is non-standard.
+# Env overrides:
+#     SKILLSLAB_API_URL   default http://52.88.255.208 (prod LMS)
+#     SKILLSLAB_WEB_URL   default http://52.88.255.208
+#     SKILLSLAB_IMAGE     default tusharbisht1391/skillslab:latest
+#     SKILLSLAB_REPO      override repo root (only needed when
+#                         auto-detection from symlink misses)
+#
 set -euo pipefail
 
-# Resolve the real path of this script (handles symlinks). repo_root = parent of cli/.
-_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}")"
-_cli_dir="$(dirname "$(dirname "$_self")")"
-SKILLSLAB_REPO="${SKILLSLAB_REPO:-$(dirname "$_cli_dir")}"
+# ── Defaults (overridable via env) ────────────────────────────────────
+: "${SKILLSLAB_API_URL:=http://52.88.255.208}"
+: "${SKILLSLAB_WEB_URL:=http://52.88.255.208}"
+: "${SKILLSLAB_IMAGE:=tusharbisht1391/skillslab:latest}"
 
-if [[ ! -f "$SKILLSLAB_REPO/cli/docker-compose.yml" ]]; then
-  echo "skillslab launcher: cannot find docker-compose.yml at $SKILLSLAB_REPO/cli/" >&2
-  echo "Set SKILLSLAB_REPO=/path/to/skills-lab-v2 and re-run." >&2
-  exit 2
-fi
-
-# /work mounts $PWD by default. Wrapper makes that explicit so the user can
-# run from any directory without thinking about it.
+export SKILLSLAB_API_URL SKILLSLAB_WEB_URL SKILLSLAB_IMAGE
 export SKILLSLAB_WORK_DIR="${SKILLSLAB_WORK_DIR:-$PWD}"
 
-# Fast path: no args = interactive bash. With args, run skillslab subcommand
-# headlessly (no extra shell layer).
+# ── Try to resolve a cloned repo (so power users get bind-mount + ────
+# compose-driven runs). Falls back to plain docker run otherwise.
+_self="$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || python3 -c 'import os,sys; print(os.path.realpath(sys.argv[1]))' "${BASH_SOURCE[0]}" 2>/dev/null || echo "")"
+_compose_file=""
+if [[ -n "$_self" ]]; then
+  _cli_dir="$(dirname "$(dirname "$_self")")"
+  _candidate="${SKILLSLAB_REPO:-$(dirname "$_cli_dir")}/cli/docker-compose.yml"
+  [[ -f "$_candidate" ]] && _compose_file="$_candidate"
+fi
+
+# Make sure host state dirs exist before we try to bind-mount them
+# (empty dirs are fine; docker creates them otherwise but the host
+# default-perms can be wrong on macOS).
+mkdir -p "${HOME}/.skillslab" "${HOME}/.claude" "${HOME}/.aider" "${HOME}/.config/gh" 2>/dev/null || true
+
+# ── Path A: cloned repo → use docker compose (preserves bind-mount) ──
+if [[ -n "$_compose_file" ]]; then
+  if [[ $# -eq 0 ]]; then
+    exec docker compose -f "$_compose_file" run --rm skillslab
+  else
+    exec docker compose -f "$_compose_file" run --rm skillslab skillslab "$@"
+  fi
+fi
+
+# ── Path B: standalone install → direct docker run (zero-config) ─────
+# Mirrors the compose file's mounts + envs. This is the "I curl'd the
+# launcher, no clone" path that beginners hit by default.
+_DOCKER_ARGS=(
+  --rm
+  -v "${SKILLSLAB_WORK_DIR}:/work"
+  -v "${HOME}/.skillslab:/root/.skillslab"
+  -v "${HOME}/.claude:/root/.claude"
+  -v "${HOME}/.aider:/root/.aider"
+  -v "${HOME}/.config/gh:/root/.config/gh"
+  -e "SKILLSLAB_API_URL=${SKILLSLAB_API_URL}"
+  -e "SKILLSLAB_WEB_URL=${SKILLSLAB_WEB_URL}"
+  -e "ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}"
+  -e "OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}"
+  -e "GITHUB_TOKEN=${GITHUB_TOKEN:-}"
+  -e "GH_TOKEN=${GH_TOKEN:-}"
+  --add-host "host.docker.internal:host-gateway"
+  -w /work
+)
+
 if [[ $# -eq 0 ]]; then
-  exec docker compose -f "$SKILLSLAB_REPO/cli/docker-compose.yml" run --rm skillslab
+  # Interactive shell — needs -it for the banner + prompt to render
+  exec docker run -it "${_DOCKER_ARGS[@]}" "${SKILLSLAB_IMAGE}" /bin/bash
 else
-  exec docker compose -f "$SKILLSLAB_REPO/cli/docker-compose.yml" run --rm skillslab \
-    skillslab "$@"
+  # One-shot subcommand — keep stdin open + tty for prompts (login)
+  exec docker run -i "${_DOCKER_ARGS[@]}" "${SKILLSLAB_IMAGE}" skillslab "$@"
 fi
