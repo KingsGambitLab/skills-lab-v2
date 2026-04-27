@@ -117,6 +117,95 @@ ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
 
 ---
 
+## 📦 VSCODE EXT BUNDLED-VSIX DEPLOY — `/dl/skillslab.vsix` from prod (2026-04-27 v0.1.9)
+
+**Problem.** The Skillslab VS Code extension isn't published to the
+marketplace, so `customizations.vscode.extensions: ["tusharbisht1391.skillslab"]`
+in a course-repo's `devcontainer.json` silently fails — the marketplace
+lookup returns nothing, VS Code logs a warning, learner ends up inside
+the container without Skillslab. Manual sideload-per-container = friction.
+
+**Fix.** The latest `.vsix` is staged on the prod LMS at:
+`http://52.88.255.208/dl/skillslab.vsix` (no auth, served by nginx
+location block). Each course-repo's `devcontainer.json` carries a
+`postCreateCommand` that curls the .vsix on container creation +
+installs it via `code --install-extension`:
+
+```jsonc
+"postCreateCommand": "(curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix && code --install-extension /tmp/skillslab.vsix) || echo '[skillslab] vsix install skipped (network or server) — install manually' && skillslab --version && claude --version && echo Ready"
+```
+
+The OR-fallback keeps `postCreateCommand` non-failing if the prod URL is
+down — container is still usable for the CLI flow; learner can install
+the extension manually. The trailing `skillslab --version && claude --version`
+is the existing toolchain smoke test.
+
+### Keys flow into the container (BYO via host shell, never our backend)
+
+CLAUDE.md hard rule: "we never handle learner API keys." The dev container
+gets keys via VS Code's `${localEnv:X}` interpolation in `remoteEnv`:
+
+```jsonc
+"remoteEnv": {
+  "ANTHROPIC_API_KEY": "${localEnv:ANTHROPIC_API_KEY}",
+  "OPENROUTER_API_KEY": "${localEnv:OPENROUTER_API_KEY}",
+  "GITHUB_TOKEN": "${localEnv:GITHUB_TOKEN}"
+}
+```
+
+Learner workflow:
+1. Learner exports `ANTHROPIC_API_KEY=...` / `OPENROUTER_API_KEY=...` / `GITHUB_TOKEN=...` in their shell rc (`~/.zshrc` / `~/.bashrc`).
+2. Opens VS Code from that shell.
+3. Reopens in container — VS Code reads the host env via `${localEnv:X}`, sets the values inside the container's `process.env`.
+4. `claude` / `aider` / `gh` read from env, work out of the box.
+5. If a key is unset on host → `process.env.X` is empty in container → tool itself fails ("OPENROUTER_API_KEY required") → captured in grader output → 0% score with a clear in-feedback signal.
+
+Why NOT VS Code SecretStorage as the source: SecretStorage inside a
+container is its own keychain (separate from host's). Keys stored via
+the extension's "Set API Key" command on the host wouldn't be visible
+inside the container without a sync mechanism we'd have to invent.
+Host shell env is the cleaner, more standard pattern.
+
+### Updating the staged .vsix (every Skillslab release)
+
+```bash
+# Locally, after building skillslab-X.Y.Z.vsix:
+scp -i ~/Downloads/ai-agent-demo.pem \
+  /Users/tushar/Desktop/codebases/skills-lab-v2/vscode/skillslab-X.Y.Z.vsix \
+  ec2-user@52.88.255.208:/home/ec2-user/skills-lab-v2/dl/skillslab.vsix
+# Done — next container creation pulls the new version automatically.
+```
+
+The URL is **not versioned** — `/dl/skillslab.vsix` always points at
+latest. devcontainer.json never needs to change per Skillslab release;
+just SCP the new .vsix.
+
+### nginx location block (idempotent — already in `/etc/nginx/conf.d/skills-lab.conf` on prod 2026-04-27)
+
+```nginx
+location /dl/ {
+    alias /home/ec2-user/skills-lab-v2/dl/;
+    autoindex on;
+    default_type application/octet-stream;
+    add_header Content-Disposition "attachment";
+}
+```
+
+Perms required: `o+x` on the path traversal `/home/ec2-user/` +
+`/home/ec2-user/skills-lab-v2/`, plus `o+r` on the .vsix itself, so
+the `nginx` user can read it.
+
+### Updating devcontainer.json across all course-repos
+
+Use `tools/update_devcontainers.py` (or the inline script saved to
+`/tmp/update_devcontainers.py` 2026-04-27) — iterates the 22 working
+branches across `tusharbisht/{kimi,aie,jspring}-course-repo`, fetches
+each devcontainer.json via gh API, idempotently injects the v0.1.9
+postCreateCommand if missing, PUTs the update via the GitHub Contents
+API. Run before every devcontainer schema change.
+
+---
+
 ## 🛡️ WIDGET RUNTIME — CSP-SAFE BY CONSTRUCTION, NEVER EVAL (2026-04-27 v0.1.2)
 
 **User directive (verbatim, 2026-04-27):** *"don't fix the symptom, fix the root cause please"* — filed against a WebView click failure: `EvalError: Evaluating a string as JavaScript violates Content Security Policy directive because 'unsafe-eval' is not an allowed source of script`.
