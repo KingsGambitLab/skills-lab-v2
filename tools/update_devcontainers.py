@@ -29,16 +29,52 @@ REPOS_BRANCHES = {
     ],
 }
 
-# v0.1.9 — install the bundled .vsix from the prod URL after container creation.
-# Best-effort: if curl fails, postCreateCommand still succeeds so container
-# is usable for the CLI flow; learner can install manually.
-INSTALL_PREAMBLE = (
-    "(curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix "
-    "&& code --install-extension /tmp/skillslab.vsix) "
-    "|| echo '[skillslab] vsix install skipped (network or server) — install manually'"
+# v0.1.9.1 — install moved to postAttachCommand (runs every VS Code attach,
+# idempotent). postCreateCommand keeps the existing toolchain smoke (runs
+# once at container creation).
+#
+# Why the move: at postCreateCommand time the default Dev Containers shell
+# is /bin/sh (dash on Debian-based images), which doesn't source .bashrc
+# or .profile, so the `code` CLI VS Code Server adds to PATH via shell rc
+# isn't visible. Got "/bin/sh: 1: code: not found" on the first deploy.
+#
+# Two robustness layers:
+#   1. Use bash -c (not /bin/sh) so we have a richer shell.
+#   2. Locate `code` via PATH first, then fall back to known dev-container
+#      install locations (/vscode/bin/<commit>/, ~/.vscode-server/bin/<commit>/)
+#      so we don't depend on PATH being right.
+#
+# postAttachCommand fires every time VS Code attaches to the container,
+# which is when `code` is reliably available. Idempotency check via
+# `code --list-extensions | grep -qx tusharbisht1391.skillslab` skips the
+# curl on subsequent attaches.
+POST_CREATE_TOOLCHAIN_SMOKE = "skillslab --version && claude --version && echo Ready"
+
+POST_ATTACH_INSTALL_SCRIPT = (
+    # Locate the `code` CLI: PATH first, then known dev-container locations.
+    'CODE=$(command -v code 2>/dev/null '
+    '|| ls /vscode/bin/*/bin/remote-cli/code 2>/dev/null | head -1 '
+    '|| ls /home/*/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1 '
+    '|| ls /root/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1); '
+    'if [ -z "$CODE" ]; then '
+    '  echo "[skillslab] code CLI not found (PATH or known dev-container locations); install manually: download http://52.88.255.208/dl/skillslab.vsix and run code --install-extension"; '
+    '  exit 0; '
+    'fi; '
+    # Idempotency: skip the download if extension is already installed.
+    'if "$CODE" --list-extensions 2>/dev/null | grep -qx tusharbisht1391.skillslab; then '
+    '  echo "[skillslab] extension already installed"; '
+    '  exit 0; '
+    'fi; '
+    # Fresh install path.
+    'echo "[skillslab] downloading + installing extension..."; '
+    'curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix '
+    '&& "$CODE" --install-extension /tmp/skillslab.vsix '
+    '|| echo "[skillslab] install failed (network or download issue); install manually"'
 )
 
-NEW_POST_CREATE_TAIL = " && skillslab --version && claude --version && echo Ready"
+# Array form so the JSON encoder handles all quoting cleanly + bash sees a
+# single -c arg without shell-meta interpretation.
+POST_ATTACH_COMMAND = ["bash", "-c", POST_ATTACH_INSTALL_SCRIPT]
 
 
 def gh_api(method: str, path: str, body: dict | None = None) -> dict:
@@ -67,21 +103,23 @@ def update_branch(repo: str, branch: str) -> str:
     except json.JSONDecodeError as e:
         return f"error parsing JSON: {e}"
 
-    # Idempotent skip: already has the v0.1.9 install command
-    existing_pc = cfg.get("postCreateCommand", "")
-    if "/dl/skillslab.vsix" in existing_pc:
+    # Idempotent skip: already has the v0.1.9.1 postAttachCommand pattern.
+    # Note we deliberately CHECK ANEW even if v0.1.9 (string) was applied,
+    # because v0.1.9.1 moves the install out of postCreateCommand and uses
+    # array-form postAttachCommand instead.
+    existing_pac = cfg.get("postAttachCommand")
+    if (
+        isinstance(existing_pac, list)
+        and len(existing_pac) >= 3
+        and "/dl/skillslab.vsix" in existing_pac[2]
+    ):
         return "skipped (already updated)"
 
-    # Compose new postCreateCommand: install .vsix first, then preserve any
-    # tail the original config had (toolchain version checks).
-    tail = ""
-    if existing_pc and "skillslab" in existing_pc.lower():
-        # Original had a toolchain check — preserve it via " && existing_pc"
-        # but strip a leading "skillslab --version" since we keep that anyway.
-        tail = " && " + existing_pc
-    else:
-        tail = NEW_POST_CREATE_TAIL
-    cfg["postCreateCommand"] = INSTALL_PREAMBLE + tail
+    # v0.1.9.1 surgery:
+    #   1. postCreateCommand → just the toolchain smoke (no .vsix install)
+    #   2. postAttachCommand → the array-form install script with PATH fallback
+    cfg["postCreateCommand"] = POST_CREATE_TOOLCHAIN_SMOKE
+    cfg["postAttachCommand"] = POST_ATTACH_COMMAND
 
     # Add Python tooling to extensions (kept tusharbisht1391.skillslab for
     # eventual marketplace publish; harmless when not on marketplace —
@@ -101,8 +139,8 @@ def update_branch(repo: str, branch: str) -> str:
             f"repos/{OWNER}/{repo}/contents/{path}",
             body={
                 "message": (
-                    "feat: devcontainer installs Skillslab .vsix from prod URL "
-                    "(v0.1.9 bundled-vsix flow)"
+                    "fix: devcontainer postAttachCommand installs .vsix with "
+                    "code-CLI PATH fallback (v0.1.9.1 — fixes /bin/sh: code: not found)"
                 ),
                 "content": new_b64,
                 "sha": sha,

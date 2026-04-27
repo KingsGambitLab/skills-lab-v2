@@ -127,18 +127,47 @@ the container without Skillslab. Manual sideload-per-container = friction.
 
 **Fix.** The latest `.vsix` is staged on the prod LMS at:
 `http://52.88.255.208/dl/skillslab.vsix` (no auth, served by nginx
-location block). Each course-repo's `devcontainer.json` carries a
-`postCreateCommand` that curls the .vsix on container creation +
-installs it via `code --install-extension`:
+location block). Each course-repo's `devcontainer.json` carries:
+
+  - `postCreateCommand` → existing toolchain smoke (runs once on create)
+  - `postAttachCommand` → array-form bash script that curls the .vsix +
+    installs via the located `code` CLI (runs on every VS Code attach,
+    idempotent via `code --list-extensions | grep -qx tusharbisht1391.skillslab`)
 
 ```jsonc
-"postCreateCommand": "(curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix && code --install-extension /tmp/skillslab.vsix) || echo '[skillslab] vsix install skipped (network or server) — install manually' && skillslab --version && claude --version && echo Ready"
+"postCreateCommand": "skillslab --version && claude --version && echo Ready",
+"postAttachCommand": ["bash", "-c", "<install script — see below>"]
 ```
 
-The OR-fallback keeps `postCreateCommand` non-failing if the prod URL is
-down — container is still usable for the CLI flow; learner can install
-the extension manually. The trailing `skillslab --version && claude --version`
-is the existing toolchain smoke test.
+**Why postAttachCommand, NOT postCreateCommand.** First v0.1.9 deploy
+(2026-04-27) used postCreateCommand and hit
+`/bin/sh: 1: code: not found`. Root cause: postCreateCommand runs as
+`/bin/sh -c` (dash on Debian-based images). Dash doesn't source
+.bashrc / .profile, so the `code` CLI VS Code Server adds to PATH via
+shell rc isn't visible. By postAttachCommand time, VS Code has fully
+attached + the `code` CLI is reliably on PATH. v0.1.9.1 moved the
+install accordingly.
+
+**The install script** (one-line bash, locates `code` via 4-level
+fallback so it works even if PATH is wrong):
+
+```bash
+CODE=$(command -v code 2>/dev/null \
+  || ls /vscode/bin/*/bin/remote-cli/code 2>/dev/null | head -1 \
+  || ls /home/*/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1 \
+  || ls /root/.vscode-server/bin/*/bin/remote-cli/code 2>/dev/null | head -1)
+[ -z "$CODE" ] && { echo "[skillslab] code CLI not found, install manually"; exit 0; }
+"$CODE" --list-extensions 2>/dev/null | grep -qx tusharbisht1391.skillslab \
+  && { echo "[skillslab] already installed"; exit 0; }
+echo "[skillslab] downloading + installing extension..."
+curl -fsSL http://52.88.255.208/dl/skillslab.vsix -o /tmp/skillslab.vsix \
+  && "$CODE" --install-extension /tmp/skillslab.vsix \
+  || echo "[skillslab] install failed; install manually"
+```
+
+OR-fallback chain ensures postAttachCommand never aborts the attach —
+container stays usable for the CLI flow even if the network blip
+prevents the vsix download.
 
 ### Keys flow into the container (BYO via host shell, never our backend)
 
