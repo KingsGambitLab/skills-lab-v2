@@ -86,6 +86,38 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
       (courseId: string, moduleId: number, step: any) =>
         cmds.openStep(courseId, moduleId, step),
     ),
+    // "Previous Step" — palette + WebView footer button. Mirrors next();
+    // does not submit, just decrements cursor + opens the predecessor.
+    vscode.commands.registerCommand(
+      "skillslab.previousStep",
+      async () => {
+        const slug = state.getMostRecentSlug();
+        if (!slug) {
+          vscode.window.showInformationMessage("No active step. Open one from the sidebar first.");
+          return;
+        }
+        const cursor = state.getCursor(slug);
+        if (!cursor) return;
+        // Walk to find the current step, then call previous(). We don't
+        // have the current step object handy at the palette level; the
+        // WebView's button passes it via postMessage when the user clicks
+        // there. For palette invocation, just use openCurrentStep semantics
+        // to get a step then advance from cursor. Simpler: walk the flat
+        // list and call previous() with the current step.
+        const course = await api.getCourse(cursor.courseId);
+        let idx = 0;
+        for (const m of course.modules) {
+          const mod = await api.getModule(cursor.courseId, m.id);
+          for (const s of mod.steps) {
+            if (idx === cursor.stepIdx) {
+              await cmds.previous(cursor.courseId, m.id, s);
+              return;
+            }
+            idx++;
+          }
+        }
+      },
+    ),
   );
 
   // URI handler — `vscode://tusharbisht1391.skillslab/course/<slug>?step=<sid>`

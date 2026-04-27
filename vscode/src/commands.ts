@@ -159,6 +159,7 @@ export class CommandHandlers {
       () => void this.submitAndContinue(courseId, moduleId, detailedStep),
       () => void this.next(courseId, moduleId, detailedStep),
       () => void this.runStepInTerminal(detailedStep),
+      () => void this.previous(courseId, moduleId, detailedStep),
     );
   }
 
@@ -298,6 +299,41 @@ export class CommandHandlers {
     const next = flat[nextIdx];
     this.state.setCursor(slug, courseId, nextIdx);
     await this.openStep(courseId, next.mid, next.step);
+    this.tree.refresh();
+  }
+
+  /**
+   * Go back to the previous step (no submit, no completion change).
+   * Mirror of `next()` — cursor decrements, step opens. If we're at
+   * the first step (cursor.stepIdx === 0), surface a friendly message
+   * instead of going negative.
+   */
+  async previous(courseId: string, moduleId: number, _step: StepSummary): Promise<void> {
+    const slug = courseId;
+    const cursor = this.state.getCursor(slug);
+    if (!cursor) {
+      vscode.window.showInformationMessage("No active course.");
+      return;
+    }
+    if (cursor.stepIdx <= 0) {
+      vscode.window.showInformationMessage("Already at the first step.");
+      return;
+    }
+    // Walk the flat step list to find the predecessor.
+    const course = await this.api.getCourse(courseId);
+    const flat: { mid: number; step: StepSummary }[] = [];
+    for (const m of course.modules) {
+      const mod = await this.api.getModule(courseId, m.id);
+      for (const s of mod.steps) flat.push({ mid: m.id, step: s });
+    }
+    const prevIdx = cursor.stepIdx - 1;
+    if (prevIdx < 0 || prevIdx >= flat.length) {
+      vscode.window.showInformationMessage("No previous step.");
+      return;
+    }
+    const prev = flat[prevIdx];
+    this.state.setCursor(slug, courseId, prevIdx);
+    await this.openStep(courseId, prev.mid, prev.step);
     this.tree.refresh();
   }
 

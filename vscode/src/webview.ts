@@ -7,6 +7,17 @@
  * "How to run this step" section that opens the integrated terminal
  * pre-populated with the right commands. Without this, terminal-shy
  * learners read the briefing, click Submit, and bounce on "no output".
+ *
+ * UX feedback 2026-04-27 (user screenshot):
+ *   1. Need a "Previous" button — added to footer-actions next to Skip.
+ *   2. Red theme overwhelming — accent now only appears as a 3px stripe
+ *      on the step-header + on the primary CTA. Everything else uses
+ *      VS Code-native semantic colors so the panel blends with the IDE.
+ *   3. "Open in Browser" was too prominent — now only shown as a primary
+ *      action for steps whose widget IS the work (scenario_branch,
+ *      simulator_loop, incident_console, etc.). For concept / code_read /
+ *      terminal_exercise, the browser link is demoted to a small footer
+ *      utility link, since the WebView already renders everything.
  */
 import * as vscode from "vscode";
 import { rewriteForWebview } from "./widgets";
@@ -23,13 +34,43 @@ export interface StepRenderInput {
   webBaseUrl: string;       // for "Open in browser" links
 }
 
+/**
+ * Exercise types whose interactive widget IS the work surface.
+ * For these, we surface "Open in Browser" as a primary top-of-page CTA
+ * because the dashboard widget is what the learner needs to use to
+ * actually solve the step (drag-drop, scenario tree, sim console, etc.).
+ *
+ * Anything not in this set + non-terminal surface → no top-of-page
+ * primary action (the WebView already shows the briefing inline).
+ */
+const BROWSER_WIDGET_TYPES = new Set([
+  "scenario_branch",
+  "simulator_loop",
+  "incident_console",
+  "categorization",
+  "parsons",
+  "sjt",
+  "mcq",
+  "fill_in_blank",
+  "ordering",
+  "code_review",
+  "adaptive_roleplay",
+  "voice_mock_interview",
+]);
+
 /** Open or focus the step-card panel for a given step. */
 export class StepWebViewManager {
   private panel: vscode.WebviewPanel | null = null;
 
   constructor(private readonly extensionUri: vscode.Uri) {}
 
-  show(input: StepRenderInput, onCheck: () => void, onNext: () => void, onRunInTerminal: () => void): void {
+  show(
+    input: StepRenderInput,
+    onCheck: () => void,
+    onNext: () => void,
+    onRunInTerminal: () => void,
+    onPrev: () => void,
+  ): void {
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
     } else {
@@ -45,6 +86,7 @@ export class StepWebViewManager {
         switch (msg.type) {
           case "submit": onCheck(); break;
           case "next": onNext(); break;
+          case "prev": onPrev(); break;
           case "runInTerminal": onRunInTerminal(); break;
         }
       });
@@ -62,7 +104,7 @@ export class StepWebViewManager {
     const stepLabel = labelOf(input);
     const surface = (input.step.learner_surface || "web").toLowerCase();
     const surfaceWord = surface === "terminal" ? "TERMINAL" : "WEB";
-    const exType = input.step.exercise_type || "concept";
+    const exType = (input.step.exercise_type || "concept").toLowerCase();
     const stepContent = input.step.content || "";
     const accent = input.themeAccent;
     const attemptBadge =
@@ -85,24 +127,44 @@ export class StepWebViewManager {
       `font-src ${cspWebView}`,
     ].join("; ");
 
-    // Browser deep-link for the same step (in case the learner wants to
-    // open the dashboard widget — useful for adaptive_roleplay /
-    // simulator_loop where the browser widget IS the work surface).
+    // Browser deep-link for the same step (opens the dashboard widget —
+    // useful for scenario_branch / simulator_loop / etc. where the widget
+    // IS the work surface).
     const browserUrl = `${input.webBaseUrl.replace(/\/$/, "")}/#${input.courseId}/${input.moduleId}/${Math.max(0, input.step.position - 1)}`;
 
-    // The "How to run" affordance — the footgun fix. For terminal-surface
-    // steps, prominent button to open the integrated terminal pre-populated
-    // with the right commands. For web-surface steps, prominent "Open in
-    // browser" button (the work happens in the dashboard widget).
-    const howToRun = surface === "terminal"
-      ? `<div class="action-row">
-           <button class="primary" data-vsc-msg="runInTerminal">▸ Open Terminal &amp; Run Steps</button>
-           <span class="muted">spawns the integrated terminal with the cli_commands ready</span>
-         </div>`
-      : `<div class="action-row">
-           <a class="primary" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">▸ Open in Browser</a>
-           <span class="muted">interactive widget renders in the dashboard</span>
-         </div>`;
+    // Decide what (if anything) to surface as the top-of-page primary
+    // action. Three buckets:
+    //   - terminal surface → "Open Terminal" (footgun fix from buddy-Opus)
+    //   - browser-widget exercise type → "Open in Browser" (widget = work)
+    //   - everything else (concept / code_read / etc.) → no banner;
+    //     the briefing in the WebView is the whole experience.
+    let howToRun = "";
+    if (surface === "terminal") {
+      howToRun = `
+        <div class="action-row">
+          <button class="primary" data-vsc-msg="runInTerminal">▸ Open Terminal &amp; Run Steps</button>
+          <span class="muted">spawns the integrated terminal with the cli_commands ready</span>
+        </div>`;
+    } else if (BROWSER_WIDGET_TYPES.has(exType)) {
+      howToRun = `
+        <div class="action-row">
+          <a class="primary" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">▸ Open in Browser</a>
+          <span class="muted">the interactive ${escapeAttr(exType.replace(/_/g, " "))} widget renders in the dashboard</span>
+        </div>`;
+    }
+    // else: no top-of-page action — concept / code_read / system_build
+    // briefings are self-contained in the WebView.
+
+    // Decide whether to include the small "Open in Browser ↗" footer
+    // link. We show it ONLY when we did NOT already promote it to a
+    // top-of-page primary (i.e. for terminal-surface + concept-style
+    // steps, in case the learner WANTS the dashboard view as a
+    // secondary path). Stays subtle — link styling, not button.
+    const showFooterBrowserLink =
+      surface !== "web" || !BROWSER_WIDGET_TYPES.has(exType);
+    const footerBrowserLink = showFooterBrowserLink
+      ? `<a class="footer-link" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">view in browser ↗</a>`
+      : "";
 
     return `<!doctype html>
 <html lang="en">
@@ -115,36 +177,85 @@ export class StepWebViewManager {
            background: var(--vscode-editor-background);
            color: var(--vscode-editor-foreground);
            margin: 0; padding: 24px; line-height: 1.55; }
+
+    /* ── Header — only place the course accent shows up beyond the CTA.
+       3px stripe (was 4px) + label color. Everything else native. ── */
     .step-header {
-      border-left: 4px solid ${accent};
-      padding: 12px 18px;
-      margin-bottom: 24px;
+      border-left: 3px solid ${accent};
+      padding: 10px 16px;
+      margin-bottom: 22px;
       background: var(--vscode-sideBar-background);
-      border-radius: 0 6px 6px 0;
+      border-radius: 0 4px 4px 0;
     }
-    .step-header h1 { margin: 0 0 4px 0; font-size: 1.1rem; }
+    .step-header h1 { margin: 0 0 4px 0; font-size: 1.05rem; font-weight: 600; }
     .step-header .label { color: ${accent}; font-weight: 700; margin-right: 8px; }
-    .step-meta { font-size: 0.85rem; opacity: 0.85; }
+    .step-meta { font-size: 0.82rem; opacity: 0.85; }
+
+    /* Badges — all VS Code-native (no accent). Surface badge becomes a
+       neutral pill instead of a colored one. */
     .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
-             font-size: 0.75rem; margin-right: 6px; }
-    .badge-surface { background: ${accent}22; color: ${accent}; }
-    .badge-type { background: var(--vscode-badge-background); color: var(--vscode-badge-foreground); }
+             font-size: 0.72rem; margin-right: 6px; font-weight: 500; }
+    .badge-surface { background: var(--vscode-badge-background);
+                     color: var(--vscode-badge-foreground); }
+    .badge-type { background: var(--vscode-badge-background);
+                  color: var(--vscode-badge-foreground); opacity: 0.75; }
     .badge-attempt { background: var(--vscode-statusBarItem-warningBackground);
                      color: var(--vscode-statusBarItem-warningForeground); }
+
+    /* ── Top-of-page action row (terminal/browser primary CTA) ── */
     .action-row { display: flex; gap: 12px; align-items: center;
-                  margin: 18px 0; padding: 14px; border: 1px solid var(--vscode-panel-border);
-                  border-radius: 6px; background: var(--vscode-textBlockQuote-background); }
+                  margin: 16px 0; padding: 12px 14px;
+                  border: 1px solid var(--vscode-panel-border);
+                  border-radius: 4px;
+                  background: var(--vscode-textBlockQuote-background); }
+
+    /* ── Primary CTA — the ONLY widget that uses the course accent
+       beyond the header stripe + label. Solid fill, white text. ── */
     button.primary, a.primary {
-      background: ${accent}; color: white; border: none; padding: 8px 16px;
-      border-radius: 4px; font-size: 0.95rem; font-weight: 600; cursor: pointer;
+      background: ${accent};
+      color: white;
+      border: none;
+      padding: 7px 16px;
+      border-radius: 3px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
       text-decoration: none;
+      display: inline-block;
     }
-    button.primary:hover, a.primary:hover { opacity: 0.9; }
-    .muted { color: var(--vscode-descriptionForeground); font-size: 0.85rem; }
-    .footer-actions { display: flex; gap: 12px; margin-top: 32px; padding-top: 20px;
+    button.primary:hover, a.primary:hover { opacity: 0.88; }
+
+    /* ── Secondary buttons — VS Code's secondary palette, NOT accent ── */
+    .secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid transparent;
+      padding: 7px 14px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 0.92rem;
+      font-weight: 500;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    .secondary[disabled] { opacity: 0.5; cursor: not-allowed; }
+
+    .muted { color: var(--vscode-descriptionForeground); font-size: 0.83rem; }
+
+    /* ── Footer actions — Submit primary, Prev/Skip secondary, browser link ── */
+    .footer-actions { display: flex; gap: 10px; align-items: center;
+                       margin-top: 28px; padding-top: 18px;
                        border-top: 1px solid var(--vscode-panel-border); }
-    .secondary { background: transparent; color: ${accent}; border: 1px solid ${accent};
-                  padding: 8px 16px; border-radius: 4px; cursor: pointer; font-weight: 600; }
+    .footer-spacer { flex: 1; }
+    .footer-link {
+      color: var(--vscode-textLink-foreground);
+      font-size: 0.82rem;
+      text-decoration: none;
+      opacity: 0.85;
+    }
+    .footer-link:hover { opacity: 1; text-decoration: underline; }
+
     pre { background: var(--vscode-textCodeBlock-background); padding: 12px;
           border-radius: 4px; overflow-x: auto; }
     code { font-family: var(--vscode-editor-font-family); }
@@ -174,8 +285,10 @@ export class StepWebViewManager {
 
   <div class="footer-actions">
     <button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>
-    <button class="secondary" data-vsc-msg="next">Skip — Next Step</button>
-    <a class="secondary" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener" style="display:inline-flex;align-items:center;">Open in Browser ↗</a>
+    <button class="secondary" data-vsc-msg="prev" title="Go to previous step">◂ Previous</button>
+    <button class="secondary" data-vsc-msg="next" title="Skip without submitting">Skip ▸</button>
+    <span class="footer-spacer"></span>
+    ${footerBrowserLink}
   </div>
 
   <script nonce="${nonce}">

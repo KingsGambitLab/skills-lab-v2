@@ -135,10 +135,10 @@ grep -nE 'stripOuterIife|outerIIFE' {repo_root}/vscode/src/widgets.ts
 ```
 
 Match expected. Test that the regex handles BOTH shapes:
-  - Crockford `(function(){...}})();`
-  - Alt `(function(){...}}());`
+  - Crockford `(function(){{...}})();`
+  - Alt `(function(){{...}}());`
   - Leading-semicolon variant
-  - Should NOT strip when the IIFE has args (`(function(x){...})("y")`)
+  - Should NOT strip when the IIFE has args (`(function(x){{...}})("y")`)
 
 ### VI. Devcontainer files exist on all 3 course-repos
 
