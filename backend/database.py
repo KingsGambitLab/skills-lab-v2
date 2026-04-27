@@ -17,6 +17,7 @@ from sqlalchemy import (
     Enum,
     Float,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
@@ -211,8 +212,25 @@ class UserProgress(Base):
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     response_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Course-progression #4 (2026-04-27): server-side attempt counter,
+    # incremented on every /api/exercises/validate call. Drives per-step
+    # pass-rate + dropout signals on the creator dashboard. Nullable for
+    # rows created before the column existed; treat None as 0.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     step: Mapped["Step"] = relationship(back_populates="progress_records")
+
+    # Indices (2026-04-27): UserProgress had zero indices, every query was a
+    # seq scan. Postgres dev/staging feels this on real data — every
+    # /progress/complete + /exercises/validate upsert (now per-attempt
+    # since #4) hits WHERE user_id = ? AND step_id = ?. The composite
+    # covers that hot path and any user_id-scoped reads (get_progress,
+    # creator-learners). The step_id-only index covers the reverse —
+    # aggregate-stats per-step rollup that filters WHERE step_id IN (...).
+    __table_args__ = (
+        Index("ix_user_progress_user_step", "user_id", "step_id"),
+        Index("ix_user_progress_step_id", "step_id"),
+    )
 
 
 class Certificate(Base):
@@ -386,6 +404,27 @@ async def create_tables() -> None:
         column="learner_surface",
         ddl="ALTER TABLE steps ADD COLUMN learner_surface VARCHAR",
     )
+    # Course-progression #4 (2026-04-27) — per-step attempt counter on
+    # UserProgress. Incremented by /api/exercises/validate on every
+    # submission. Existing rows backfill to 0 via the DEFAULT clause.
+    await _ensure_column(
+        table="user_progress",
+        column="attempts",
+        ddl="ALTER TABLE user_progress ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
+    )
+    # Course-progression (2026-04-27) — UserProgress indices for Postgres
+    # dev/staging perf. CREATE INDEX IF NOT EXISTS works on both SQLite
+    # 3.8.0+ and Postgres 9.5+. Idempotent: noop on second startup.
+    # New tables created by Base.metadata.create_all already include
+    # these via __table_args__; this DDL backfills existing tables.
+    await _run_ddl(
+        "CREATE INDEX IF NOT EXISTS ix_user_progress_user_step "
+        "ON user_progress (user_id, step_id)"
+    )
+    await _run_ddl(
+        "CREATE INDEX IF NOT EXISTS ix_user_progress_step_id "
+        "ON user_progress (step_id)"
+    )
 
 
 async def _ensure_column(*, table: str, column: str, ddl: str) -> None:
@@ -404,6 +443,15 @@ async def _ensure_column(*, table: str, column: str, ddl: str) -> None:
         existing = await conn.run_sync(_existing_cols)
         if column in existing:
             return
+        await conn.execute(text(ddl))
+
+
+async def _run_ddl(ddl: str) -> None:
+    """Execute a DDL statement. Used for idempotent CREATE INDEX IF NOT
+    EXISTS migrations where the IF NOT EXISTS clause itself makes the
+    statement re-runnable across SQLite and Postgres."""
+    from sqlalchemy import text
+    async with engine.begin() as conn:
         await conn.execute(text(ddl))
 
 
