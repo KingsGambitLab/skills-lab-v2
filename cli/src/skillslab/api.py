@@ -49,6 +49,17 @@ def login_with_password(email: str, password: str, label: str = "cli") -> dict[s
 
 
 def whoami() -> dict[str, Any] | None:
+    """Return the current user record, or None if not signed in.
+
+    2026-04-27: was raising `ApiError: API 401: Not signed in` when no
+    token was set, because `_client(with_auth=True)` raises before we
+    can check the response. Now: if no token, return None up front so
+    `cli.whoami` can render the friendly "Not signed in" message
+    instead of dumping a traceback (the first command a new learner
+    might try).
+    """
+    if not get_token():
+        return None
     with _client() as c:
         r = c.get("/api/auth/me")
     if r.status_code == 401:

@@ -71,6 +71,14 @@ services:
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
       - GITHUB_TOKEN=${GITHUB_TOKEN:-}
       - GH_TOKEN=${GH_TOKEN:-}
+      # 2026-04-27 — pass terminal capability hints through. Without these,
+      # Rich falls back to 8-color and the course-theme hex accents
+      # (#6366f1 indigo / #f97316 orange / #dc2626 red) all quantize to
+      # ANSI 36 cyan. shim's v7-ux walk caught this; theme renderer is
+      # correct, just needs truecolor on the wire.
+      - TERM=${TERM:-xterm-256color}
+      - COLORTERM=${COLORTERM:-truecolor}
+      - TERM_PROGRAM=${TERM_PROGRAM:-}
     extra_hosts:
       # So the in-container CLI can reach the host's LMS at localhost:8001
       - "host.docker.internal:host-gateway"
