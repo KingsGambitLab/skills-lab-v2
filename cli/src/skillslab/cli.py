@@ -392,6 +392,11 @@ def start(slug: str):
         "content_etag": (etag_info or {}).get("etag"),
         "content_etag_at": _now_iso(),
     })
+    # 2026-04-27 — reset per-step attempt counters when (re)starting a
+    # course. Step IDs may have changed shape after a regen; the old
+    # counter values would over- or under-count attempts on fresh
+    # content. Fresh start = fresh attempt counts.
+    state.reset_attempts(slug)
 
     console.print(f"[green]✓ Wrote {written} step files to[/green] {cdir / 'steps'}")
     console.print(f"[dim]ls {cdir / 'steps'}[/dim]")
@@ -1121,7 +1126,7 @@ def check(ctx, course, paste, cwd, verbose):
     if paste is None and not sys.stdin.isatty():
         paste = sys.stdin.read()
 
-    result = run_check(full_step, cwd=cwd, paste=paste, console=console)
+    result = run_check(full_step, cwd=cwd, paste=paste, console=console, slug=slug)
 
     if result.get("correct"):
         score = result.get("score") or 1.0

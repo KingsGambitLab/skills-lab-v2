@@ -169,6 +169,80 @@ def write_progress(slug: str, progress: dict[str, Any]) -> None:
     (course_dir(slug) / "progress.json").write_text(json.dumps(progress, indent=2))
 
 
+# ── Per-step attempt tracking (2026-04-27) ─────────────────────────────
+# Mirrors `_sllRecordAttempt` in frontend/index.html. The backend's
+# /api/exercises/validate gates the answer-key reveal behind
+# attempt_number >= 3 (line 1444 main.py: `gate_trip = (not is_fully_correct)
+# and attempt_num <= 2`). The CLI was sending no attempt_number → backend
+# defaulted to 1 → "X more retries" counter stuck saying "2 more" forever.
+# Fix: persist a per-(slug, step_id) attempt count in ~/.skillslab/<slug>/attempts.json
+# and pass it on every validate.
+
+def _attempts_path(slug: str) -> Path:
+    return course_dir(slug) / "attempts.json"
+
+
+def _read_attempts(slug: str) -> dict[str, int]:
+    f = _attempts_path(slug)
+    if not f.exists():
+        return {}
+    try:
+        d = json.loads(f.read_text())
+        # Defensive: ensure dict[str, int] shape
+        return {str(k): int(v) for k, v in d.items() if isinstance(v, (int, float))}
+    except Exception:
+        return {}
+
+
+def record_attempt(slug: str, step_id: int | str) -> int:
+    """Increment the attempt counter for a (course, step). Returns the
+    new attempt number (1 on first call, 2 on second, etc.).
+
+    Used by the CLI's grader-submit path so the backend's reveal-gate
+    (attempt_num >= 3 → full breakdown) actually trips on the 3rd
+    submission. Without this, every CLI submission was attempt=1
+    forever and learners saw "2 more retries" in perpetuity.
+
+    Persistence: ~/.skillslab/<slug>/attempts.json — a flat dict
+    {step_id_str: int}. Survives container restarts (the .skillslab
+    home is bind-mounted from the host).
+    """
+    key = str(step_id)
+    counts = _read_attempts(slug)
+    counts[key] = counts.get(key, 0) + 1
+    try:
+        _attempts_path(slug).write_text(json.dumps(counts, indent=2))
+    except Exception:
+        # Non-fatal — fall back to in-process counter (will reset on
+        # restart but at least increments within the session).
+        pass
+    return counts[key]
+
+
+def get_attempt(slug: str, step_id: int | str) -> int:
+    """Read the current attempt count without incrementing. Returns 0
+    if the step has never been submitted.
+    """
+    return _read_attempts(slug).get(str(step_id), 0)
+
+
+def reset_attempts(slug: str, step_id: int | str | None = None) -> None:
+    """Reset attempts. Pass step_id to reset just that step; omit to
+    reset every step in the course. Useful after `skillslab start`
+    refreshes content (the old attempt counts no longer match the
+    new step shape).
+    """
+    if step_id is None:
+        try:
+            _attempts_path(slug).unlink()
+        except FileNotFoundError:
+            pass
+        return
+    counts = _read_attempts(slug)
+    counts.pop(str(step_id), None)
+    _attempts_path(slug).write_text(json.dumps(counts, indent=2))
+
+
 def step_filename(module_pos: int, step_pos: int, title: str) -> str:
     """Build a stable, sortable, readable filename for a step's markdown.
     `M{module}.S{step}-{slug}.md` so `ls steps/` already shows the course

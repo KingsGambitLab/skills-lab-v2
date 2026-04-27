@@ -138,12 +138,30 @@ def mark_step_complete(step_id: int, score: int | float | None = None,
     return _check(r)
 
 
-def validate_exercise(step_id: int, exercise_type: str, response_data: dict) -> dict[str, Any]:
+def validate_exercise(
+    step_id: int,
+    exercise_type: str,
+    response_data: dict,
+    *,
+    attempt_number: int = 1,
+) -> dict[str, Any]:
     """Bridge mode: when a step has a rubric but no native cli_check spec,
     the CLI captures stdout / git diff into response_data and posts to
     the existing LLM-rubric grader. Same payload shape the browser sends.
+
+    2026-04-27: `attempt_number` is now passed (was always defaulting to
+    1 server-side because the CLI never sent it). The backend's reveal
+    gate (main.py: `gate_trip = (not is_fully_correct) and attempt_num <= 2`)
+    needs the real count to flip on attempt 3 and surface the full per-
+    item breakdown. User caught this live: "2 more retries before the
+    full breakdown reveals" never decremented across many submissions.
     """
-    body = {"step_id": step_id, "exercise_type": exercise_type, "response_data": response_data}
+    body = {
+        "step_id": step_id,
+        "exercise_type": exercise_type,
+        "response_data": response_data,
+        "attempt_number": int(attempt_number) if attempt_number else 1,
+    }
     with _client() as c:
         r = c.post("/api/exercises/validate", json=body)
     return _check(r)

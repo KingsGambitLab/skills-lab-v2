@@ -343,11 +343,19 @@ _NATIVE_KINDS = {
 
 # ── LMS bridge (default fallback) ──────────────────────────────────────────
 
-def _bridge_validate(step: dict, submission: str, accept_rc: int) -> dict:
+def _bridge_validate(step: dict, submission: str, accept_rc: int,
+                      *, slug: str | None = None) -> dict:
     """Invisible to the learner — we POST + render the verdict in the
     terminal. The learner runs `skillslab check`, gets a Panel back. They
     don't open the dashboard.
+
+    2026-04-27: now records + passes attempt_number so the backend's
+    reveal-gate (attempt_num >= 3 → full breakdown) actually trips on
+    the 3rd submission. Pre-fix: every CLI submission landed at the
+    backend with attempt_number=1 → "2 more retries" forever, full
+    breakdown never revealed.
     """
+    from . import state as _state
     sid = step.get("id")
     etype = step.get("exercise_type") or "concept"
     payload = {
@@ -357,8 +365,16 @@ def _bridge_validate(step: dict, submission: str, accept_rc: int) -> dict:
         "markdown": submission,
         "acceptance_exit_code": accept_rc,
     }
+    # Resolve which course slug owns this attempt counter. Caller
+    # passes it explicitly when known; fall back to a generic
+    # "_unknown" bucket so the increment still works.
+    attempt_slug = slug or step.get("_course_slug") or "_unknown"
     try:
-        out = api.validate_exercise(sid, etype, payload)
+        attempt_n = _state.record_attempt(attempt_slug, sid)
+    except Exception:
+        attempt_n = 1
+    try:
+        out = api.validate_exercise(sid, etype, payload, attempt_number=attempt_n)
     except api.ApiError as e:
         return {"correct": False, "score": 0, "feedback": f"LMS validate error: {e}",
                 "_debug": {"submission": submission, "accept_rc": accept_rc, "error": str(e)}}
@@ -387,7 +403,7 @@ def _bridge_validate(step: dict, submission: str, accept_rc: int) -> dict:
 # ── Public entry point ────────────────────────────────────────────────────
 
 def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any = None,
-              auto_confirm: bool = False) -> dict:
+              auto_confirm: bool = False, slug: str | None = None) -> dict:
     """Grade a step. Submission + verdict both happen in the terminal — the
     learner never has to switch to the dashboard.
 
@@ -437,7 +453,7 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
         # The captured text becomes the "paste" the bridge submits to the LMS.
         # Backend validator (must_contain / rubric / both) grades unchanged.
         attach = _attach_debug_factory(run.captured_text, accept_rc_val=0)
-        return attach(_bridge_validate(step, run.captured_text, accept_rc=0),
+        return attach(_bridge_validate(step, run.captured_text, accept_rc=0, slug=slug),
                        path="cli_commands")
 
     # 0b) gha_workflow_check runner — push + watch + submit run URL
@@ -459,7 +475,7 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
             if console:
                 console.print(f"[dim]Using --paste run URL directly (skipping push/watch): {run_url}[/dim]")
             attach = _attach_debug_factory(run_url, accept_rc_val=0)
-            return attach(_bridge_validate(step, run_url, accept_rc=0),
+            return attach(_bridge_validate(step, run_url, accept_rc=0, slug=slug),
                            path="gha_push_watch:via_paste")
         from .cli_runners import run_gha_push_and_watch
         gha = run_gha_push_and_watch(gha_check, cwd=cwd, console=console)
@@ -472,7 +488,7 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
         # Submit the run URL as the "paste" — LMS grader (or _check_gha) will
         # hit the GitHub API to verify conclusion. SAME backend contract.
         attach = _attach_debug_factory(gha.run_url, accept_rc_val=0)
-        return attach(_bridge_validate(step, gha.run_url, accept_rc=0),
+        return attach(_bridge_validate(step, gha.run_url, accept_rc=0, slug=slug),
                        path="gha_push_watch")
 
     # Build paste-style submission for the legacy paths below.
@@ -501,7 +517,7 @@ def run_check(step: dict, cwd: str = ".", paste: str | None = None, console: Any
     #    comes back through the API and we render it in the terminal.
     if rubric_raw or must_contain:
         return _attach_debug(
-            _bridge_validate(step, submission, accept_rc),
+            _bridge_validate(step, submission, accept_rc, slug=slug),
             path="bridge_validate",
         )
 
