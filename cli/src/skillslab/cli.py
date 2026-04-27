@@ -720,7 +720,20 @@ def _browser_url(course_id: str, step: dict) -> str:
     module_id = step.get("module_id")
     step_pos = step.get("step_pos")
     if module_id is not None and step_pos is not None:
-        return f"{base}/#{course_id}/{module_id}/{step_pos}"
+        # 2026-04-27 fix: `step_pos` from the DB is 1-INDEXED (first step
+        # has position=1). Frontend's `parseHash` uses 0-INDEXED stepIdx
+        # (parts[2] from the hash). Emitting `step_pos` directly sent
+        # learners to the WRONG step — clicking a M1.S1 deep-link landed
+        # them on M1.S2 because the URL said `.../<mod>/1` (which the
+        # frontend reads as "step at array index 1" = the SECOND step).
+        # User caught this on AIE step 85060 (M1.S1, position=1) → URL
+        # `/23189/1` opened M1.S2 instead. Subtract 1 to map DB-position
+        # → 0-indexed-array-position.
+        try:
+            step_idx = max(0, int(step_pos) - 1)
+        except (TypeError, ValueError):
+            step_idx = 0
+        return f"{base}/#{course_id}/{module_id}/{step_idx}"
     if module_id is not None:
         return f"{base}/#{course_id}/{module_id}"
     return f"{base}/#{course_id}"
