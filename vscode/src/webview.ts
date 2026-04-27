@@ -55,28 +55,53 @@ export interface StepRenderInput {
 }
 
 /**
- * Exercise types whose interactive widget IS the work surface.
- * For these, we surface "Open in Browser" as a primary top-of-page CTA
- * because the dashboard widget is what the learner needs to use to
- * actually solve the step (drag-drop, scenario tree, sim console, etc.).
+ * v0.1.13 reframe (per user 2026-04-27): "Something or the other keeps
+ * breaking in non coding module slides in vscode. Let's only keep
+ * coding exercises on vscode, rest let's redesign the vscode page to
+ * take users to web."
  *
- * Anything not in this set + non-terminal surface → no top-of-page
- * primary action (the WebView already shows the briefing inline).
+ * Architecture:
+ *   - VS Code's strength is the editor + integrated terminal — i.e.
+ *     CODING work. We keep those exercise types fully rendered.
+ *   - Non-coding types (concept slides, drag-drops, simulators,
+ *     roleplay) are first-class in the BROWSER dashboard where their
+ *     widgets render natively. VS Code redirects to the browser
+ *     instead of attempting to render them inline.
+ *
+ * The set of types we render fully in VS Code's WebView. Everything
+ * NOT in this set + non-terminal-surface → renders as a "open in
+ * browser" redirect pane (no briefing, no submit — just nav + CTA).
  */
-const BROWSER_WIDGET_TYPES = new Set([
-  "scenario_branch",
-  "simulator_loop",
-  "incident_console",
-  "categorization",
-  "parsons",
-  "sjt",
-  "mcq",
-  "fill_in_blank",
-  "ordering",
-  "code_review",
-  "adaptive_roleplay",
-  "voice_mock_interview",
+const VSCODE_CODING_TYPES = new Set([
+  "code",              // read & run demos
+  "code_exercise",     // hands-on coding with hidden_tests
+  "code_read",         // read code + explain (only for actual code, not text)
+  "fill_in_blank",     // syntax recall (only for actual code, not text)
+  "terminal_exercise", // BYO-key CLI flow (M0.S2 etc.)
+  "system_build",      // capstone build/deploy with code or terminal
 ]);
+
+/**
+ * Decide whether to redirect to browser. Returns true if the step's
+ * widget IS the work surface (and rendering it inline in a WebView
+ * is brittle — CSP issues, hoisting, etc.).
+ */
+function shouldRedirectToBrowser(step: StepSummary): boolean {
+  const exType = (step.exercise_type || "concept").toLowerCase();
+  const surface = (step.learner_surface || "web").toLowerCase();
+
+  // Terminal-surface = always a CLI step → keep in VS Code (auto-run path).
+  if (surface === "terminal") return false;
+
+  // Zero-code variants of code_read / fill_in_blank / system_build — the
+  // language is text/markdown/plaintext, the widget is a styled reference
+  // block + textarea. Browser renders this better.
+  const lang = (((step as any).demo_data || {}).language || "").toLowerCase();
+  if (lang === "text" || lang === "markdown" || lang === "plaintext") return true;
+
+  // Coding types stay in VS Code; everything else → redirect.
+  return !VSCODE_CODING_TYPES.has(exType);
+}
 
 /**
  * Exercise types that have NO submission to grade — purely read-then-advance.
@@ -85,6 +110,10 @@ const BROWSER_WIDGET_TYPES = new Set([
  * step complete on the way through (mirrors submitAndContinue's concept
  * branch). User feedback 2026-04-27: "Keep submit & continue only for
  * exercises which requires submission."
+ *
+ * Note: redirect-to-browser steps don't render a submit button in the
+ * first place (their entire body is the redirect pane), so this set
+ * only matters for the in-VS-Code coding path.
  */
 const NO_SUBMIT_TYPES = new Set(["concept"]);
 
@@ -173,6 +202,22 @@ export class StepWebViewManager {
   }
 
   private renderHtml(input: StepRenderInput): string {
+    // v0.1.13 — non-coding steps render as a clean "open in browser"
+    // redirect pane, not an attempted-render of an interactive widget
+    // that breaks under CSP / hoist constraints in a WebView.
+    if (shouldRedirectToBrowser(input.step)) {
+      return this.renderRedirectHtml(input);
+    }
+    return this.renderCodingHtml(input);
+  }
+
+  /**
+   * Full WebView render for CODING steps — terminal_exercise / code_exercise /
+   * code_read / fill_in_blank / system_build / code. This is the path with
+   * the briefing, spec panel, auto-run terminal button, feedback panel,
+   * Submit & Continue / Next, etc. Same shape as pre-v0.1.13.
+   */
+  private renderCodingHtml(input: StepRenderInput): string {
     const stepLabel = labelOf(input);
     const surface = (input.step.learner_surface || "web").toLowerCase();
     const surfaceWord = surface === "terminal" ? "TERMINAL" : "WEB";
@@ -224,26 +269,18 @@ export class StepWebViewManager {
           <span class="footer-spacer"></span>
           <a class="footer-link" href="#" data-vsc-msg="runInTerminal">↳ open terminal manually</a>
         </div>`;
-    } else if (BROWSER_WIDGET_TYPES.has(exType)) {
-      howToRun = `
-        <div class="action-row">
-          <a class="primary" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">▸ Open in Browser</a>
-          <span class="muted">the interactive ${escapeAttr(exType.replace(/_/g, " "))} widget renders in the dashboard</span>
-        </div>`;
     }
-    // else: no top-of-page action — concept / code_read / system_build
-    // briefings are self-contained in the WebView.
+    // v0.1.13: in this code path, the only steps reaching renderCodingHtml
+    // are CODING types (terminal_exercise / code_exercise / code_read /
+    // fill_in_blank / system_build / code). Non-coding types are routed
+    // to renderRedirectHtml upstream. So the prior "BROWSER_WIDGET_TYPES"
+    // branch (which served drag-drops + simulators + roleplay) is no
+    // longer reachable here — those types redirect. Removed.
 
-    // Decide whether to include the small "Open in Browser ↗" footer
-    // link. We show it ONLY when we did NOT already promote it to a
-    // top-of-page primary (i.e. for terminal-surface + concept-style
-    // steps, in case the learner WANTS the dashboard view as a
-    // secondary path). Stays subtle — link styling, not button.
-    const showFooterBrowserLink =
-      surface !== "web" || !BROWSER_WIDGET_TYPES.has(exType);
-    const footerBrowserLink = showFooterBrowserLink
-      ? `<a class="footer-link" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">view in browser ↗</a>`
-      : "";
+    // Footer browser link — kept as a subtle escape hatch for coding
+    // steps in case the learner wants the dashboard view too (e.g. to
+    // see other learners' submissions, comments, etc.).
+    const footerBrowserLink = `<a class="footer-link" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">view in browser ↗</a>`;
 
     // Submit & Continue only renders for steps that actually grade a
     // submission. For pure-read steps (concept), the Next button is
@@ -523,6 +560,217 @@ export class StepWebViewManager {
 </body>
 </html>`;
   }
+
+  /**
+   * v0.1.13 — render the "open in browser" redirect pane for non-coding
+   * exercise types (concept slides, scenario_branch, drag-drops,
+   * simulators, roleplay, voice interviews). No briefing render, no
+   * spec panel, no submit button — just a clean "this lives in the
+   * browser" CTA + nav buttons. Avoids the CSP/hoist breakage that
+   * embedding interactive widgets in a WebView produces.
+   *
+   * Reasoning is summarized for the learner: "VS Code is for the
+   * coding work; the browser is where the interactive widgets live."
+   * Reduces confusion + sets expectation that some steps are
+   * intentionally browser-side.
+   */
+  private renderRedirectHtml(input: StepRenderInput): string {
+    const stepLabel = labelOf(input);
+    const exType = (input.step.exercise_type || "concept").toLowerCase();
+    const accent = input.themeAccent;
+    const attemptBadge =
+      input.attemptCount >= 1
+        ? `<span class="badge badge-attempt">attempt ${input.attemptCount + 1}</span>`
+        : "";
+
+    const cspWebView = this.panel!.webview.cspSource;
+    // Tiny inline script handles the prev/next button postMessages — needs
+    // a nonce'd script-src like the coding render does. Generate a fresh
+    // nonce per render.
+    const nonce = generateNonceLocal();
+    const csp = [
+      `default-src 'none'`,
+      `style-src 'unsafe-inline' ${cspWebView}`,
+      `img-src ${cspWebView} https: data:`,
+      `script-src 'nonce-${nonce}'`,
+    ].join("; ");
+
+    const browserUrl = `${input.webBaseUrl.replace(/\/$/, "")}/#${input.courseId}/${input.moduleId}/${Math.max(0, input.step.position - 1)}`;
+
+    // Short reason text — varies by type so the learner knows WHY the
+    // browser is the right surface for this particular step.
+    const reasonText: Record<string, string> = {
+      concept: "Concept slides often have interactive widgets (visualizers, command explorers, decision trees) that render natively in the browser.",
+      scenario_branch: "Scenario branches are interactive decision trees with branching consequences — the browser dashboard renders them as a click-through experience.",
+      simulator_loop: "Live simulations (tick-based dashboards, evolving state, action panels) render as a multi-pane widget in the browser.",
+      incident_console: "The incident console is a 4-pane simulator (alert banner, log tail, shell, Slack) — designed for the browser dashboard.",
+      categorization: "Drag-and-drop categorization works best with the browser's native drag-drop API.",
+      ordering: "Drag-to-reorder works best with the browser's native drag-drop API.",
+      parsons: "Code-line drag-and-drop assembly works best with the browser's native drag-drop API.",
+      sjt: "Ranking-style judgment exercises render as interactive option-rankers in the browser.",
+      mcq: "Quick knowledge-check questions render best as a clickable option list in the browser.",
+      adaptive_roleplay: "Adaptive roleplay is a turn-based chat with hidden state — the browser shows the full debrief panel + state trajectory after the session.",
+      voice_mock_interview: "Voice mock interviews use the browser's microphone + speech-synthesis APIs — VS Code WebViews can't access those.",
+      code_review: "Code review exercises (clicking suspected bug lines) render as an annotated code viewer in the browser.",
+    };
+    const reason =
+      reasonText[exType] ||
+      "This step's interactive content renders natively in the browser dashboard.";
+
+    return `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="${csp}">
+  <title>${escapeAttr(stepLabel)} — Skillslab</title>
+  <style>
+    body { font-family: -apple-system, "Segoe UI", system-ui, sans-serif;
+           background: var(--vscode-editor-background);
+           color: var(--vscode-editor-foreground);
+           margin: 0; padding: 24px; line-height: 1.55; }
+    .step-header {
+      border-left: 3px solid ${accent};
+      padding: 10px 16px;
+      margin-bottom: 22px;
+      background: var(--vscode-sideBar-background);
+      border-radius: 0 4px 4px 0;
+    }
+    .step-header h1 { margin: 0 0 4px 0; font-size: 1.05rem; font-weight: 600; }
+    .step-header .label { color: ${accent}; font-weight: 700; margin-right: 8px; }
+    .step-meta { font-size: 0.82rem; opacity: 0.85; }
+    .badge { display: inline-block; padding: 2px 8px; border-radius: 10px;
+             font-size: 0.72rem; margin-right: 6px; font-weight: 500;
+             background: var(--vscode-badge-background);
+             color: var(--vscode-badge-foreground); }
+    .badge-attempt { background: var(--vscode-statusBarItem-warningBackground);
+                     color: var(--vscode-statusBarItem-warningForeground); }
+
+    .redirect-pane {
+      display: flex; flex-direction: column; align-items: center;
+      text-align: center;
+      padding: 48px 24px;
+      margin: 16px 0 32px;
+      background: var(--vscode-textBlockQuote-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 6px;
+    }
+    .redirect-icon {
+      font-size: 3rem;
+      margin-bottom: 16px;
+      opacity: 0.85;
+    }
+    .redirect-pane h2 {
+      margin: 0 0 12px 0;
+      font-size: 1.15rem;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .redirect-pane p {
+      max-width: 520px;
+      margin: 0 0 20px 0;
+      font-size: 0.92rem;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.6;
+    }
+    .redirect-pane a.cta {
+      background: ${accent};
+      color: white;
+      border: none;
+      padding: 11px 22px;
+      border-radius: 4px;
+      font-size: 0.95rem;
+      font-weight: 600;
+      cursor: pointer;
+      text-decoration: none;
+      display: inline-block;
+      margin-bottom: 14px;
+    }
+    .redirect-pane a.cta:hover { opacity: 0.88; }
+    .redirect-pane .followup {
+      font-size: 0.82rem;
+      color: var(--vscode-descriptionForeground);
+      margin-top: 8px;
+      max-width: 480px;
+    }
+
+    .footer-actions { display: flex; gap: 10px; align-items: center;
+                       margin-top: 28px; padding-top: 18px;
+                       border-top: 1px solid var(--vscode-panel-border); }
+    .footer-spacer { flex: 1; }
+    .secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid transparent;
+      padding: 7px 14px;
+      border-radius: 3px;
+      cursor: pointer;
+      font-size: 0.92rem;
+      font-weight: 500;
+      text-decoration: none;
+      display: inline-block;
+    }
+    .secondary:hover { background: var(--vscode-button-secondaryHoverBackground); }
+    button.primary {
+      background: ${accent};
+      color: white;
+      border: none;
+      padding: 7px 16px;
+      border-radius: 3px;
+      font-size: 0.92rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+    button.primary:hover { opacity: 0.88; }
+  </style>
+</head>
+<body>
+  <div class="step-header">
+    <h1><span class="label">${escapeAttr(stepLabel)}</span>${escapeAttr(input.step.title || "")}</h1>
+    <div class="step-meta">
+      <span class="badge">${escapeAttr(exType)}</span>
+      ${attemptBadge}
+      <span style="opacity: 0.85;">module: ${escapeAttr(input.moduleTitle)}</span>
+    </div>
+  </div>
+
+  <div class="redirect-pane">
+    <div class="redirect-icon">🌐</div>
+    <h2>This step lives in the browser</h2>
+    <p>${escapeAttr(reason)} VS Code is where you do the actual coding work — terminal commands, code edits, capstones.</p>
+    <a class="cta" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">▸ Open in Browser</a>
+    <div class="followup">When you finish in the browser, click <strong>Next ▸</strong> below to advance to the next step. Coding modules render fully here.</div>
+  </div>
+
+  <div class="footer-actions">
+    <button class="secondary" data-vsc-msg="prev" title="Go to previous step">◂ Previous</button>
+    <button class="primary" data-vsc-msg="next" title="Go to next step">Next ▸</button>
+    <span class="footer-spacer"></span>
+  </div>
+
+  <script nonce="${nonce}">
+    document.addEventListener('click', function(e) {
+      const el = e.target.closest && e.target.closest('[data-vsc-msg]');
+      if (!el) return;
+      e.preventDefault();
+      const acquireVsCodeApi = window['acquireVsCodeApi'];
+      const vscode = (window.__vscApi = window.__vscApi || (acquireVsCodeApi && acquireVsCodeApi()));
+      if (vscode) vscode.postMessage({ type: el.getAttribute('data-vsc-msg') });
+    });
+  </script>
+</body>
+</html>`;
+  }
+}
+
+/**
+ * Local nonce generator for renderRedirectHtml (avoids needing to import
+ * widgets.ts:generateNonce — keeps the redirect path self-contained).
+ */
+function generateNonceLocal(len = 24): string {
+  const chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+  let s = "";
+  for (let i = 0; i < len; i++) s += chars.charAt(Math.floor(Math.random() * chars.length));
+  return s;
 }
 
 function labelOf(input: StepRenderInput): string {
