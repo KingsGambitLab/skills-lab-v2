@@ -147,8 +147,6 @@ Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, e
        Render via Path C, extract the dashboard URL emitted by `_print_web_pointer`.
        Verify it has the 3-part form `#<courseId>/<moduleId>/<stepIdx>` (NOT
        just `#<courseId>` which lands on stale cursor).
-       Cross-check moduleId + stepIdx against the actual step you targeted —
-       parse like the frontend's `parseHash` would.
 
 **II2.** **CALL-SITE AUDIT (v5)** — `_browser_url(course_id, step)` is the
        canonical URL builder. Audit EVERY URL-emission site to ensure it
@@ -169,6 +167,53 @@ Mark each ✅ pass / ❌ fail with the EXACT evidence (file:line, output line, e
        bypassing `_browser_url`. v5 caught a 3rd site at `dashboard` cmd.
        Same precision-bug class repeated. v5+ must audit all sites, not
        just verify the function is correct.)
+
+**II3.** **URL→FRONTEND ROUND-TRIP** (added 2026-04-27 after a live bug
+       II1 missed). II1 only checked URL SHAPE (3 parts present); it didn't
+       verify the URL actually points at the right step when the FRONTEND
+       parses it. v6 missed: `_browser_url` emitted `step_pos` (1-indexed
+       from DB position) where the frontend's `parseHash` reads
+       `parts[2]` as a 0-indexed array index → user clicked `M1.S1` URL
+       and landed on `M1.S2`.
+
+       **Mechanical round-trip check** — DON'T eyeball the parts:
+       ```python
+       # Pick a step — preferably the FIRST step of a non-first module so
+       # the off-by-one is visible (M1.S1 of any course works).
+       step = <DB row for first step of M1, e.g. AIE step_id=85060,
+               module_id=23189, step_pos=1>
+
+       # Build the URL the way the CLI does
+       from skillslab.cli import _browser_url
+       url = _browser_url(course_id, {
+           "module_id": step.module_id,
+           "step_pos": step.step_pos,
+       })
+
+       # Parse the URL the way the frontend's parseHash does
+       hash_part = url.split("#", 1)[1]
+       parts = [p for p in hash_part.split("/") if p]
+       parsed_module_id = int(parts[1])
+       parsed_step_idx = int(parts[2])  # 0-indexed array position
+
+       # Look up the step the way the frontend does:
+       # state.currentModuleData.steps[stepIdx].id
+       module_steps = sorted(
+           <DB rows of all steps in module=parsed_module_id>,
+           key=lambda s: s.position,
+       )
+       resolved_step = module_steps[parsed_step_idx]
+
+       assert resolved_step.id == step.id, (
+           f"URL points at step_id={{resolved_step.id}} "
+           f"but the CLI said it was step_id={{step.id}}. "
+           f"Off-by-one between DB position and frontend stepIdx."
+       )
+       ```
+
+       Run this on at LEAST one S1 step from each course (kimi/aie/jspring).
+       If any assertion fails, the URL builder is mis-mapping indexing
+       conventions — same bug class as the 2026-04-27 fix.
 
 ### III. cli_commands runner integrity
 
