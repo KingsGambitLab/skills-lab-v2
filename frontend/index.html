@@ -2390,6 +2390,11 @@ button.expertise-badge:hover {
   background: var(--bg-tertiary);
 }
 
+/* F1 v2 (2026-04-27) — Creator workspace page styles moved to
+   frontend/creator/workspace.css, served via /creator-assets/workspace.css.
+   Search for `.creator-page` / `.creator-shell` / `.creator-side-card`
+   in that file. */
+
 /* Wizard steps indicator */
 .creator-steps-bar {
   display: flex;
@@ -2604,6 +2609,11 @@ button.expertise-badge:hover {
 .creator-exercise-badge.code { background: rgba(74, 124, 255, 0.12); color: var(--accent); }
 .creator-exercise-badge.system_build { background: rgba(245, 158, 11, 0.12); color: #f59e0b; }
 
+/* F1 v2 (2026-04-27) — Editable-outline + workspace styles live in
+   frontend/creator/workspace.css. The .creator-overlay styles above are
+   kept only for any legacy code path that still references them; the
+   live #create route never mounts the overlay. */
+
 /* Feedback textarea in step 3 */
 .creator-feedback-section {
   margin-top: 20px;
@@ -2724,6 +2734,11 @@ button.expertise-badge:hover {
 }
 @keyframes spin { to { transform: rotate(360deg); } }
 </style>
+<!-- Creator workspace v2 (F1, 2026-04-27) — page-route UI lives in its own
+     file so index.html doesn't keep accumulating route-specific bloat.
+     Loaded via the /creator-assets/ route handler in backend/main.py. -->
+<link rel="stylesheet" href="/creator-assets/workspace.css">
+<script src="/creator-assets/workspace.js" defer></script>
 </head>
 <body>
 
@@ -2854,17 +2869,12 @@ button.expertise-badge:hover {
   <span>Create Course</span>
 </button>
 
-<!-- Creator Wizard Modal -->
-<div class="creator-overlay" id="creatorOverlay">
-  <div class="creator-modal">
-    <div class="creator-header">
-      <div class="creator-header-title">Create a Course</div>
-      <button class="creator-close" onclick="closeCreatorWizard()">&times;</button>
-    </div>
-    <div class="creator-steps-bar" id="creatorStepsBar"></div>
-    <div class="creator-body" id="creatorBody"></div>
-  </div>
-</div>
+<!-- Creator wizard: F1 (2026-04-27) — no modal overlay anymore. The wizard
+     mounts as a dedicated page on the #create hash route, into the existing
+     #contentScroll pane. See openCreatorPage() / renderCreatorWizard(). The
+     #creatorBody and #creatorStepsBar ids are written into the DOM at mount
+     time; rendering them here too would create id collisions and cause the
+     render functions to target the wrong element. -->
 
 <script>
 // ===================================================================
@@ -3215,9 +3225,10 @@ function loadCode(courseId, moduleId, stepIndex) {
 // URL Routing
 // ===================================================================
 function updateHash() {
-  const target = (state.view === 'catalog')
-    ? '#'
-    : `#${state.currentCourse.id}/${state.currentModule}/${state.currentStepIndex}`;
+  let target;
+  if (state.view === 'catalog') target = '#';
+  else if (state.view === 'create') target = '#create';
+  else target = `#${state.currentCourse.id}/${state.currentModule}/${state.currentStepIndex}`;
   // Use pushState so Browser Back/Forward navigates through steps naturally.
   // Guard: don't push duplicates (prevents infinite history spam on refresh).
   if (location.hash !== target && location.hash.replace('#', '') !== target.replace('#', '')) {
@@ -3228,6 +3239,9 @@ function updateHash() {
 function parseHash() {
   const h = location.hash.replace('#', '');
   if (!h) return null;
+  // F1 (2026-04-27) — `#create` is the dedicated create-course page route.
+  // Reserved keyword; never collides with course ids (which are uuid-like).
+  if (h === 'create' || h.startsWith('create/')) return { create: true };
   const parts = h.split('/').filter(s => s.length > 0);
   if (parts.length >= 1) {
     // Pre-2026-04-19 bug: parseHash required length>=2, so `#<courseId>` alone
@@ -3252,6 +3266,12 @@ window.addEventListener('popstate', () => {
 });
 
 async function restoreFromHash(r) {
+  // F1 — dedicated create-course route. Mounts the wizard in the main pane,
+  // not as a modal. Hash-driven so refresh/share/back-button all work.
+  if (r && r.create) {
+    openCreatorPage();
+    return;
+  }
   if (!state.courses.length) {
     await loadCatalog();
   }
@@ -9057,10 +9077,12 @@ function _saveCreatorDraft() {
     const levelEl = document.getElementById('creatorLevel');
     const modeEl = document.getElementById('creatorMode');
     const archEl = document.getElementById('creatorArchetype');
-    // Only snapshot if at least one field has real user content — prevents the
-    // "Resume your draft?" banner from firing on an empty wizard open.
-    const title = titleEl?.value || '';
-    const desc = descEl?.value || '';
+    // F1 v2 fix (2026-04-27): on Step 3 the title/desc inputs aren't in the
+    // DOM. Without this fallback we'd save empty strings and clobber the
+    // user's title on every outline edit. Prefer DOM values when present
+    // (live Step-1 typing); fall back to creatorState (post-/start truth).
+    const title = (titleEl && titleEl.value) || creatorState.title || '';
+    const desc  = (descEl  && descEl.value)  || creatorState.description || '';
     const hasContent = title.trim() || desc.trim() || creatorState.sessionId;
     if (!hasContent) return;
     const draft = {
@@ -9068,11 +9090,11 @@ function _saveCreatorDraft() {
       fields: {
         title,
         desc,
-        urls: urlsEl?.value || '',
-        courseType: typeEl?.value || '',
-        level: levelEl?.value || '',
-        courseMode: modeEl?.value || '',
-        archetype: archEl?.value || '',
+        urls: (urlsEl && urlsEl.value) || '',
+        courseType: (typeEl && typeEl.value) || '',
+        level: (levelEl && levelEl.value) || '',
+        courseMode: (modeEl && modeEl.value) || '',
+        archetype: (archEl && archEl.value) || '',
       },
       state: { ...creatorState },
       urlsFetchedMaterial: state._urlsFetchedMaterial || '',
@@ -9121,12 +9143,17 @@ function _clearCreatorDraft() {
 }
 
 // Install a single delegated listener that snapshots the draft whenever any
-// input inside the Creator overlay changes. Covers all current + future fields
-// without having to wire oninput= on every element.
+// input inside the Creator workspace changes. Covers all current + future
+// fields without having to wire oninput= on every element.
+//
+// F1 v2 fix (2026-04-27): the wizard mounts as a route inside .creator-page,
+// not the deleted #creatorOverlay modal. The handler now matches the page
+// container; otherwise autosave silently never fired and refresh wiped the
+// in-progress draft.
 (function _installCreatorDraftListener() {
   function handler(e) {
-    const overlay = document.getElementById('creatorOverlay');
-    if (!overlay || !overlay.contains(e.target)) return;
+    const onCreatorPage = e.target && e.target.closest && e.target.closest('.creator-page');
+    if (!onCreatorPage) return;
     // Debounce bursts of keystrokes to one save per ~300ms.
     clearTimeout(_installCreatorDraftListener._t);
     _installCreatorDraftListener._t = setTimeout(_saveCreatorDraft, 300);
@@ -9142,42 +9169,17 @@ function _clearCreatorDraft() {
   }
 })();
 
+// F1 (2026-04-27) — backward-compat alias. The wizard is now a dedicated
+// hash route (`#create`); historical callsites and any in-flight pages
+// loaded before the upgrade still call this function. We mount the page
+// directly (matching the showCatalog/enterCourse pattern — set state, call
+// updateHash inside). Setting `location.hash` alone wouldn't fire the
+// popstate router on every browser.
 function openCreatorWizard() {
-  // First-visit flag (2026-04-21): remember that the user has discovered the
-  // button so the attention-pulse doesn't keep nagging on subsequent loads.
-  try { localStorage.setItem('creatorFabOpened', '1'); } catch (e) {}
-  const fab = document.getElementById('creatorFab');
-  if (fab) fab.classList.remove('pulse');
-
-  // 2026-04-21 draft-persistence: if a draft exists, restore creatorState
-  // BEFORE rendering so the wizard lands on the same step the user left on.
-  // Title/desc/URLs land back into the DOM after renderCreatorStep1() writes
-  // the inputs (handled in _applyCreatorDraftToDOM called post-render).
-  const draft = _loadCreatorDraft();
-  if (draft && draft.state) {
-    creatorState = { ...creatorState, ...draft.state };
-    if (draft.urlsFetchedMaterial) {
-      state._urlsFetchedMaterial = draft.urlsFetchedMaterial;
-    }
-  } else {
-    creatorState = {
-      step: 1,
-      sessionId: null,
-      questions: [],
-      initialOutline: null,
-      refinedOutline: null,
-      followUpQuestions: null,
-      generatedCourseId: null,
-      generatedCourse: null,
-    };
-  }
-  const overlay = document.getElementById('creatorOverlay');
-  overlay.style.display = 'flex';
-  requestAnimationFrame(() => overlay.classList.add('visible'));
-  renderCreatorWizard();
-  // Post-render: push saved field values back into the DOM inputs.
-  if (draft && draft.fields) _applyCreatorDraftToDOM(draft);
+  openCreatorPage();
 }
+
+// F1 v2: openCreatorPage() lives in /creator-assets/workspace.js
 
 function _applyCreatorDraftToDOM(draft) {
   if (!draft || !draft.fields) return;
@@ -9264,13 +9266,19 @@ function _discardCreatorDraft() {
 })();
 
 function closeCreatorWizard() {
-  const overlay = document.getElementById('creatorOverlay');
-  overlay.classList.remove('visible');
-  setTimeout(() => { overlay.style.display = 'none'; }, 250);
+  // F1 (2026-04-27): wizard is now a route, not a modal. Leaving means
+  // navigating back to the catalog. We call goToCatalog directly (matching
+  // the rest of the app's navigation pattern); updateHash inside showCatalog
+  // clears the URL hash.
+  if (typeof goToCatalog === 'function') goToCatalog();
 }
 
 function renderCreatorStepsBar() {
   const bar = document.getElementById('creatorStepsBar');
+  // Guard: callers may invoke after the user has navigated off /create
+  // (the page chrome is no longer in the DOM). Silently no-op rather than
+  // crash, since later re-entry will re-mount and re-render fresh.
+  if (!bar) return;
   let html = '';
   CREATOR_STEPS.forEach((s, i) => {
     const cls = creatorState.step === s.num ? 'active' : (creatorState.step > s.num ? 'done' : '');
@@ -9285,20 +9293,11 @@ function renderCreatorStepsBar() {
   bar.innerHTML = html;
 }
 
-function renderCreatorWizard() {
-  renderCreatorStepsBar();
-  const body = document.getElementById('creatorBody');
+// F1 v2: renderCreatorWizard() lives in /creator-assets/workspace.js
 
-  if (creatorState.step === 1) {
-    body.innerHTML = renderCreatorStep1();
-  } else if (creatorState.step === 2) {
-    body.innerHTML = renderCreatorStep2();
-  } else if (creatorState.step === 3) {
-    body.innerHTML = renderCreatorStep3();
-  } else if (creatorState.step === 4) {
-    body.innerHTML = renderCreatorStep4();
-  }
-}
+// CTA(s) for the current step. Centralizes navigation so each step's body
+// stays focused on content and the action bar is always visible.
+// F1 v2: renderCreatorFooter() lives in /creator-assets/workspace.js
 
 // ---------- Starter template library ----------
 // 3 HEADLINE AI-power-skills templates pinned to the top (Developer / PM / Operations).
@@ -9461,111 +9460,7 @@ const FRAMING_DIMENSIONS = [
 // + optional source upload. No course_type / level / course_mode / framing pills
 // on step 1 — those are inferred or moved to step 2. Reduces step-1 decisions from
 // ~9 to ~2 for a first-time creator.
-function renderCreatorStep1() {
-  return `
-    <div style="max-width:640px; margin:0 auto; padding:8px 4px;">
-      <!-- SINGLE CONTENT CHANNEL (user directive 2026-04-20): two logical fields only —
-           Topic Name + Content. The Content block carries 3 input modes in
-           strict preference order: Course Objective > PDF/PPT > Link. The backend
-           labels each source in every prompt and tells the LLM "on conflict, earlier
-           wins." Combined total is hard-capped at 18,000 chars so NOTHING is
-           silently truncated downstream; if the creator exceeds the cap they're
-           asked to trim. -->
-
-      <h2 style="font-size:1.4rem; font-weight:700; color:var(--text-primary); margin:0 0 6px; letter-spacing:-0.01em;">Topic name</h2>
-      <p style="font-size:0.88rem; color:var(--text-muted); margin:0 0 16px;">A short, specific title. Or pick a template.</p>
-
-      <div class="creator-form-group" style="position:relative;">
-        <input class="creator-form-input" id="creatorTitle" type="text" autocomplete="off"
-               placeholder="e.g. Incident response for on-call engineers"
-               oninput="showTemplateAutocomplete()" onfocus="showTemplateAutocomplete()" onblur="hideTemplateAutocompleteSoon()"
-               onkeydown="onTitleAutocompleteKey(event)"
-               role="combobox" aria-autocomplete="list" aria-controls="templateAutocomplete" aria-expanded="false"
-               style="font-size:1.02rem; padding:14px 16px;">
-        <div id="templateAutocomplete" style="display:none; position:absolute; top:100%; left:0; right:0; margin-top:4px; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; max-height:320px; overflow-y:auto; z-index:10; box-shadow:0 12px 32px rgba(0,0,0,0.35);"></div>
-      </div>
-
-      <h2 style="font-size:1.4rem; font-weight:700; color:var(--text-primary); margin:28px 0 6px; letter-spacing:-0.01em; display:flex; align-items:center; gap:8px;">
-        Content
-        <span class="creator-info-tip" tabindex="0" aria-label="How content priority works"
-              title="When inputs conflict, the Course Objective takes preference over files, and files over links. Combined 18,000-char limit."
-              style="display:inline-flex; align-items:center; justify-content:center; width:18px; height:18px; border-radius:50%; background:var(--bg-card); border:1px solid var(--border); color:var(--text-muted); font-size:11px; font-weight:600; cursor:help; user-select:none;">i</span>
-      </h2>
-      <p style="font-size:0.88rem; color:var(--text-muted); margin:0 0 14px;">Anything the Creator uses to build the course. <span style="color:var(--text-secondary);">18,000 chars total.</span></p>
-
-      <!-- 1. Course Objective -->
-      <div class="creator-form-group">
-        <label class="creator-form-label" style="font-size:0.84rem; color:var(--text-secondary); margin-bottom:6px; display:flex; align-items:center; gap:8px;">
-          <span style="background:#4a7cff22; color:#4a7cff; font-weight:700; font-size:11px; padding:2px 8px; border-radius:10px;">COURSE OBJECTIVE</span>
-        </label>
-        <textarea class="creator-form-textarea" id="creatorDesc"
-                  oninput="updateCreatorContentMeter()"
-                  placeholder="Everything you want the learners to walk away with — learner persona, constraints, specific skills, facts they must know verbatim, framework names, metrics. The Creator uses this to build the outline, capstone scenario, and every step's prompt. Example: &quot;Senior engineers picking up on-call in Q3. They know Linux, not Kubernetes. Must cover our incident runbook v4.2 (MERIDIAN framework, 7 stages), PagerDuty tiers, and the 15-min acknowledgement SLA.&quot;"
-                  style="min-height:130px; font-size:0.94rem;"></textarea>
-      </div>
-
-      <!-- 2. Files -->
-      <div class="creator-form-group" style="margin-top:16px;">
-        <label class="creator-form-label" style="font-size:0.84rem; color:var(--text-secondary); margin-bottom:6px; display:flex; align-items:center; gap:8px;">
-          <span style="background:#2dd4bf22; color:#2dd4bf; font-weight:700; font-size:11px; padding:2px 8px; border-radius:10px;">FILES</span>
-          <span style="color:var(--text-muted); font-weight:400;">PDF · PPTX · DOCX · TXT · MD</span>
-        </label>
-        <input type="file" id="creatorFiles" multiple
-               accept=".pdf,.docx,.pptx,.ppt,.txt,.md"
-               onchange="updateCreatorContentMeter()"
-               style="width:100%; color:var(--text-secondary); font-size:0.84rem; padding:10px 12px; background:var(--bg-card); border:1px dashed var(--border); border-radius:6px;">
-      </div>
-
-      <!-- 3. Links -->
-      <div class="creator-form-group" style="margin-top:14px;">
-        <label class="creator-form-label" style="font-size:0.84rem; color:var(--text-secondary); margin-bottom:6px; display:flex; align-items:center; gap:8px;">
-          <span style="background:#8892a822; color:#8892a8; font-weight:700; font-size:11px; padding:2px 8px; border-radius:10px;">LINK</span>
-          <span style="color:var(--text-muted); font-weight:400;">Notion · Confluence · docs page</span>
-        </label>
-        <div style="display:flex; gap:10px; align-items:stretch;">
-          <input type="url" id="creatorUrls"
-                 oninput="updateCreatorContentMeter()"
-                 placeholder="https://docs.mycompany.com/handbook (one or more URLs, comma-separated)"
-                 style="flex:1; color:var(--text-primary); font-size:0.86rem; padding:10px 12px; background:var(--bg-card); border:1px solid var(--border); border-radius:6px;">
-          <button type="button" id="creatorFetchUrlBtn" onclick="creatorFetchUrls()"
-                  style="flex:0 0 auto; padding:10px 14px; font-size:0.84rem; font-weight:600; color:var(--accent); background:var(--bg-card); border:1px solid var(--border); border-radius:6px; cursor:pointer;">Fetch</button>
-        </div>
-        <div id="creatorUploadStatus" style="font-size:0.78rem; color:var(--text-muted); margin-top:6px;"></div>
-      </div>
-
-      <!-- Combined char meter — green under limit, amber 90-100%, red over -->
-      <div id="creatorContentMeter" style="margin-top:14px; padding:10px 14px; background:var(--bg-tertiary); border:1px solid var(--border); border-radius:6px; font-size:0.84rem; color:var(--text-secondary); display:flex; justify-content:space-between; align-items:center; gap:10px;">
-        <span id="creatorContentMeterText">0 / 18,000 chars combined</span>
-        <div style="flex:1; max-width:240px; height:6px; background:var(--bg-card); border-radius:3px; overflow:hidden;">
-          <div id="creatorContentMeterBar" style="height:100%; width:0%; background:#34d399; transition:width 0.2s, background 0.2s;"></div>
-        </div>
-      </div>
-
-      <div style="font-size:0.82rem; color:var(--text-muted); margin-top:16px;">
-        <a href="#" onclick="openTemplateBrowser(); return false;" style="color:var(--accent); text-decoration:none;">Browse all ${CREATOR_STARTERS.length} templates →</a>
-      </div>
-
-      <input type="hidden" id="creatorType" value="">
-      <input type="hidden" id="creatorLevel" value="">
-      <input type="hidden" id="creatorMode" value="">
-      <input type="hidden" id="creatorArchetype" value="">
-
-      <div class="creator-actions" style="margin-top:24px;">
-        <button class="creator-btn" onclick="closeCreatorWizard()">Cancel</button>
-        <button class="creator-btn primary" id="creatorStartBtn" onclick="creatorStart()">Continue &rarr;</button>
-      </div>
-    </div>
-
-    <style>
-      .tmpl-row { display:block; padding:10px 14px; border-bottom:1px solid var(--border); cursor:pointer; transition:background 0.12s; }
-      .tmpl-row:hover, .tmpl-row.kb-focus { background: rgba(124,58,237,0.08); }
-      .tmpl-row:last-child { border-bottom: 0; }
-      .tmpl-title { font-size:0.92rem; color:var(--text-primary); font-weight:600; margin-bottom:2px; }
-      .tmpl-meta { font-size:0.76rem; color:var(--text-muted); }
-      .tmpl-hint { padding:10px 14px; font-size:0.78rem; color:var(--text-muted); font-style:italic; }
-    </style>
-  `;
-}
+// F1 v2: renderCreatorStep1() lives in /creator-assets/workspace.js
 
 // Autocomplete: filter CREATOR_STARTERS by the title input's value.
 function showTemplateAutocomplete() {
@@ -10178,6 +10073,16 @@ async function creatorStart() {
     } finally { _stopStartPhases(); }
 
     creatorState.sessionId = enqueueData.session_id;
+    // F1 v2 (2026-04-27): persist Step-1 inputs onto creatorState so later
+    // steps (Step 2 recap, Step 3 drift detector) can read them. Previously
+    // these only lived in DOM inputs that get destroyed on step transition,
+    // so the Step-2 right-panel recap rendered "(blank)". We store the
+    // user-typed description (DOM value) — `desc` may have framing-pill
+    // text appended for backend, but the recap should show what the
+    // creator actually wrote.
+    creatorState.title = title;
+    creatorState.description = (_descEl && _descEl.value.trim()) || desc;
+    creatorState.sourceMaterial = sourceMaterial;
     const resp = finalResp || {};
     creatorState.questions = resp.questions || [];
     creatorState.initialOutline = resp.initial_outline || { modules: [] };
@@ -10248,69 +10153,7 @@ async function _pollCreatorTaskUntilDone(sessionId, opts) {
 }
 
 // ---------- Step 2: Answer Questions ----------
-function renderCreatorStep2() {
-  // Layout: single column of combo-input questions. Submit proceeds to step 3.
-  //
-  // 2026-04-22 cleanup: removed the "How hands-on should this feel?" depth
-  // picker (Drop-in simulation / Guided practice / Concept-first). It was
-  // compulsory in the UI but the selected value was stashed on creatorState
-  // and NEVER sent to the backend — /api/creator/refine receives only
-  // {session_id, answers}. Dead UX that gated submit for nothing. If/when
-  // we wire depth through, restore via the COURSE_MODE_REGISTRY path.
-
-  // Questions render as a TYPEAHEAD COMBOBOX: input + dropdown of suggestions that
-  // filters as you type, BUT always accepts free text. Fixes "none of the options fit" problem.
-  // Now with ARIA attributes for screen-reader users (aria-combobox / autocomplete / expanded).
-  const questionsHtml = creatorState.questions.map((q, qIdx) => {
-    const suggestions = (q.type === 'choice' && Array.isArray(q.options)) ? q.options : [];
-    const comboId = `creatorCombo_${qIdx}`;
-    const ddId = comboId + '_dd';
-    const suggestionsJson = JSON.stringify(suggestions).replace(/"/g, '&quot;');
-    const hint = suggestions.length
-      ? `${suggestions.length} suggestion${suggestions.length===1?'':'s'} — or write your own`
-      : 'Type your own answer';
-    return `<div class="creator-question-item" style="margin-bottom:16px;">
-      <label for="${comboId}" class="creator-question-text" style="margin-bottom:6px; display:block;">${esc(q.question)}</label>
-      <div class="combo-wrap" style="position:relative;" role="combobox" aria-expanded="false" aria-haspopup="listbox" aria-owns="${ddId}">
-        <input class="creator-form-input creator-answer combo-input"
-               id="${comboId}"
-               data-qid="${esc(q.id)}"
-               data-suggestions="${suggestionsJson}"
-               type="text"
-               autocomplete="off"
-               role="combobox"
-               aria-autocomplete="list"
-               aria-controls="${ddId}"
-               aria-expanded="false"
-               placeholder="Type your answer or press ↓ for suggestions"
-               oninput="onComboInput('${comboId}')"
-               onfocus="showComboDropdown('${comboId}')"
-               onblur="hideComboDropdownSoon('${comboId}')"
-               onkeydown="onComboKey(event, '${comboId}')"
-               >
-        <div class="combo-hint" style="font-size:0.74rem; color:var(--text-muted); margin-top:4px;">${esc(hint)}</div>
-        <div class="combo-dropdown"
-             id="${ddId}"
-             role="listbox"
-             style="display:none; position:absolute; top:100%; left:0; right:0; margin-top:4px; background:var(--bg-card); border:1px solid var(--border); border-radius:8px; max-height:240px; overflow-y:auto; z-index:20; box-shadow:0 12px 32px rgba(0,0,0,0.35);">
-        </div>
-      </div>
-    </div>`;
-  }).join('');
-
-  // Single-column layout — the outline-preview right-panel was dropped. Outline shows on step 3.
-  return `
-    <div style="max-width:720px; margin:0 auto;">
-      <h3 style="font-size:0.94rem; color:var(--text-primary); margin:10px 0 14px;">A few questions so we can tailor the course</h3>
-      ${questionsHtml}
-
-      <div class="creator-actions">
-        <button class="creator-btn" onclick="creatorState.step=1;renderCreatorWizard();">&larr; Back</button>
-        <button class="creator-btn primary" id="creatorRefineBtn" onclick="creatorRefine()">Submit Answers &rarr;</button>
-      </div>
-    </div>
-  `;
-}
+// F1 v2: renderCreatorStep2() lives in /creator-assets/workspace.js
 
 async function creatorRefine(isRetry) {
   const answerEls = document.querySelectorAll('.creator-answer');
@@ -10393,56 +10236,64 @@ async function creatorRefine(isRetry) {
   }
 }
 
-// ---------- Step 3: Review & Refine ----------
-function renderCreatorStep3() {
-  const outline = creatorState.refinedOutline;
-  const treeHtml = (outline.modules || []).map(mod => {
-    const stepsHtml = (mod.steps || []).map(s => `
-      <div class="creator-step-node">
-        <span class="creator-step-title">${esc(s.title)}</span>
-        <span class="creator-exercise-badge ${s.exercise_type || ''}">${esc(s.exercise_type || 'concept')}</span>
-      </div>`).join('');
+// ---------- Step 3: Review Outline (editable, F1 2026-04-27) ----------
+// Creator edits the refined outline before generation: rename / reorder /
+// add / delete modules and steps; change exercise_type per step. Mutations
+// update creatorState.refinedOutline locally + push to /api/creator/outline
+// (debounced) so a refresh during editing doesn't lose work.
+//
+// Looks-good gate: Generate Course only fires after the creator confirms the
+// outline is ready. State bit: creatorState.outlineConfirmed (false by default;
+// reset to false on any structural change so a late edit can't sneak past
+// confirmation).
 
-    const objHtml = (mod.objectives || []).length
-      ? `<ul class="creator-module-objectives">${mod.objectives.map(o => `<li>${esc(o)}</li>`).join('')}</ul>`
-      : '';
+// F1 v2: CREATOR_DEFAULT_TYPES
 
-    return `<div class="creator-module-node">
-      <div class="creator-module-title">${esc(mod.title)}</div>
-      ${objHtml}
-      ${stepsHtml}
-    </div>`;
-  }).join('');
+// F1 v2: _creatorLoadAssignmentTypes
 
-  let followUpHtml = '';
-  if (creatorState.followUpQuestions && creatorState.followUpQuestions.length) {
-    followUpHtml = `
-      <div class="creator-follow-ups">
-        <h4 style="font-size:0.85rem;font-weight:600;color:var(--text-primary);margin-bottom:10px">Follow-up Questions</h4>
-        ${creatorState.followUpQuestions.map(fq => `
-          <div class="creator-follow-up-item">
-            <div class="creator-follow-up-q">${esc(fq.question)}</div>
-            <input class="creator-form-input creator-followup-answer" data-fqid="${esc(fq.id)}" placeholder="Your response (optional)...">
-          </div>`).join('')}
-      </div>`;
-  }
+// F1 v2: _creatorTypeOptions
 
-  return `
-    <h3 style="font-size:0.95rem;font-weight:700;margin-bottom:14px">Course Outline</h3>
-    <div class="creator-outline-tree">${treeHtml || '<p style="color:var(--text-muted)">No modules in outline.</p>'}</div>
-    ${followUpHtml}
-    <div class="creator-feedback-section">
-      <h4>Additional Feedback (optional)</h4>
-      <textarea class="creator-form-textarea" id="creatorFeedback" placeholder="Request changes, add modules, adjust difficulty..."></textarea>
-      <div style="margin-top:10px">
-        <button class="creator-btn" id="creatorReRefineBtn" onclick="creatorReRefine()">Refine Again</button>
-      </div>
-    </div>
-    <div class="creator-actions">
-      <button class="creator-btn" onclick="creatorState.step=2;renderCreatorWizard();">&larr; Back</button>
-      <button class="creator-btn success" id="creatorGenerateBtn" onclick="creatorGenerate()">Generate Course</button>
-    </div>`;
-}
+// directly from inline handlers, so the save scheduler and re-render fire). -----
+
+// F1 v2: _creatorMutateOutline
+
+// F1 v2: creatorRenameModule
+
+// F1 v2: creatorMoveModule
+
+// F1 v2: creatorDeleteModule
+
+// F1 v2: creatorAddModule
+
+// F1 v2: creatorRenameStep
+
+// F1 v2: creatorChangeStepType
+
+// F1 v2: creatorEditStepDesc
+
+// F1 v2: creatorMoveStep
+
+// F1 v2: creatorDeleteStep
+
+// F1 v2: creatorAddStep
+
+// F1 v2: creatorToggleStepDesc
+
+
+// F1 v2: outline save scheduler state
+let _creatorOutlineSaveSeq = 0;
+
+// F1 v2: _creatorScheduleSaveOutline
+
+// F1 v2: _creatorSaveOutline
+
+// F1 v2: _creatorSetSaveStatus
+
+
+// F1 v2: _creatorDetectSourceModuleCount
+
+
+// F1 v2: renderCreatorStep3() lives in /creator-assets/workspace.js
 
 async function creatorReRefine() {
   const feedback = (document.getElementById('creatorFeedback').value || '').trim();
@@ -10476,6 +10327,12 @@ async function creatorReRefine() {
 
     creatorState.refinedOutline = data.outline || creatorState.refinedOutline;
     creatorState.followUpQuestions = data.follow_up_questions || null;
+    // Re-refine produced a (potentially) new outline shape — un-confirm so
+    // the creator looks at it before generating, reset accordion state +
+    // per-module review flags (the outline is structurally new).
+    creatorState.outlineConfirmed = false;
+    creatorState._descOpen = {};
+    creatorState._activeModuleIdx = 0;
     renderCreatorWizard();
   } catch (e) {
     btn.disabled = false;
@@ -10486,10 +10343,13 @@ async function creatorReRefine() {
 
 async function creatorGenerate() {
   const btn = document.getElementById('creatorGenerateBtn');
-  btn.disabled = true;
-  btn.textContent = 'Generating...';
+  if (btn) {
+    btn.disabled = true;
+    btn.textContent = 'Generating...';
+  }
 
   const body = document.getElementById('creatorBody');
+  if (!body) return;  // navigated away mid-flight
   // Render live progress UI — updated by the polling loop below.
   // Phase line starts with an explicit pre-gen status so the learner never
   // sees a blank "Starting up..." for 5-15s while the backend initializes.
@@ -10719,19 +10579,7 @@ function _renderCreatorProgress(p) {
 }
 
 // ---------- Step 4: Done ----------
-function renderCreatorStep4() {
-  const title = creatorState.generatedCourse?.title || 'your course';
-  return `
-    <div class="creator-success">
-      <span class="creator-success-icon">&#10024;</span>
-      <h3>Course Created!</h3>
-      <p>"${esc(title)}" has been generated and is ready for learners.</p>
-      <div style="display:flex;gap:12px;justify-content:center;flex-wrap:wrap">
-        <button class="creator-btn primary" onclick="creatorGoToCourse()">Open Course</button>
-        <button class="creator-btn" onclick="closeCreatorWizard()">Close</button>
-      </div>
-    </div>`;
-}
+// F1 v2: renderCreatorStep4() lives in /creator-assets/workspace.js
 
 async function creatorGoToCourse() {
   closeCreatorWizard();
@@ -10747,7 +10595,9 @@ async function creatorGoToCourse() {
   }
 }
 
-// Show/hide creator FAB based on view
+// Show/hide creator FAB based on view. Only visible from the catalog —
+// hidden inside an open course AND on the dedicated #create page (no point
+// "Create another course" while you're already creating one).
 function updateCreatorFab() {
   const fab = document.getElementById('creatorFab');
   if (fab) {

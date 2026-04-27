@@ -804,6 +804,34 @@ async def get_template_asset(name: str, ext: str):
                     headers={"Cache-Control": "public, max-age=300"})
 
 
+# ── Creator workspace assets (F1 v2, 2026-04-27) ───────────────────
+# Same pattern as /templates/ but serves the dedicated Creator-page assets
+# from frontend/creator/. Keeping them out of index.html prevents that file
+# from accumulating UI code that's only used in one route (#create).
+_CREATOR_DIR = _os_tpl.path.join(_os_tpl.path.dirname(_os_tpl.path.dirname(__file__)), "frontend", "creator")
+
+
+@app.get("/creator-assets/{name}.{ext}")
+async def get_creator_asset(name: str, ext: str):
+    """Serve a Creator-workspace asset. Whitelist ext to js/css only —
+    the workspace doesn't ship its own HTML; index.html mounts the router."""
+    from fastapi.responses import Response
+    if ext not in ("js", "css"):
+        raise HTTPException(404, "unsupported extension")
+    if "/" in name or ".." in name or not name.replace("_", "").isalnum():
+        raise HTTPException(400, "invalid creator asset name")
+    path = _os_tpl.path.join(_CREATOR_DIR, f"{name}.{ext}")
+    if not _os_tpl.path.exists(path):
+        raise HTTPException(404, f"creator asset {name}.{ext} not found")
+    ct = {"js": "application/javascript", "css": "text/css"}[ext]
+    return Response(
+        content=open(path, encoding="utf-8").read(),
+        media_type=ct,
+        # No-cache during dev; switch to 300s once the file stabilizes.
+        headers={"Cache-Control": "no-store, no-cache, must-revalidate, max-age=0"},
+    )
+
+
 # ── F24: GitHub Actions workflow_run check ─────────────────────────
 # Learner pastes a GHA run URL; we parse owner/repo/run_id, call the GitHub
 # API (unauth works for public repos, token via env for rate limits), check
@@ -10260,6 +10288,74 @@ async def _creator_refine_impl(req: CreatorRefineRequest):
         follow_up_questions=follow_ups,
         ready_to_generate=True,
     )
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# F1 (2026-04-27) — Outline preview & edit
+# ═══════════════════════════════════════════════════════════════════════════
+# The wizard's Step 3 ("Review Outline") lets the creator rename / reorder /
+# add / delete modules and steps before generation. These two endpoints back
+# that step. Both are additive — /refine and /generate are byte-identical for
+# any client that doesn't use them.
+
+@app.get("/api/creator/ontology/assignments")
+async def creator_ontology_assignments():
+    """Return the ASSIGNMENT_REGISTRY as a list. Drives the exercise_type
+    dropdown on Step 3 so the dropdown stays in sync with the registry as
+    new types are registered (no hardcoded list in JS to drift)."""
+    return [
+        {
+            "id": a.id,
+            "description": a.description,
+            "grade_primitives": list(a.grade_primitives),
+            "is_code_assignment": bool(a.is_code_assignment),
+        }
+        for a in ASSIGNMENT_REGISTRY.values()
+    ]
+
+
+@app.post("/api/creator/outline")
+async def creator_outline_save(body: dict):
+    """Persist the creator's edited outline back to session state.
+
+    Refresh-resilience: without this, an editor reload during Step 3 loses
+    every edit. With it, Step 3 reopens with the last saved outline.
+
+    Validates exercise_type against ASSIGNMENT_REGISTRY. Unknown types are
+    rejected with 400 — keeps the outline in sync with what _is_complete +
+    the grader will accept downstream.
+    """
+    session_id = body.get("session_id")
+    outline = body.get("outline")
+    if not session_id or not isinstance(outline, dict):
+        raise HTTPException(400, "session_id and outline are required")
+
+    session = _creator_sessions.get(session_id)
+    if not session:
+        raise HTTPException(404, "Creator session not found")
+
+    # Round-trip through the Pydantic model: drops unknown fields, enforces
+    # the {modules: [{title, position, objectives, steps: [{title,
+    # exercise_type, description}]}]} shape.
+    try:
+        validated = CreatorRefinedOutline(**outline)
+    except Exception as e:
+        raise HTTPException(400, f"Invalid outline shape: {e}")
+
+    # Validate exercise_type values against the registry.
+    valid_types = set(ASSIGNMENT_REGISTRY.keys())
+    for m_idx, mod in enumerate(validated.modules):
+        for s_idx, step in enumerate(mod.steps):
+            if step.exercise_type not in valid_types:
+                raise HTTPException(
+                    400,
+                    f"Module {m_idx + 1} step {s_idx + 1}: unknown "
+                    f"exercise_type '{step.exercise_type}'. Valid: "
+                    f"{sorted(valid_types)}",
+                )
+
+    session["refined_outline"] = validated.model_dump()
+    return {"ok": True, "modules": len(validated.modules)}
 
 
 # ═══════════════════════════════════════════════════════════════════════════
