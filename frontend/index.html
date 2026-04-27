@@ -3042,7 +3042,16 @@ function isStepComplete(courseId, moduleId, stepIndex) {
   return !!getProgress()[stepKey(courseId, moduleId, stepIndex)];
 }
 
-function markStepComplete(courseId, moduleId, stepIndex, score) {
+// Persistence: localStorage is the optimistic source of truth (offline +
+// instant UI), but the backend is durable. We:
+//   1. Mark complete locally + render IMMEDIATELY (no await) so the UI
+//      doesn't stall on network latency.
+//   2. POST to /api/progress/complete with await so errors are visible
+//      and the certificate-issuance signal lands deterministically.
+//   3. On any failure, push the write into a localStorage retry queue
+//      so a tab close mid-POST doesn't lose progress — the queue drains
+//      on the next page load (see _drainPendingProgressWrites at init).
+async function markStepComplete(courseId, moduleId, stepIndex, score) {
   const p = getProgress();
   const key = stepKey(courseId, moduleId, stepIndex);
   if (p[key]) return; // Already complete
@@ -3051,29 +3060,125 @@ function markStepComplete(courseId, moduleId, stepIndex, score) {
   renderStepDots();
   renderModuleList();
 
-  // Persist to backend (fire and forget)
   const steps = state.modules?.[moduleId]?.steps;
   const stepObj = steps?.[stepIndex];
-  if (stepObj && stepObj.id) {
-    fetch('/api/progress/complete', {
-      method: 'POST',
-      headers: {'Content-Type': 'application/json'},
-      body: JSON.stringify({step_id: stepObj.id, score: score || null}),
-    })
-    .then(r => r.json())
-    .then(data => {
-      if (data.certificate_issued) {
-        showCertificateCelebration(courseId, data.certificate);
-      }
-    })
-    .catch(() => {}); // Silently fail
-  }
+  const stepType = stepObj?.exercise_type || stepObj?.step_type || 'concept';
 
   // Check local completion for course (only for exercise steps, not concept auto-completes)
-  const stepType = stepObj?.exercise_type || stepObj?.step_type || 'concept';
   if (stepType !== 'concept') {
     checkCourseCompletion(courseId);
   }
+
+  if (stepObj && stepObj.id) {
+    await _persistProgressComplete(courseId, stepObj.id, score);
+  }
+}
+
+const PROGRESS_PENDING_KEY = 'learnSkillsPendingWrites_v1';
+
+function _loadPendingProgressWrites() {
+  try { return JSON.parse(localStorage.getItem(PROGRESS_PENDING_KEY) || '[]'); }
+  catch { return []; }
+}
+function _savePendingProgressWrites(arr) {
+  try { localStorage.setItem(PROGRESS_PENDING_KEY, JSON.stringify(arr)); } catch (_) {}
+}
+
+async function _persistProgressComplete(courseId, stepId, score) {
+  try {
+    const res = await fetch('/api/progress/complete', {
+      method: 'POST',
+      headers: {'Content-Type': 'application/json'},
+      credentials: 'same-origin',
+      body: JSON.stringify({step_id: stepId, score: score == null ? null : score}),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const data = await res.json();
+    if (data && data.certificate_issued) {
+      showCertificateCelebration(courseId, data.certificate);
+    }
+  } catch (e) {
+    // Queue for retry on next page load. The localStorage update already
+    // happened; this just means the backend is temporarily unsynced.
+    console.warn('progress sync failed, queued for retry:', e && e.message);
+    const q = _loadPendingProgressWrites();
+    q.push({step_id: stepId, score: score == null ? null : score, course_id: courseId, queued_at: Date.now()});
+    // Cap the queue at 100 entries so a long offline streak doesn't blow up localStorage.
+    if (q.length > 100) q.splice(0, q.length - 100);
+    _savePendingProgressWrites(q);
+  }
+}
+
+// Pulls /api/progress/{course_id} from the backend and writes the
+// completed step_ids into localStorage so the UI is consistent with the
+// authenticated user's durable progress, not just the per-device local
+// cache. Called from enterCourse before render.
+//
+// We resolve module + step indices for each backend-reported completion
+// by looking up state.modules — the course detail just landed, so the
+// step.id → (module.id, step_index) mapping is in memory.
+async function _mergeBackendProgressIntoLocal(courseId) {
+  let payload;
+  try {
+    const res = await fetch(`${API}/progress/${encodeURIComponent(courseId)}`, {
+      credentials: 'same-origin',
+    });
+    if (!res.ok) return;
+    payload = await res.json();
+  } catch (_) { return; }
+
+  if (!payload || !Array.isArray(payload.steps)) return;
+  // Build a step_id → (moduleId, stepIndex) map from the in-memory course.
+  const stepMap = new Map();
+  for (const m of (state.modules || [])) {
+    const arr = m.steps || [];
+    for (let i = 0; i < arr.length; i++) {
+      if (arr[i] && arr[i].id != null) stepMap.set(arr[i].id, { moduleId: m.id, stepIndex: i });
+    }
+  }
+  if (!stepMap.size) return;
+
+  const p = getProgress();
+  let mutated = false;
+  for (const sc of payload.steps) {
+    if (!sc || !sc.completed) continue;
+    const ref = stepMap.get(sc.step_id);
+    if (!ref) continue;
+    const key = stepKey(courseId, ref.moduleId, ref.stepIndex);
+    if (!p[key]) {
+      p[key] = true;
+      mutated = true;
+    }
+  }
+  if (mutated) saveProgress(p);
+}
+
+// Drains the retry queue on init. Best-effort — any entry that still fails
+// stays in the queue for the next attempt. Avoids storms by stopping after
+// the first failure (likely the same network problem applies to all).
+async function _drainPendingProgressWrites() {
+  const q = _loadPendingProgressWrites();
+  if (!q.length) return;
+  const remaining = [];
+  for (const entry of q) {
+    try {
+      const res = await fetch('/api/progress/complete', {
+        method: 'POST',
+        headers: {'Content-Type': 'application/json'},
+        credentials: 'same-origin',
+        body: JSON.stringify({step_id: entry.step_id, score: entry.score}),
+      });
+      if (!res.ok) { remaining.push(entry); break; }
+      const data = await res.json();
+      if (data && data.certificate_issued && entry.course_id) {
+        showCertificateCelebration(entry.course_id, data.certificate);
+      }
+    } catch (_) { remaining.push(entry); break; }
+  }
+  // Anything we didn't process (after a break) stays queued.
+  const idx = q.indexOf(remaining[0]);
+  const tail = idx > 0 ? q.slice(idx) : remaining;
+  _savePendingProgressWrites(tail);
 }
 
 function checkCourseCompletion(courseId) {
@@ -3306,6 +3411,10 @@ async function init() {
   // renders in its final form immediately (no flash from signed-out →
   // signed-in).
   try { await hydrateAuth(); } catch (_) {}
+  // Course-progression #1 (2026-04-27): drain any progress writes that
+  // were queued while offline / mid-tab-close. Best-effort, runs in the
+  // background — doesn't block catalog load.
+  _drainPendingProgressWrites().catch(() => {});
   const r = parseHash();
   if (r) {
     await loadCatalog();
@@ -3470,14 +3579,136 @@ async function loadCreatorLearnersForCourse(courseId) {
   if (!detail) return;
   detail.innerHTML = `<div style="color:#8892a8; padding:16px;">Loading learners…</div>`;
   try {
-    const r = await fetch(`${API}/auth/creator/courses/${encodeURIComponent(courseId)}/enrolled-learners`,
-      {credentials: 'same-origin'});
-    if (!r.ok) throw new Error(`learners ${r.status}`);
-    const data = await r.json();
-    renderCreatorLearnersTable(data, detail);
+    // Course-progression #6 (2026-04-27): fetch the aggregate stats alongside
+    // the per-learner roster so the overview + step heatmap render in the
+    // same view. /aggregate-stats failure is non-fatal — we still show the
+    // learner table with a small notice that aggregates are missing.
+    const [learnersRes, aggRes] = await Promise.all([
+      fetch(`${API}/auth/creator/courses/${encodeURIComponent(courseId)}/enrolled-learners`,
+        {credentials: 'same-origin'}),
+      fetch(`${API}/auth/creator/courses/${encodeURIComponent(courseId)}/aggregate-stats`,
+        {credentials: 'same-origin'}),
+    ]);
+    if (!learnersRes.ok) throw new Error(`learners ${learnersRes.status}`);
+    const data = await learnersRes.json();
+    const agg = aggRes.ok ? await aggRes.json() : null;
+    let html = '';
+    if (agg) html += renderCreatorAggregateOverview(agg);
+    detail.innerHTML = html + `<div id="creatorLearnersTable"></div>`;
+    renderCreatorLearnersTable(data, document.getElementById('creatorLearnersTable'));
   } catch (e) {
     detail.innerHTML = `<div style="color:#fca5a5; padding:16px;">Failed to load learners: ${esc(e.message)}</div>`;
   }
+}
+
+// Course-progression #6 (2026-04-27): renders the aggregate-stats overview
+// the creator sees above the per-learner table. Three blocks:
+//   - Top metrics row (enrolled / completed / avg pct / median pct)
+//   - Last-active distribution (engagement freshness — day / week / month / older / never)
+//   - Per-step pass-rate heatmap grouped by module (which exercises bottle up learners)
+function renderCreatorAggregateOverview(agg) {
+  const s = agg.summary || {};
+  const buckets = s.last_active_distribution || {};
+  const enrolled = s.enrolled || 0;
+  const completed = s.completed_course || 0;
+  const avg = s.avg_progress_percent != null ? s.avg_progress_percent : 0;
+  const median = s.median_progress_percent != null ? s.median_progress_percent : 0;
+
+  // Top metrics — stacked stat cards.
+  const stat = (label, value, hint) => `
+    <div style="background:#0e1218; border:1px solid #2a3352; border-radius:8px; padding:14px 16px; flex:1 1 0;">
+      <div style="color:#8892a8; font-size:0.74rem; text-transform:uppercase; letter-spacing:0.05em; margin-bottom:4px;">${esc(label)}</div>
+      <div style="color:#e8ecf4; font-size:1.4rem; font-weight:700; line-height:1.1;">${esc(value)}</div>
+      ${hint ? `<div style="color:#8892a8; font-size:0.74rem; margin-top:3px;">${esc(hint)}</div>` : ''}
+    </div>`;
+  const metricsRow = `
+    <div style="display:flex; gap:10px; margin-bottom:14px; flex-wrap:wrap;">
+      ${stat('Enrolled', enrolled)}
+      ${stat('Completed course', completed, enrolled ? `${Math.round(100*completed/enrolled)}% of enrolled` : '')}
+      ${stat('Avg progress', `${avg}%`)}
+      ${stat('Median progress', `${median}%`)}
+    </div>`;
+
+  // Last-active distribution: small horizontal bar.
+  const totalActiveBuckets = (buckets.day || 0) + (buckets.week || 0) + (buckets.month || 0) + (buckets.older || 0) + (buckets.never || 0);
+  const seg = (key, label, color) => {
+    const v = buckets[key] || 0;
+    const w = totalActiveBuckets ? (100 * v / totalActiveBuckets) : 0;
+    return v ? `<div title="${esc(label)} · ${v}" style="background:${color}; width:${w}%; min-width:${v ? '4px' : 0}; display:flex; align-items:center; justify-content:center; color:#0b0e14; font-size:0.7rem; font-weight:700;">${v}</div>` : '';
+  };
+  const activityBar = totalActiveBuckets ? `
+    <div style="margin-bottom:14px;">
+      <div style="color:#c9d1df; font-size:0.84rem; font-weight:600; margin-bottom:6px;">Last activity</div>
+      <div style="display:flex; height:18px; border-radius:4px; overflow:hidden; background:#0e1218; border:1px solid #2a3352;">
+        ${seg('day', 'Within 24h', '#2dd4bf')}
+        ${seg('week', 'This week', '#4a7cff')}
+        ${seg('month', 'This month', '#a855f7')}
+        ${seg('older', 'Older', '#fbbf24')}
+        ${seg('never', 'Never active', '#3a4258')}
+      </div>
+      <div style="display:flex; gap:14px; color:#8892a8; font-size:0.72rem; margin-top:5px; flex-wrap:wrap;">
+        <span><span style="display:inline-block; width:10px; height:10px; background:#2dd4bf; border-radius:2px; vertical-align:middle; margin-right:4px;"></span>24h</span>
+        <span><span style="display:inline-block; width:10px; height:10px; background:#4a7cff; border-radius:2px; vertical-align:middle; margin-right:4px;"></span>7d</span>
+        <span><span style="display:inline-block; width:10px; height:10px; background:#a855f7; border-radius:2px; vertical-align:middle; margin-right:4px;"></span>30d</span>
+        <span><span style="display:inline-block; width:10px; height:10px; background:#fbbf24; border-radius:2px; vertical-align:middle; margin-right:4px;"></span>Older</span>
+        <span><span style="display:inline-block; width:10px; height:10px; background:#3a4258; border-radius:2px; vertical-align:middle; margin-right:4px;"></span>Never</span>
+      </div>
+    </div>` : '';
+
+  // Per-step pass-rate heatmap.
+  const modulesHtml = (agg.modules || []).map(m => {
+    const reach = m.reached_learners || 0;
+    const compl = m.completed_learners || 0;
+    const reachPct = enrolled ? Math.round(100 * reach / enrolled) : 0;
+    const stepCells = (m.steps || []).map(st => {
+      const attempts = st.attempts || 0;
+      const passRate = st.pass_rate; // 0-1 or null
+      let bg = '#1a1f2e';  // no attempts yet → grey
+      let label = '—';
+      if (attempts > 0 && passRate != null) {
+        const pct = Math.round(passRate * 100);
+        // Red < 40%, amber 40-70%, green > 70%.
+        bg = pct < 40 ? '#7f1d1d' : (pct < 70 ? '#78350f' : '#064e3b');
+        label = `${pct}%`;
+      }
+      const tip = `${st.title} · ${attempts} attempt${attempts === 1 ? '' : 's'}` +
+                   (passRate != null ? ` · pass ${Math.round(passRate * 100)}%` : '') +
+                   ` · ${st.exercise_type || 'concept'}`;
+      return `<div title="${esc(tip)}" style="background:${bg}; color:#e8ecf4; border:1px solid #2a3352; border-radius:4px; padding:6px 8px; font-size:0.74rem; font-family:ui-monospace,Menlo,monospace; min-width:48px; text-align:center;">${esc(label)}</div>`;
+    }).join('');
+    return `
+      <div style="margin-bottom:12px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:6px; gap:10px; flex-wrap:wrap;">
+          <div style="color:#c9d1df; font-weight:600; font-size:0.86rem;">M${m.position}: ${esc(m.title)}</div>
+          <div style="color:#8892a8; font-size:0.74rem;">
+            Reached <strong style="color:#c9d1df;">${reach}</strong>/${enrolled} (${reachPct}%) · Completed <strong style="color:#c9d1df;">${compl}</strong>
+          </div>
+        </div>
+        <div style="display:flex; gap:4px; flex-wrap:wrap;">${stepCells || '<span style="color:#8892a8; font-size:0.78rem;">No steps.</span>'}</div>
+      </div>`;
+  }).join('');
+
+  const heatmap = (agg.modules || []).length ? `
+    <div>
+      <div style="color:#c9d1df; font-size:0.84rem; font-weight:600; margin-bottom:8px; display:flex; align-items:center; gap:10px;">
+        Per-step pass rate
+        <span style="color:#8892a8; font-size:0.72rem; font-weight:400;">red &lt;40% · amber &lt;70% · green ≥70%</span>
+      </div>
+      ${modulesHtml}
+    </div>` : '';
+
+  return `
+    <div style="background:#161b26; border:1px solid #2a3352; border-radius:10px; padding:18px 22px; margin-bottom:14px;">
+      <div style="display:flex; justify-content:space-between; align-items:start; gap:14px; margin-bottom:14px;">
+        <div>
+          <div style="color:#e8ecf4; font-weight:600; font-size:1.05rem;">Overview</div>
+          <div style="color:#8892a8; font-size:0.78rem; margin-top:2px;">${esc(agg.course_title || agg.course_id)} · ${agg.module_count || 0} modules · ${agg.total_steps || 0} steps</div>
+        </div>
+      </div>
+      ${metricsRow}
+      ${activityBar}
+      ${heatmap}
+    </div>`;
 }
 
 function renderCreatorLearnersTable(data, container) {
@@ -4118,6 +4349,14 @@ async function enterCourse(course, moduleId, stepIndex) {
     showError('This course has no modules.');
     return;
   }
+
+  // Course-progression #2 (2026-04-27): merge backend progress into the
+  // local cache before render. Without this the catalog/course view shows
+  // localStorage state only — which is empty on a fresh device or browser,
+  // even when the backend has completion records for the current user.
+  // Best-effort: if the fetch fails (offline, 404, anonymous), the local
+  // cache remains the source of truth.
+  await _mergeBackendProgressIntoLocal(course.id).catch(() => {});
 
   // Show sidebar elements
   document.getElementById('sidebarCourseInfo').style.display = 'block';

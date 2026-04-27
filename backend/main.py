@@ -1435,7 +1435,7 @@ async def execute_code(req: CodeExecuteRequest):
 # ── Exercise validation ──────────────────────────────────────────────────
 
 @app.post("/api/exercises/validate", response_model=ExerciseSubmitResponse)
-async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depends(get_db)):
+async def validate_exercise(req: ExerciseSubmitRequest, request: Request, db: AsyncSession = Depends(get_db)):
     # Load the step to get validation data
     result = await db.execute(select(Step).where(Step.id == req.step_id))
     step = result.scalars().first()
@@ -1469,6 +1469,22 @@ async def validate_exercise(req: ExerciseSubmitRequest, db: AsyncSession = Depen
     merged_validation = {**demo_data, **validation}
 
     vresult = _validate_exercise(exercise_type, merged_validation, response, step)
+
+    # Course-progression #4 (2026-04-27): record this submission as an
+    # attempt on UserProgress. Server-side counter — clients have been
+    # tracking attempt_number themselves for reveal-gating, but it never
+    # reached the DB. Without this, the creator dashboard can't compute
+    # per-step pass rate or dropout. Best-effort: a flush failure here
+    # shouldn't fail the validate response, so it lives in a try/except.
+    try:
+        auth_user_v = getattr(request.state, "user", None)
+        if auth_user_v:
+            attempt_user_id = str(auth_user_v.id)
+        else:
+            attempt_user_id = getattr(request.state, "anon_id", None) or "default"
+        await _record_attempt(db, attempt_user_id, req.step_id)
+    except Exception as _e:
+        logging.warning("attempt counter record failed for step %s: %s", req.step_id, _e)
 
     # Build per-item teaching feedback from the full DB record (server has access to answers).
     # This is returned to the frontend AFTER submission so the UI can render rich feedback
@@ -1965,9 +1981,14 @@ def _collect_explanations(exercise_type: str, validation: dict) -> list[str] | N
 
 @app.get("/api/progress/{course_id}", response_model=ProgressOut)
 async def get_progress(course_id: str, request: Request, db: AsyncSession = Depends(get_db)):
-    # 2026-04-25 — same soft-auth pattern as /api/progress/complete
+    # 2026-04-25 — same soft-auth pattern as /api/progress/complete.
+    # Course-progression #5 (2026-04-27): anonymous learners read against
+    # their own anon_id bucket, not the shared "default" pool.
     auth_user = getattr(request.state, "user", None)
-    user_id = str(auth_user.id) if auth_user else "default"
+    if auth_user:
+        user_id = str(auth_user.id)
+    else:
+        user_id = getattr(request.state, "anon_id", None) or "default"
 
     # Get all modules + steps for this course
     mod_result = await db.execute(
@@ -2044,13 +2065,20 @@ async def mark_step_complete(
     if not step_id:
         raise HTTPException(400, "step_id is required")
 
-    score = body.get("score")
+    score = _normalize_score(body.get("score"))
     response_data = body.get("response_data")
     # 2026-04-25 — attribute progress to the logged-in user when possible.
-    # Soft auth: anonymous learners (no session cookie) still get tracked
-    # under "default" — back-compat with review agents + headless smoke tests.
+    # Course-progression #5 (2026-04-27): anonymous learners are now keyed
+    # by their `sll_anon` cookie (request.state.anon_id) instead of the
+    # shared "default" bucket — so guests don't share progress with each
+    # other, and pre-signup work survives via _migrate_anon_progress in
+    # the register/login handlers. "default" is still the fallback for
+    # cookieless callers (smoke tests, review agents, curl).
     auth_user = getattr(request.state, "user", None)
-    user_id = str(auth_user.id) if auth_user else "default"
+    if auth_user:
+        user_id = str(auth_user.id)
+    else:
+        user_id = getattr(request.state, "anon_id", None) or "default"
 
     # Check step exists
     step_result = await db.execute(select(Step).where(Step.id == step_id))
@@ -10182,6 +10210,65 @@ async def creator_fetch_url(body: dict):
         "total_chars": len(combined),
         "pages": summary,
     }
+
+
+async def _record_attempt(db: AsyncSession, user_id: str, step_id: int) -> None:
+    """Increment UserProgress.attempts for (user_id, step_id) — insert if missing.
+
+    Course-progression #4 (2026-04-27): called from /api/exercises/validate
+    so every grader invocation increments a durable attempt counter. The
+    creator dashboard (#6) reads this for per-step pass-rate.
+
+    Idempotent on a single submission: increments by 1 each call. Doesn't
+    flip `completed`; that stays in /api/progress/complete's hands.
+    """
+    existing = await db.execute(
+        select(UserProgress).where(
+            UserProgress.user_id == user_id,
+            UserProgress.step_id == step_id,
+        )
+    )
+    row = existing.scalars().first()
+    if row:
+        row.attempts = (row.attempts or 0) + 1
+    else:
+        db.add(UserProgress(
+            user_id=user_id,
+            step_id=step_id,
+            attempts=1,
+            completed=False,
+        ))
+    await db.flush()
+
+
+def _normalize_score(raw):
+    """Normalize a step score to the canonical 0.0-1.0 scale.
+
+    Course-progression #3 (2026-04-27): clients drift on score scale —
+    Web sends raw 0-1 (or null), CLI/VSCode send int 0-100. Without
+    normalization the same column ends up with mixed scales and any
+    aggregate (avg, certificate score, creator dashboard) is wrong.
+
+    Heuristic:
+      - None / "" / unparseable → None (no score recorded)
+      - 0.0 ≤ x ≤ 1.0 → as-is (already 0-1)
+      - 1.0 < x ≤ 100.0 → x / 100 (interpret as percentage)
+      - x < 0 → 0.0  (clamp)
+      - x > 100 → 1.0 (clamp; should never happen but be defensive)
+    """
+    if raw is None or raw == "":
+        return None
+    try:
+        v = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if v < 0:
+        return 0.0
+    if v <= 1.0:
+        return v
+    if v <= 100.0:
+        return v / 100.0
+    return 1.0
 
 
 def _normalize_course_level(raw) -> str:

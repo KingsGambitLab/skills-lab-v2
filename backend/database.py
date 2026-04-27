@@ -211,6 +211,11 @@ class UserProgress(Base):
     score: Mapped[float | None] = mapped_column(Float, nullable=True)
     response_data: Mapped[dict | None] = mapped_column(JSON, nullable=True)
     completed_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Course-progression #4 (2026-04-27): server-side attempt counter,
+    # incremented on every /api/exercises/validate call. Drives per-step
+    # pass-rate + dropout signals on the creator dashboard. Nullable for
+    # rows created before the column existed; treat None as 0.
+    attempts: Mapped[int] = mapped_column(Integer, nullable=False, default=0, server_default="0")
 
     step: Mapped["Step"] = relationship(back_populates="progress_records")
 
@@ -385,6 +390,14 @@ async def create_tables() -> None:
         table="steps",
         column="learner_surface",
         ddl="ALTER TABLE steps ADD COLUMN learner_surface VARCHAR",
+    )
+    # Course-progression #4 (2026-04-27) — per-step attempt counter on
+    # UserProgress. Incremented by /api/exercises/validate on every
+    # submission. Existing rows backfill to 0 via the DEFAULT clause.
+    await _ensure_column(
+        table="user_progress",
+        column="attempts",
+        ddl="ALTER TABLE user_progress ADD COLUMN attempts INTEGER NOT NULL DEFAULT 0",
     )
 
 

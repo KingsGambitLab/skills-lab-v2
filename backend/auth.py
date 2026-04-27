@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import secrets
+import uuid
 from datetime import datetime, timedelta
 from typing import Optional
 
@@ -138,6 +139,15 @@ class UserOut(BaseModel):
 COOKIE_NAME = "sll_session"
 SESSION_TTL_DAYS = 14
 
+# Course-progression #5 (2026-04-27): anonymous learner identity. Without
+# this every guest writes to the shared user_id="default" bucket on
+# UserProgress, which (a) leaks progress between unrelated guests, and
+# (b) makes it impossible to migrate their work to a real user_id when
+# they sign up. The middleware below issues an `sll_anon` cookie on
+# first request and the progress endpoints use it as the fallback user_id.
+ANON_COOKIE_NAME = "sll_anon"
+ANON_TTL_DAYS = 365
+
 
 def _set_session_cookie(response: Response, token: str) -> None:
     # secure=False for local dev (localhost:8001 HTTP). In prod nginx does TLS
@@ -157,22 +167,44 @@ def _clear_session_cookie(response: Response) -> None:
     response.delete_cookie(key=COOKIE_NAME, path="/")
 
 
+def _set_anon_cookie(response: Response, anon_id: str) -> None:
+    response.set_cookie(
+        key=ANON_COOKIE_NAME,
+        value=anon_id,
+        max_age=ANON_TTL_DAYS * 24 * 3600,
+        httponly=True,
+        samesite="lax",
+        secure=False,
+        path="/",
+    )
+
+
+def _clear_anon_cookie(response: Response) -> None:
+    response.delete_cookie(key=ANON_COOKIE_NAME, path="/")
+
+
 # ── Middleware: load session into request.state ───────────────────────────
 
 async def session_middleware(request: Request, call_next):
-    """Attach request.state.user + request.state.session.
+    """Attach request.state.user + request.state.session + request.state.anon_id.
 
-    Two auth paths supported:
-      1. `sll_session` cookie (browser flow) — existing
-      2. `Authorization: Bearer <token>` header (CLI flow) — added 2026-04-25
+    Three identity layers supported:
+      1. `sll_session` cookie (browser flow) — authenticated user
+      2. `Authorization: Bearer <token>` header (CLI flow) — authenticated user
+      3. `sll_anon` cookie (browser flow) — anonymous learner identity
+         (course-progression #5). Issued on first request; persists 1 year.
+         Lets us track guest progress separately per browser/device and
+         migrate it to a real user_id at sign-up time.
 
-    Both resolve through the same `auth_sessions` table; bearer tokens
-    just live in the same store. CLI tokens are issued via
-    POST /api/auth/cli_token and are long-lived (90 days) so a
-    `skillslab login` lasts across many work sessions.
+    Both authenticated paths resolve through the same `auth_sessions` table.
+    The anon path is independent — anon_id is set even when a session is
+    present, so the progress endpoints can still see the anon cookie if a
+    pre-signup migration is pending.
     """
     request.state.user = None
     request.state.session = None
+    request.state.anon_id = None
+    request.state._issue_anon_cookie = False  # internal: tells the post-call_next stage to set the cookie
 
     # 1) Cookie flow (browser)
     token = request.cookies.get(COOKIE_NAME)
@@ -198,7 +230,21 @@ async def session_middleware(request: Request, call_next):
                         request.state.session = sess
         except Exception:
             logger.exception("session load failed")
-    return await call_next(request)
+
+    # 3) Anonymous identity. Set even for authenticated users — register/
+    #    login handlers consume it to migrate pre-signup progress.
+    anon_id = request.cookies.get(ANON_COOKIE_NAME)
+    if not anon_id:
+        anon_id = uuid.uuid4().hex
+        request.state._issue_anon_cookie = True
+    request.state.anon_id = anon_id
+
+    response = await call_next(request)
+    if getattr(request.state, "_issue_anon_cookie", False):
+        # Mint the cookie on the way out so it's bound to the response
+        # the browser is about to receive.
+        _set_anon_cookie(response, anon_id)
+    return response
 
 
 # ── Dependencies ──────────────────────────────────────────────────────────
@@ -234,8 +280,80 @@ def _user_to_out(u: User) -> UserOut:
     )
 
 
+async def _migrate_anon_progress(db: AsyncSession, anon_id: str, user_id: int) -> int:
+    """Transfer guest progress from anon_id to authenticated user_id.
+
+    Course-progression #5 (2026-04-27): runs at register + login so a
+    learner who solved a few steps as a guest doesn't lose them on signup.
+
+    Conflict resolution when both anon and user already have a row for the
+    same step: take MAX(score), SUM(attempts), OR(completed). Prefer the
+    user's completed_at when set, else take anon's. Anon rows are deleted
+    after merge so re-running is idempotent.
+
+    Returns count of step-rows migrated (transferred + merged).
+    """
+    if not anon_id or anon_id == "default":
+        return 0
+
+    from backend.database import UserProgress as _UP, Certificate as _Cert
+
+    new_user_id = str(user_id)
+    anon_rows = (await db.execute(
+        select(_UP).where(_UP.user_id == anon_id)
+    )).scalars().all()
+    if not anon_rows:
+        return 0
+
+    # Index user's existing rows by step_id so the conflict path is one
+    # dict lookup, not a per-row select.
+    user_existing = (await db.execute(
+        select(_UP).where(_UP.user_id == new_user_id)
+    )).scalars().all()
+    by_step = {row.step_id: row for row in user_existing}
+
+    migrated = 0
+    for arow in anon_rows:
+        urow = by_step.get(arow.step_id)
+        if urow is None:
+            arow.user_id = new_user_id
+        else:
+            # Merge.
+            urow.attempts = (urow.attempts or 0) + (arow.attempts or 0)
+            if (arow.score is not None) and (urow.score is None or arow.score > urow.score):
+                urow.score = arow.score
+            if arow.completed and not urow.completed:
+                urow.completed = True
+                urow.completed_at = arow.completed_at or urow.completed_at
+            elif arow.completed and urow.completed and arow.completed_at and (
+                urow.completed_at is None or arow.completed_at < urow.completed_at
+            ):
+                # Preserve the earlier completion time when both completed.
+                urow.completed_at = arow.completed_at
+            if arow.response_data and not urow.response_data:
+                urow.response_data = arow.response_data
+            await db.delete(arow)
+        migrated += 1
+
+    # Move any anon Certificates the user doesn't already have.
+    anon_certs = (await db.execute(
+        select(_Cert).where(_Cert.user_id == anon_id)
+    )).scalars().all()
+    for cert in anon_certs:
+        existing = (await db.execute(
+            select(_Cert).where(_Cert.user_id == new_user_id, _Cert.course_id == cert.course_id)
+        )).scalar_one_or_none()
+        if existing is None:
+            cert.user_id = new_user_id
+        else:
+            await db.delete(cert)
+
+    await db.flush()
+    return migrated
+
+
 @router.post("/register", response_model=UserOut)
-async def register(req: RegisterRequest, response: Response, db: AsyncSession = Depends(get_db)):
+async def register(req: RegisterRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     email = req.email.lower()
     existing = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
     if existing is not None:
@@ -248,17 +366,28 @@ async def register(req: RegisterRequest, response: Response, db: AsyncSession = 
     )
     db.add(user)
     await db.flush()
+    # Migrate any pre-signup guest progress before issuing the session
+    # cookie — failure is logged but not fatal (registration still succeeds).
+    anon_id = getattr(request.state, "anon_id", None)
+    if anon_id:
+        try:
+            n = await _migrate_anon_progress(db, anon_id, user.id)
+            if n:
+                logger.info("migrated %d anon progress rows from %s to user %s", n, anon_id, user.id)
+        except Exception:
+            logger.exception("anon-progress migration failed at register; continuing")
     # Fresh session auto-logged-in.
     sess = AuthSession.new_for_user(user.id, ttl_hours=SESSION_TTL_DAYS * 24)
     db.add(sess)
     await db.flush()
     _set_session_cookie(response, sess.id)
+    _clear_anon_cookie(response)  # subsequent requests use the session cookie
     await db.commit()
     return _user_to_out(user)
 
 
 @router.post("/login", response_model=UserOut)
-async def login(req: LoginRequest, response: Response, db: AsyncSession = Depends(get_db)):
+async def login(req: LoginRequest, request: Request, response: Response, db: AsyncSession = Depends(get_db)):
     email = req.email.lower()
     user = (await db.execute(select(User).where(User.email == email))).scalar_one_or_none()
     # Intentionally vague error to avoid email enumeration.
@@ -268,7 +397,18 @@ async def login(req: LoginRequest, response: Response, db: AsyncSession = Depend
     db.add(sess)
     await db.flush()
     user.last_login_at = datetime.utcnow()
+    # Same migration as register — covers the case where a returning user
+    # browsed as a guest before logging back in.
+    anon_id = getattr(request.state, "anon_id", None)
+    if anon_id:
+        try:
+            n = await _migrate_anon_progress(db, anon_id, user.id)
+            if n:
+                logger.info("migrated %d anon progress rows from %s to user %s on login", n, anon_id, user.id)
+        except Exception:
+            logger.exception("anon-progress migration failed at login; continuing")
     _set_session_cookie(response, sess.id)
+    _clear_anon_cookie(response)
     await db.commit()
     return _user_to_out(user)
 
@@ -547,3 +687,167 @@ async def enrolled_learners(course_id: str, request: Request, db: AsyncSession =
             "completed_at": e.completed_at.isoformat() if e.completed_at else None,
         })
     return {"course_id": course_id, "course_title": course.title, "total_steps": total_steps, "learners": out}
+
+
+@router.get("/creator/courses/{course_id}/aggregate-stats")
+async def creator_course_aggregate_stats(course_id: str, request: Request, db: AsyncSession = Depends(get_db)):
+    """Course-wide engagement signals for the creator dashboard.
+
+    Course-progression #6 (2026-04-27): per-step pass rate (so the
+    creator can see which exercises are choking learners), per-module
+    funnel (% of enrolled who reached / completed each module), and a
+    last-active distribution (engagement freshness). Depends on the
+    persisted `UserProgress.attempts` (#4) and the normalized 0-1
+    `UserProgress.score` scale (#3).
+
+    Auth: creator-or-admin scoped to the requested course.
+    """
+    user = await require_role("creator", "admin")(request)
+    course = (await db.execute(select(Course).where(Course.id == course_id))).scalar_one_or_none()
+    if course is None:
+        raise HTTPException(404, "Course not found")
+    if user.role != "admin" and course.creator_user_id != user.id:
+        raise HTTPException(403, "You are not the creator of this course")
+
+    from sqlalchemy import case, func as _func, distinct
+    from backend.database import Module, Step, UserProgress as _UP
+
+    modules = (await db.execute(
+        select(Module).where(Module.course_id == course_id).order_by(Module.position)
+    )).scalars().all()
+    module_step_ids: dict[int, list[int]] = {}
+    step_meta: dict[int, dict] = {}
+    for m in modules:
+        steps = (await db.execute(
+            select(Step).where(Step.module_id == m.id).order_by(Step.position)
+        )).scalars().all()
+        module_step_ids[m.id] = [s.id for s in steps]
+        for pos, s in enumerate(steps):
+            step_meta[s.id] = {
+                "step_id": s.id,
+                "module_id": m.id,
+                "module_position": m.position,
+                "module_title": m.title,
+                "position": pos,
+                "title": s.title,
+                "exercise_type": s.exercise_type or "concept",
+            }
+    all_step_ids = [sid for ids in module_step_ids.values() for sid in ids]
+
+    # Per-step rollup: attempts, completed_count, avg_score, distinct learner count.
+    step_stats: dict[int, dict] = {sid: {"attempts": 0, "completed": 0, "learners": 0, "avg_score": None}
+                                    for sid in all_step_ids}
+    if all_step_ids:
+        rows = (await db.execute(
+            select(
+                _UP.step_id,
+                _func.coalesce(_func.sum(_UP.attempts), 0).label("attempts"),
+                _func.sum(case((_UP.completed.is_(True), 1), else_=0)).label("completed"),
+                _func.count(distinct(_UP.user_id)).label("learners"),
+                _func.avg(_UP.score).label("avg_score"),
+            )
+            .where(_UP.step_id.in_(all_step_ids))
+            .group_by(_UP.step_id)
+        )).all()
+        for r in rows:
+            sid = r.step_id
+            if sid in step_stats:
+                step_stats[sid] = {
+                    "attempts": int(r.attempts or 0),
+                    "completed": int(r.completed or 0),
+                    "learners": int(r.learners or 0),
+                    "avg_score": float(r.avg_score) if r.avg_score is not None else None,
+                }
+
+    # Per-module funnel: distinct learners who have ≥1 progress row on any
+    # step of the module (regardless of completion).
+    per_module = []
+    for m in modules:
+        sids = module_step_ids.get(m.id, [])
+        # Reach: distinct user_ids with any progress in this module
+        reach_q = select(_func.count(distinct(_UP.user_id))).where(_UP.step_id.in_(sids)) if sids else None
+        reached = int((await db.execute(reach_q)).scalar() or 0) if reach_q is not None else 0
+        # Module completion: distinct user_ids who completed ALL steps in the module
+        if sids:
+            sub_q = (
+                select(_UP.user_id)
+                .where(_UP.step_id.in_(sids), _UP.completed.is_(True))
+                .group_by(_UP.user_id)
+                .having(_func.count(_UP.step_id) >= len(sids))
+            )
+            completed_users = (await db.execute(sub_q)).scalars().all()
+            mod_completed = len(completed_users)
+        else:
+            mod_completed = 0
+        # Aggregate per-step stats for this module
+        m_attempts = sum(step_stats[sid]["attempts"] for sid in sids)
+        m_completed = sum(step_stats[sid]["completed"] for sid in sids)
+        per_module.append({
+            "module_id": m.id,
+            "position": m.position,
+            "title": m.title,
+            "step_count": len(sids),
+            "reached_learners": reached,
+            "completed_learners": mod_completed,
+            "total_attempts": m_attempts,
+            "total_step_completions": m_completed,
+            "steps": [
+                {
+                    **step_meta[sid],
+                    **step_stats[sid],
+                    # Pass rate = completed / attempts. Useful when attempts > 0.
+                    "pass_rate": (
+                        step_stats[sid]["completed"] / step_stats[sid]["attempts"]
+                        if step_stats[sid]["attempts"] else None
+                    ),
+                }
+                for sid in sids
+            ],
+        })
+
+    # Last-active distribution + course-wide enrollment summary.
+    enrollments = (await db.execute(
+        select(Enrollment).where(Enrollment.course_id == course_id)
+    )).scalars().all()
+    now = datetime.utcnow()
+    buckets = {"day": 0, "week": 0, "month": 0, "older": 0, "never": 0}
+    completed_courses = 0
+    progress_percents: list[int] = []
+    for e in enrollments:
+        if e.completed_at is not None:
+            completed_courses += 1
+        progress_percents.append(int(e.progress_percent or 0))
+        last = e.last_active_at
+        if last is None:
+            buckets["never"] += 1
+            continue
+        delta = (now - last).total_seconds()
+        if delta <= 86_400:
+            buckets["day"] += 1
+        elif delta <= 7 * 86_400:
+            buckets["week"] += 1
+        elif delta <= 30 * 86_400:
+            buckets["month"] += 1
+        else:
+            buckets["older"] += 1
+
+    avg_pct = (sum(progress_percents) / len(progress_percents)) if progress_percents else 0.0
+    median_pct = (
+        sorted(progress_percents)[len(progress_percents) // 2]
+        if progress_percents else 0
+    )
+
+    return {
+        "course_id": course_id,
+        "course_title": course.title,
+        "total_steps": len(all_step_ids),
+        "module_count": len(modules),
+        "summary": {
+            "enrolled": len(enrollments),
+            "completed_course": completed_courses,
+            "avg_progress_percent": round(avg_pct, 1),
+            "median_progress_percent": median_pct,
+            "last_active_distribution": buckets,
+        },
+        "modules": per_module,
+    }
