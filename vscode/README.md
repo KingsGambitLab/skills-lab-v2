@@ -25,7 +25,7 @@ Walk Claude Code / Aider / Spring Boot courses in VS Code without leaving the ed
 Download the `.vsix` from the [latest GitHub release](https://github.com/KingsGambitLab/skills-lab-v2/releases) and:
 
 ```
-code --install-extension skillslab-0.1.4.vsix
+code --install-extension skillslab-0.1.5.vsix
 ```
 
 ### From Marketplace

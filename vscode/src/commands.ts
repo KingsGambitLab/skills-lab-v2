@@ -18,8 +18,78 @@
 import * as vscode from "vscode";
 import * as path from "path";
 import * as fs from "fs";
+import * as cp from "child_process";
 import { LmsClient, StepSummary, ValidateResponse } from "./api";
 import { AuthManager } from "./auth";
+
+/**
+ * Known course-repo URLs keyed by lower-cased substring of the course title.
+ * Used by `startCourse` (Change #4) to suggest "Clone & Reopen in Container"
+ * when the learner picks a course whose toolchain expects the devcontainer.
+ *
+ * NOTE — drift risk: this lookup hardcodes the 3 known v8.6.x course-repos.
+ * Replacement plan: backend endpoint `GET /api/courses/{id}/asset` reading
+ * from `backend/course_assets.py`. Tracked in the creator-flow worktree.
+ * Until then, add a row here when shipping a new BYO-key course.
+ */
+const KNOWN_COURSE_REPOS: ReadonlyArray<{
+  matchTitleLower: string;
+  repoUrl: string;
+  repoFolderName: string;
+}> = [
+  {
+    matchTitleLower: "open-source ai coding",
+    repoUrl: "https://github.com/tusharbisht/kimi-eng-course-repo",
+    repoFolderName: "kimi-eng-course-repo",
+  },
+  {
+    matchTitleLower: "ai-augmented engineering",
+    repoUrl: "https://github.com/tusharbisht/aie-course-repo",
+    repoFolderName: "aie-course-repo",
+  },
+  {
+    matchTitleLower: "claude code for spring boot",
+    repoUrl: "https://github.com/tusharbisht/jspring-course-repo",
+    repoFolderName: "jspring-course-repo",
+  },
+];
+
+function findCourseRepo(courseTitle: string): { repoUrl: string; repoFolderName: string } | null {
+  const tl = (courseTitle || "").toLowerCase();
+  for (const c of KNOWN_COURSE_REPOS) {
+    if (tl.includes(c.matchTitleLower)) {
+      return { repoUrl: c.repoUrl, repoFolderName: c.repoFolderName };
+    }
+  }
+  return null;
+}
+
+/**
+ * Install hints surfaced by the pre-flight tool-check picker (Change #1)
+ * when a learner is on the host shell + clicks Run This Step + a required
+ * tool is missing from PATH. The "right" answer is almost always "Reopen
+ * in Container" (we ship a known-good toolchain) but for learners who
+ * insist on running locally, this gives them a copy-pasteable starting
+ * point per tool. Unknown tools fall through to a generic "see <tool>
+ * docs" line — better than silence.
+ */
+const INSTALL_HINTS: Record<string, string> = {
+  aider: "pip install aider-chat   # https://aider.chat/docs/install.html",
+  claude:
+    "see https://docs.anthropic.com/en/docs/claude-code/setup for the Claude Code CLI installer",
+  gh: "macOS: brew install gh   |   Linux: see https://github.com/cli/cli#installation",
+  python3: "Python 3.10+ — macOS: pre-installed   |   Linux: apt install python3",
+  python: "Python 3.10+ — macOS: pre-installed   |   Linux: apt install python3 + alias",
+  pytest: "pip install pytest",
+  npm: "install Node.js 20+: https://nodejs.org",
+  node: "install Node.js 20+: https://nodejs.org",
+  go: "install Go 1.22+: https://go.dev/dl",
+  java: "install JDK 21+: https://adoptium.net",
+  mvn: "install Maven: https://maven.apache.org/install.html",
+  docker: "install Docker Desktop: https://docker.com/products/docker-desktop",
+  cargo: "install Rust toolchain: https://rustup.rs",
+  rustc: "install Rust toolchain: https://rustup.rs",
+};
 import { StateManager } from "./state";
 import { CourseTree } from "./tree";
 import { StepWebViewManager, StepRenderInput } from "./webview";
@@ -45,6 +115,22 @@ export class CommandHandlers {
    *     a fresh one with current env.
    */
   private cachedTerminal: vscode.Terminal | null = null;
+
+  /**
+   * Per-session memory of which workspace folders we've ALREADY prompted
+   * "Reopen in Container?" for. Reset on VS Code reload. Without this,
+   * Change #2 (re-prompt on workspace folder change) would re-pester the
+   * learner for every Add Folder operation when they declined once.
+   */
+  private _devcontainerAskedFolders = new Set<string>();
+
+  /**
+   * Per-session toolchain check cache: tool name (e.g. "aider") → whether
+   * `command -v <tool>` returned 0. Used by the pre-flight check (Change
+   * #1) and the WebView status pill (Change #3). Cleared automatically
+   * when the learner moves into a devcontainer (PATH changes wholesale).
+   */
+  private _toolPathCache = new Map<string, boolean>();
 
   constructor(
     private readonly api: LmsClient,
@@ -87,6 +173,143 @@ export class CommandHandlers {
     });
     this.cachedTerminal.show();
     return this.cachedTerminal;
+  }
+
+  // ── Toolchain detection helpers (v0.1.5) ────────────────────────
+
+  /**
+   * Are we running inside a devcontainer / Codespace / GitHub-prebuild?
+   * VS Code sets one of these env vars in those contexts; on a host
+   * shell they're all undefined. Used by the pre-flight check (#1),
+   * the suggestion gate (#2), and the status pill (#3) to decide
+   * whether the learner is on the toolchain-rich container path.
+   */
+  private isInsideDevContainer(): boolean {
+    return !!(
+      process.env.REMOTE_CONTAINERS ||
+      process.env.DEVCONTAINER ||
+      process.env.CODESPACES
+    );
+  }
+
+  /**
+   * Synchronous PATH check via `command -v <tool>` (POSIX) — falls back
+   * to `where <tool>` on Windows. Cached per-tool for the session so we
+   * don't re-spawn for every step open. ~30ms first call, ~0ms cached.
+   */
+  private isToolOnPath(tool: string): boolean {
+    if (!tool) return true;
+    if (this._toolPathCache.has(tool)) return this._toolPathCache.get(tool)!;
+    const probe = process.platform === "win32" ? `where ${tool}` : `command -v ${tool}`;
+    let ok = false;
+    try {
+      cp.execSync(probe, {
+        stdio: "ignore",
+        timeout: 2000,
+        shell: process.platform === "win32" ? "cmd.exe" : "/bin/sh",
+      } as cp.ExecSyncOptions);
+      ok = true;
+    } catch {
+      ok = false;
+    }
+    this._toolPathCache.set(tool, ok);
+    return ok;
+  }
+
+  /**
+   * Pull the first whitespace-delimited token off each cli_command.
+   * `aider --version` → `aider`. `python3 -m pytest` → `python3`.
+   * Skips comment-only entries (`# foo`).
+   */
+  private firstTokensOf(cliCommands: any[]): string[] {
+    const tokens = new Set<string>();
+    for (const c of cliCommands || []) {
+      const cmd = typeof c === "string" ? c : (c?.cmd || c?.command || "");
+      const m = String(cmd).trim().match(/^(\S+)/);
+      if (!m) continue;
+      const tok = m[1];
+      if (tok.startsWith("#")) continue;
+      tokens.add(tok);
+    }
+    return [...tokens];
+  }
+
+  /**
+   * Compute the toolchain status for a step. Used by openStep (Change #3
+   * — pass into the WebView status pill) and by runAndAutoSubmit
+   * (Change #1 — gate on missing tools). Synchronous; relies on the
+   * per-tool PATH cache so it's cheap on second call.
+   *
+   * Returns:
+   *   - `n/a` for non-terminal steps (pill suppressed)
+   *   - `in-container` when REMOTE_CONTAINERS is set (toolchain assumed ready)
+   *   - `host-ok` when on host shell + every cli_command's first token is on PATH
+   *   - `host-missing` when one or more first tokens are absent → with the list
+   */
+  computeToolchainStatus(step: StepSummary): {
+    status: "n/a" | "in-container" | "host-ok" | "host-missing";
+    missingTools: string[];
+  } {
+    const surface = (step.learner_surface || "").toLowerCase();
+    if (surface !== "terminal") return { status: "n/a", missingTools: [] };
+    if (this.isInsideDevContainer()) return { status: "in-container", missingTools: [] };
+    const cliCommands: any[] = (step.validation && step.validation.cli_commands) || [];
+    if (cliCommands.length === 0) return { status: "host-ok", missingTools: [] };
+    const tokens = this.firstTokensOf(cliCommands);
+    const missing = tokens.filter((t) => !this.isToolOnPath(t));
+    return missing.length === 0
+      ? { status: "host-ok", missingTools: [] }
+      : { status: "host-missing", missingTools: missing };
+  }
+
+  /**
+   * Pre-flight gate before runAndAutoSubmit (Change #1). When the
+   * learner is on the host shell + tools are missing, surface a 3-button
+   * picker: Reopen in Container (recommended) / Install hints / Run anyway.
+   *
+   * Returns:
+   *   - "proceed" → caller continues into auto-run
+   *   - "abort" → caller returns early (we either reopened in container,
+   *     showed install hints, or learner cancelled)
+   */
+  private async preflightToolchainGate(step: StepSummary): Promise<"proceed" | "abort"> {
+    const status = this.computeToolchainStatus(step);
+    if (status.status !== "host-missing") return "proceed";
+    const missingList = status.missingTools.join(", ");
+    const choice = await vscode.window.showWarningMessage(
+      `${labelOf(step)} needs ${missingList} on PATH. The course's devcontainer has these pre-installed — recommended over a local install.`,
+      { modal: false },
+      "Reopen in Container (recommended)",
+      "Install hints",
+      "Run anyway",
+    );
+    if (choice === "Reopen in Container (recommended)") {
+      try {
+        await vscode.commands.executeCommand("remote-containers.reopenInContainer");
+      } catch (e: any) {
+        vscode.window.showErrorMessage(
+          `Dev Containers extension required. Install via: code --install-extension ms-vscode-remote.remote-containers`,
+        );
+      }
+      return "abort";
+    }
+    if (choice === "Install hints") {
+      const ch = vscode.window.createOutputChannel("Skillslab Install Hints");
+      ch.appendLine(`# ${labelOf(step)} — missing on PATH: ${missingList}`);
+      ch.appendLine(``);
+      for (const t of status.missingTools) {
+        ch.appendLine(`${t}: ${INSTALL_HINTS[t] || "see " + t + " docs"}`);
+      }
+      ch.appendLine(``);
+      ch.appendLine(
+        `Tip: the cleaner path is "Reopen in Container" — the skillslab devcontainer has every tool above pre-installed. See: https://github.com/tusharbisht/kimi-eng-course-repo`,
+      );
+      ch.show();
+      return "abort";
+    }
+    // "Run anyway" or null (dismissed) → proceed; the auto-run will fail
+    // gracefully when `aider --version` returns command-not-found.
+    return choice ? "proceed" : "abort";
   }
 
   // ── Auth ────────────────────────────────────────────────────────
@@ -150,6 +373,48 @@ export class CommandHandlers {
       { title: "Pick a course to start", matchOnDescription: true, matchOnDetail: true },
     );
     if (!pick) return;
+
+    // v0.1.5 Change #4 — auto-suggest cloning the course-repo + reopening
+    // in its devcontainer. Fires when:
+    //   - The picked course is one of the known BYO-key courses (kimi /
+    //     aie / jspring) per KNOWN_COURSE_REPOS lookup
+    //   - The learner is NOT already inside a devcontainer
+    //   - No open workspace folder is the course's repo
+    // We never block — "Continue without" lets the learner stay where
+    // they are. The clone-into-volume command short-circuits the
+    // host-side checkout entirely (Path B from the runbook).
+    const repo = findCourseRepo(pick.course.title);
+    if (repo && !this.isInsideDevContainer()) {
+      const folderNames = (vscode.workspace.workspaceFolders || []).map((f) =>
+        path.basename(f.uri.fsPath),
+      );
+      const alreadyInRepo = folderNames.some((n) => n === repo.repoFolderName);
+      if (!alreadyInRepo) {
+        const choice = await vscode.window.showInformationMessage(
+          `${pick.course.title} runs inside its devcontainer (aider/claude/python pre-installed). Clone ${repo.repoFolderName} and reopen there?`,
+          "Clone & Reopen in Container",
+          "Continue in current workspace",
+        );
+        if (choice === "Clone & Reopen in Container") {
+          try {
+            this._toolPathCache.clear();
+            await vscode.commands.executeCommand(
+              "remote-containers.cloneInVolume",
+              vscode.Uri.parse(repo.repoUrl),
+            );
+            return; // VS Code reloads the window post-clone; rest of flow runs there
+          } catch (e: any) {
+            vscode.window.showWarningMessage(
+              `Auto-clone unavailable (Dev Containers extension required). Manually: git clone ${repo.repoUrl} && code <folder>`,
+            );
+          }
+        }
+      } else {
+        // Already in the right folder — just nudge "Reopen in Container"
+        void this.maybeSuggestDevContainer();
+      }
+    }
+
     // Enroll (idempotent)
     try {
       await this.api.enroll(pick.course.id);
@@ -220,6 +485,10 @@ export class CommandHandlers {
       themeAccent: accent,
       webBaseUrl: this.cfg().webUrl,
       feedback: feedback ?? null,
+      // v0.1.5 Change #3: compute toolchain status for terminal_exercise
+      // steps so the WebView pill can render 🟢/🔴 + a "Reopen in
+      // Container" button if tools are missing on the host shell.
+      toolchainStatus: this.computeToolchainStatus(detailedStep),
     };
     this.webview.show(
       input,
@@ -228,7 +497,25 @@ export class CommandHandlers {
       () => void this.runStepInTerminal(detailedStep),
       () => void this.previous(courseId, moduleId, detailedStep),
       () => void this.runAndAutoSubmit(courseId, moduleId, detailedStep),
+      () => void this.reopenInContainer(),
     );
+  }
+
+  /**
+   * v0.1.5 Change #3 — handler for the WebView's status pill click
+   * (data-vsc-msg="reopenInContainer"). Triggers the Dev Containers
+   * extension's reopen flow + clears the tool-PATH cache so post-reopen
+   * the pill recomputes correctly.
+   */
+  async reopenInContainer(): Promise<void> {
+    this._toolPathCache.clear();
+    try {
+      await vscode.commands.executeCommand("remote-containers.reopenInContainer");
+    } catch (e: any) {
+      vscode.window.showErrorMessage(
+        `Dev Containers extension required. Install: code --install-extension ms-vscode-remote.remote-containers`,
+      );
+    }
   }
 
   async openCurrentStep(): Promise<void> {
@@ -520,6 +807,13 @@ export class CommandHandlers {
       return;
     }
 
+    // v0.1.5 Change #1 — pre-flight toolchain gate. If we're on the host
+    // shell + tools are missing, surface a 3-button picker (Reopen in
+    // Container / Install hints / Run anyway) BEFORE spawning the
+    // terminal. Without this, missing aider would surface as a regex
+    // miss in the grader → "0% pass" with no actionable signal.
+    if ((await this.preflightToolchainGate(step)) === "abort") return;
+
     const slug = courseId;
     const attempt = this.state.recordAttempt(slug, step.id);
 
@@ -635,17 +929,28 @@ export class CommandHandlers {
    * (env REMOTE_CONTAINERS / DEVCONTAINER set).
    */
   async maybeSuggestDevContainer(): Promise<void> {
-    if (process.env.REMOTE_CONTAINERS || process.env.DEVCONTAINER) return;
+    if (this.isInsideDevContainer()) return;
     const folders = vscode.workspace.workspaceFolders || [];
     for (const f of folders) {
-      const dcPath = path.join(f.uri.fsPath, ".devcontainer", "devcontainer.json");
+      const fsPath = f.uri.fsPath;
+      // Per-folder dedupe (Change #2): if we already prompted for THIS
+      // folder this session and the learner declined, don't re-pester
+      // them on every workspace-change event. They can re-trigger via
+      // "Skillslab: Reopen in Container" from the palette.
+      if (this._devcontainerAskedFolders.has(fsPath)) continue;
+      const dcPath = path.join(fsPath, ".devcontainer", "devcontainer.json");
       if (fs.existsSync(dcPath)) {
+        // Mark BEFORE the prompt — even if the user dismisses without
+        // answering, we don't want a thrash loop.
+        this._devcontainerAskedFolders.add(fsPath);
         const choice = await vscode.window.showInformationMessage(
-          `Skillslab: this folder has a devcontainer config. Reopen in Container? (Brings claude/aider/git/python pre-installed.)`,
+          `Skillslab: ${path.basename(fsPath)} has a devcontainer config. Reopen in Container? (Brings claude/aider/git/python pre-installed — matches the CLI's batteries-included experience.)`,
           "Reopen in Container",
           "Not Now",
         );
         if (choice === "Reopen in Container") {
+          // Switching contexts wholesale invalidates the tool-PATH cache
+          this._toolPathCache.clear();
           await vscode.commands.executeCommand("remote-containers.reopenInContainer");
         }
         return;

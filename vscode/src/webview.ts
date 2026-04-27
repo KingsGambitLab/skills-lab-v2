@@ -41,6 +41,17 @@ export interface StepRenderInput {
    * Null on the initial open / after navigating away.
    */
   feedback?: ValidateResponse | null;
+  /**
+   * v0.1.5 Change #3 — toolchain status pill for terminal_exercise steps.
+   * 🟢 in-container / 🟢 host-ok / 🔴 host-missing (with the missing tools
+   * listed + a "Reopen in Container" button inline) / suppressed for
+   * non-terminal steps. Populated by commands.ts:openStep via
+   * computeToolchainStatus(step).
+   */
+  toolchainStatus?: {
+    status: "n/a" | "in-container" | "host-ok" | "host-missing";
+    missingTools: string[];
+  };
 }
 
 /**
@@ -97,6 +108,7 @@ export class StepWebViewManager {
     onPrev?: () => void;
     onRunInTerminal?: () => void;
     onRunAuto?: () => void;
+    onReopenInContainer?: () => void;
   } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -108,11 +120,19 @@ export class StepWebViewManager {
     onRunInTerminal: () => void,
     onPrev: () => void,
     onRunAuto?: () => void,
+    onReopenInContainer?: () => void,
   ): void {
     // ALWAYS update callbacks BEFORE reveal/render — the listener below
     // reads via `this.callbacks.X?.()` so this swap is what makes the
     // already-open panel route to the new step.
-    this.callbacks = { onCheck, onNext, onPrev, onRunInTerminal, onRunAuto };
+    this.callbacks = {
+      onCheck,
+      onNext,
+      onPrev,
+      onRunInTerminal,
+      onRunAuto,
+      onReopenInContainer,
+    };
 
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
@@ -135,6 +155,7 @@ export class StepWebViewManager {
           case "prev": this.callbacks.onPrev?.(); break;
           case "runInTerminal": this.callbacks.onRunInTerminal?.(); break;
           case "runAuto": this.callbacks.onRunAuto?.(); break;
+          case "reopenInContainer": this.callbacks.onReopenInContainer?.(); break;
         }
       });
     }
@@ -225,6 +246,12 @@ export class StepWebViewManager {
     // promoted to primary + the host auto-marks the step complete on
     // its way through.
     const requiresSubmission = !NO_SUBMIT_TYPES.has(exType);
+
+    // v0.1.5 Change #3 — toolchain status pill. Renders ONLY for
+    // terminal-surface steps (status !== "n/a"). For host-missing,
+    // includes an inline "Reopen in Container" button that postMsgs
+    // back to commands.ts:reopenInContainer.
+    const toolchainPill = renderToolchainPill(input.toolchainStatus);
 
     // Spec panel — for terminal_exercise (and any step with cli_commands
     // / must_contain / rubric in validation), render the SAME spec the
@@ -367,6 +394,36 @@ export class StepWebViewManager {
       white-space: pre-wrap;
     }
 
+    /* ── Toolchain status pill (terminal_exercise only, v0.1.5) ── */
+    .toolchain-pill {
+      display: flex; align-items: center; gap: 10px;
+      margin: 0 0 14px;
+      padding: 8px 14px;
+      border-radius: 4px;
+      font-size: 0.85rem;
+      border: 1px solid var(--vscode-panel-border);
+    }
+    .toolchain-pill.in-container,
+    .toolchain-pill.host-ok {
+      background: var(--vscode-inputValidation-infoBackground,
+                        var(--vscode-textBlockQuote-background));
+      border-left: 3px solid var(--vscode-charts-green, #2dd4bf);
+    }
+    .toolchain-pill.host-missing {
+      background: var(--vscode-inputValidation-warningBackground,
+                        var(--vscode-textBlockQuote-background));
+      border-left: 3px solid var(--vscode-charts-red, #f97316);
+    }
+    .toolchain-pill .pill-icon { font-size: 1rem; }
+    .toolchain-pill .pill-text { flex: 1; }
+    .toolchain-pill button {
+      background: var(--vscode-button-background);
+      color: var(--vscode-button-foreground);
+      border: none; padding: 4px 10px; border-radius: 3px;
+      font-size: 0.8rem; cursor: pointer; font-weight: 500;
+    }
+    .toolchain-pill button:hover { background: var(--vscode-button-hoverBackground); }
+
     /* ── Feedback panel (post-Submit) ── */
     .feedback-panel {
       margin: 0 0 22px;
@@ -430,6 +487,8 @@ export class StepWebViewManager {
 
   ${feedbackPanel}
 
+  ${toolchainPill}
+
   ${howToRun}
 
   ${specPanel}
@@ -472,6 +531,39 @@ function escapeAttr(s: string): string {
     .replace(/"/g, "&quot;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;");
+}
+
+/**
+ * Render the TOOLCHAIN STATUS PILL for terminal_exercise steps (v0.1.5
+ * Change #3). Surfaces 🟢/🔴 + missing-tools list + a "Reopen in
+ * Container" button that posts `reopenInContainer` back to the host.
+ *
+ * Returns "" for non-terminal steps so the WebView doesn't show a
+ * misleading pill on concept / browser-widget steps.
+ */
+function renderToolchainPill(
+  status: StepRenderInput["toolchainStatus"] | undefined,
+): string {
+  if (!status || status.status === "n/a") return "";
+  if (status.status === "in-container") {
+    return `<div class="toolchain-pill in-container">
+      <span class="pill-icon">🟢</span>
+      <span class="pill-text">Skillslab devcontainer — toolchain ready (aider · python3 · git · gh pre-installed)</span>
+    </div>`;
+  }
+  if (status.status === "host-ok") {
+    return `<div class="toolchain-pill host-ok">
+      <span class="pill-icon">🟢</span>
+      <span class="pill-text">Host shell — required tools detected on PATH</span>
+    </div>`;
+  }
+  // host-missing
+  const missing = (status.missingTools || []).map(escapeAttr).join(", ");
+  return `<div class="toolchain-pill host-missing">
+    <span class="pill-icon">🔴</span>
+    <span class="pill-text">Missing on PATH: <strong>${missing}</strong> — the course's devcontainer has these pre-installed.</span>
+    <button data-vsc-msg="reopenInContainer">Reopen in Container</button>
+  </div>`;
 }
 
 /**

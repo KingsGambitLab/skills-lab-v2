@@ -158,6 +158,28 @@ export async function activate(ctx: vscode.ExtensionContext): Promise<void> {
   // delegate to Microsoft's Dev Containers extension via the existing
   // `remote-containers.reopenInContainer` command.
   void cmds.maybeSuggestDevContainer();
+
+  // v0.1.5 Change #2 — re-fire the suggestion when the workspace folder
+  // set changes. Today maybeSuggestDevContainer fires only at activation;
+  // if the learner opens a course-repo AFTER the extension is already
+  // running (Add Folder to Workspace), the prompt never came. Per-folder
+  // dedupe inside maybeSuggestDevContainer prevents pestering for
+  // folders the learner already declined.
+  ctx.subscriptions.push(
+    vscode.workspace.onDidChangeWorkspaceFolders(() => {
+      void cmds.maybeSuggestDevContainer();
+    }),
+  );
+
+  // v0.1.5 — palette command to manually re-trigger the Reopen flow.
+  // Useful when the learner declined the auto-prompt earlier and now
+  // wants the toolchain after all. Bypasses the dedupe Set by going
+  // through `cmds.reopenInContainer()` directly.
+  ctx.subscriptions.push(
+    vscode.commands.registerCommand("skillslab.reopenInContainer", () =>
+      cmds.reopenInContainer(),
+    ),
+  );
 }
 
 export function deactivate(): void {
