@@ -139,13 +139,23 @@ export class AuthManager {
    * spawn a terminal task with the env exported. Caller is expected to
    * scope usage tightly.
    */
-  async getApiKey(name: "anthropic" | "github"): Promise<string | null> {
-    const k = name === "anthropic" ? "skillslab.anthropic_key" : "skillslab.github_token";
+  async getApiKey(name: "anthropic" | "github" | "openrouter"): Promise<string | null> {
+    const k =
+      name === "anthropic"
+        ? "skillslab.anthropic_key"
+        : name === "openrouter"
+        ? "skillslab.openrouter_key"
+        : "skillslab.github_token";
     return (await this.ctx.secrets.get(k)) || null;
   }
 
-  async setApiKey(name: "anthropic" | "github", value: string): Promise<void> {
-    const k = name === "anthropic" ? "skillslab.anthropic_key" : "skillslab.github_token";
+  async setApiKey(name: "anthropic" | "github" | "openrouter", value: string): Promise<void> {
+    const k =
+      name === "anthropic"
+        ? "skillslab.anthropic_key"
+        : name === "openrouter"
+        ? "skillslab.openrouter_key"
+        : "skillslab.github_token";
     await this.ctx.secrets.store(k, value);
   }
 }

@@ -7,7 +7,8 @@ Walk Claude Code / Aider / Spring Boot courses in VS Code without leaving the ed
 - **Sidebar tree**: courses → modules → steps with ✓ / ▶ / ◯ states
 - **Step card WebView**: briefing + interactive widgets, theme-accented per course
 - **Submit & Continue**: single context-aware command (palette or WebView button) — submits, shows feedback, advances on pass
-- **Terminal pre-populate**: click "Open Terminal" in any step to spawn the integrated terminal with the right `gh repo fork` / `claude` / `pytest` already typed
+- **Run This Step (auto-capture)**: for `terminal_exercise` steps, click "▸ Run This Step" — the extension spawns a visible terminal, executes each `cli_command` via VS Code shell integration, captures the streamed output, and auto-submits to the grader. No paste step. Falls back to manual mode (open terminal + run yourself) if shell integration isn't available
+- **Terminal pre-populate (manual fallback)**: the "↳ open terminal manually" link spawns the integrated terminal with `cli_commands` already typed — for interactive flows where auto-capture doesn't fit
 - **Devcontainer support**: detects course-repos with `.devcontainer/devcontainer.json` and offers Reopen in Container — the `tusharbisht1391/skillslab` toolchain image takes over so `claude` / `aider` / `git` / `pytest` are all on PATH
 
 ## Security
@@ -24,7 +25,7 @@ Walk Claude Code / Aider / Spring Boot courses in VS Code without leaving the ed
 Download the `.vsix` from the [latest GitHub release](https://github.com/KingsGambitLab/skills-lab-v2/releases) and:
 
 ```
-code --install-extension skillslab-0.1.2.vsix
+code --install-extension skillslab-0.1.3.vsix
 ```
 
 ### From Marketplace

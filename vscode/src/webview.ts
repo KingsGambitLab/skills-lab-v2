@@ -96,6 +96,7 @@ export class StepWebViewManager {
     onNext?: () => void;
     onPrev?: () => void;
     onRunInTerminal?: () => void;
+    onRunAuto?: () => void;
   } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -106,11 +107,12 @@ export class StepWebViewManager {
     onNext: () => void,
     onRunInTerminal: () => void,
     onPrev: () => void,
+    onRunAuto?: () => void,
   ): void {
     // ALWAYS update callbacks BEFORE reveal/render — the listener below
     // reads via `this.callbacks.X?.()` so this swap is what makes the
     // already-open panel route to the new step.
-    this.callbacks = { onCheck, onNext, onPrev, onRunInTerminal };
+    this.callbacks = { onCheck, onNext, onPrev, onRunInTerminal, onRunAuto };
 
     if (this.panel) {
       this.panel.reveal(vscode.ViewColumn.Beside, true);
@@ -132,6 +134,7 @@ export class StepWebViewManager {
           case "next": this.callbacks.onNext?.(); break;
           case "prev": this.callbacks.onPrev?.(); break;
           case "runInTerminal": this.callbacks.onRunInTerminal?.(); break;
+          case "runAuto": this.callbacks.onRunAuto?.(); break;
         }
       });
     }
@@ -184,10 +187,17 @@ export class StepWebViewManager {
     //     the briefing in the WebView is the whole experience.
     let howToRun = "";
     if (surface === "terminal") {
+      // v0.1.3: primary CTA is "Run This Step" (auto-execute via shell
+      // integration + auto-capture output + auto-submit). Pre-v0.1.3
+      // the only path was "Open Terminal" → learner runs commands by
+      // hand → pastes output OR submits empty (both feel broken).
+      // Manual fallback stays available as a subtle link below.
       howToRun = `
         <div class="action-row">
-          <button class="primary" data-vsc-msg="runInTerminal">▸ Open Terminal &amp; Run Steps</button>
-          <span class="muted">spawns the integrated terminal with the cli_commands ready</span>
+          <button class="primary" data-vsc-msg="runAuto">▸ Run This Step</button>
+          <span class="muted">runs cli_commands in a terminal, captures output, auto-submits</span>
+          <span class="footer-spacer"></span>
+          <a class="footer-link" href="#" data-vsc-msg="runInTerminal">↳ open terminal manually</a>
         </div>`;
     } else if (BROWSER_WIDGET_TYPES.has(exType)) {
       howToRun = `

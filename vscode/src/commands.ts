@@ -173,6 +173,7 @@ export class CommandHandlers {
       () => void this.nextOrComplete(courseId, moduleId, detailedStep),
       () => void this.runStepInTerminal(detailedStep),
       () => void this.previous(courseId, moduleId, detailedStep),
+      () => void this.runAndAutoSubmit(courseId, moduleId, detailedStep),
     );
   }
 
@@ -375,10 +376,35 @@ export class CommandHandlers {
   }
 
   /**
+   * Build the env dict for a Skillslab terminal — only sets keys that
+   * actually exist in SecretStorage so we DON'T clobber the learner's
+   * shell env (pre-v0.1.3 bug: `OPENROUTER_API_KEY: ""` literally
+   * reset the user's exported key to empty).
+   *
+   * Per CLAUDE.md hard rule: "we never handle learner API keys". Keys
+   * read from SecretStorage are passed through to the spawned terminal's
+   * env in-flight only — never logged, never sent to our backend.
+   */
+  private async buildTerminalEnv(): Promise<Record<string, string>> {
+    const env: Record<string, string> = {
+      SKILLSLAB_API_URL: this.cfg().apiUrl,
+      SKILLSLAB_WEB_URL: this.cfg().webUrl,
+    };
+    const anthropic = await this.auth.getApiKey("anthropic");
+    if (anthropic) env.ANTHROPIC_API_KEY = anthropic;
+    const openrouter = await this.auth.getApiKey("openrouter");
+    if (openrouter) env.OPENROUTER_API_KEY = openrouter;
+    const github = await this.auth.getApiKey("github");
+    if (github) env.GITHUB_TOKEN = github;
+    return env;
+  }
+
+  /**
    * Open the integrated terminal pre-populated with the step's cli_commands.
-   * This is the footgun fix from the buddy-Opus consult: terminal-shy learners
-   * need a guided entry point. They click a button; the terminal opens with
-   * the right `gh repo fork` / `claude` / `pytest` already typed.
+   * MANUAL mode: we type the commands but the learner runs them themselves
+   * + pastes the output back. Used as the fallback when shell-integration
+   * isn't available, or when a step's cli_commands include interactive
+   * prompts (claude /login, gh auth login).
    */
   async runStepInTerminal(step: StepSummary): Promise<void> {
     const cmds: { cmd: string; label?: string }[] =
@@ -391,13 +417,7 @@ export class CommandHandlers {
     }
     const term = vscode.window.createTerminal({
       name: `Skillslab · ${labelOf(step)}`,
-      env: {
-        SKILLSLAB_API_URL: this.cfg().apiUrl,
-        SKILLSLAB_WEB_URL: this.cfg().webUrl,
-        ANTHROPIC_API_KEY: (await this.auth.getApiKey("anthropic")) || "",
-        OPENROUTER_API_KEY: "",
-        GITHUB_TOKEN: (await this.auth.getApiKey("github")) || "",
-      },
+      env: await this.buildTerminalEnv(),
     });
     term.show();
     // Echo the briefing label, then send each cmd. Don't auto-execute the
@@ -410,6 +430,143 @@ export class CommandHandlers {
       term.sendText(`# ${i + 1}/${cmds.length}: ${c.label || ""}`, true);
       term.sendText(c.cmd, !isLast); // last one: don't auto-press Enter
     }
+  }
+
+  /**
+   * AUTO-RUN mode for terminal_exercise (v0.1.3, per user feedback
+   * 2026-04-27): "Vscode assignment execution should work like Terminal
+   * instead of Web. ... command passes and output should not be paste,
+   * it should be similar to terminal (automated)."
+   *
+   * Spawns a visible terminal, waits for VS Code's shell integration to
+   * activate (stable since 1.93), then for each cli_command invokes
+   * `Terminal.shellIntegration.executeCommand(...)` and reads streamed
+   * output via the returned `TerminalShellExecution.read()` async
+   * iterator. Combined output is auto-submitted to /api/exercises/validate
+   * — the feedback panel (v0.1.2) renders pass/fail + grader prose
+   * + per-token must-contain results inline in the WebView.
+   *
+   * Fallbacks:
+   *   1. Shell integration not available within 4s → fall back to
+   *      `runStepInTerminal` (manual mode) + a toast explaining why.
+   *   2. Per-command timeout (default 60s) → kill + report error.
+   *   3. Combined output > 64KB → truncate (grader's must_contain
+   *      checker only needs presence of small tokens).
+   */
+  async runAndAutoSubmit(
+    courseId: string,
+    moduleId: number,
+    step: StepSummary,
+  ): Promise<void> {
+    const cmds: { cmd: string; label?: string }[] =
+      (step.validation && step.validation.cli_commands) || [];
+    if (cmds.length === 0) {
+      vscode.window.showInformationMessage(
+        `${labelOf(step)} has no cli_commands. Falling back to manual submit.`,
+      );
+      // No commands to run → fall through to existing submit path
+      await this.submitAndContinue(courseId, moduleId, step);
+      return;
+    }
+
+    const slug = courseId;
+    const attempt = this.state.recordAttempt(slug, step.id);
+
+    const term = vscode.window.createTerminal({
+      name: `Skillslab · ${labelOf(step)} (auto)`,
+      env: await this.buildTerminalEnv(),
+    });
+    term.show();
+
+    // Wait up to 4s for shell integration to come online. If it doesn't,
+    // fall back to manual mode — better to surface that path than to
+    // hang forever on a shell that won't integrate.
+    const integration = await waitForShellIntegration(term, 4000);
+    if (!integration) {
+      vscode.window.showWarningMessage(
+        `Shell integration not detected for ${labelOf(step)}. ` +
+          `Falling back to manual mode — run the commands yourself, then click Submit & Continue.`,
+      );
+      // Type the commands so the learner can run them manually.
+      term.sendText(`# ${labelOf(step)} — manual mode (shell integration unavailable)`, true);
+      for (let i = 0; i < cmds.length; i++) {
+        const c = cmds[i];
+        const isLast = i === cmds.length - 1;
+        term.sendText(`# ${i + 1}/${cmds.length}: ${c.label || ""}`, true);
+        term.sendText(c.cmd, !isLast);
+      }
+      return;
+    }
+
+    // Stream-execute each cmd; capture stdout+stderr via the read iterator.
+    let combinedOutput = "";
+    const TIMEOUT_MS = 60_000;
+    const MAX_OUTPUT_BYTES = 64 * 1024;
+
+    for (let i = 0; i < cmds.length; i++) {
+      const c = cmds[i];
+      const banner = `# ${i + 1}/${cmds.length}: ${c.label || ""}`;
+      combinedOutput += `${banner}\n$ ${c.cmd}\n`;
+
+      try {
+        const exec = integration.executeCommand(c.cmd);
+        const reader = exec.read();
+        const cmdOutput = await readStreamWithTimeout(reader, TIMEOUT_MS);
+        combinedOutput += cmdOutput;
+        if (!combinedOutput.endsWith("\n")) combinedOutput += "\n";
+      } catch (e: any) {
+        combinedOutput += `[skillslab] command failed or timed out: ${e?.message || e}\n`;
+      }
+
+      if (combinedOutput.length > MAX_OUTPUT_BYTES) {
+        combinedOutput =
+          combinedOutput.slice(0, MAX_OUTPUT_BYTES) +
+          `\n[skillslab] output truncated at ${MAX_OUTPUT_BYTES} bytes\n`;
+        break;
+      }
+    }
+
+    // Submit captured output as the paste field — the grader's
+    // terminal_exercise validator reads `response.paste` (single-slot
+    // back-compat per CLAUDE.md §v8.6.1).
+    let validated: ValidateResponse | null = null;
+    try {
+      validated = await this.api.validate(
+        step.id,
+        step.exercise_type || "terminal_exercise",
+        { paste: combinedOutput, captured_output: combinedOutput },
+        attempt,
+      );
+    } catch (e: any) {
+      vscode.window.showErrorMessage(
+        `Auto-submit failed: ${e?.message || e}. Try ${labelOf(step)}'s "Submit & Continue" button.`,
+      );
+      return;
+    }
+
+    if (validated.correct) {
+      const score = validated.score ?? 1.0;
+      try {
+        await this.api.markComplete(step.id, Math.round(score * 100));
+      } catch (e: any) {
+        if (e.status !== 409) {
+          vscode.window.showWarningMessage(`Pass detected, sync warning: ${e.message || e}`);
+        }
+      }
+      this.tree.refresh();
+      vscode.window.showInformationMessage(
+        `✓ ${labelOf(step)} passed — score ${Math.round(score * 100)}%. Click Next ▸ when ready.`,
+      );
+    } else {
+      vscode.window.showWarningMessage(
+        `${Math.round((validated.score ?? 0) * 100)}% — see feedback in the step panel.`,
+      );
+    }
+
+    // Re-render the WebView with the validated response so the feedback
+    // panel (v0.1.2) shows pass/fail + grader prose + per-token results
+    // inline. Same shape Submit & Continue uses.
+    await this.openStep(courseId, moduleId, step, validated);
   }
 
   // ── ToC ─────────────────────────────────────────────────────────
@@ -451,4 +608,67 @@ function labelOf(step: StepSummary, modulePos?: number): string {
   return modulePos !== undefined
     ? `M${modulePos - 1}.S${step.position}`
     : `S${step.position}`;
+}
+
+/**
+ * Wait for the terminal's shell integration to activate, up to `timeoutMs`.
+ * Returns the `TerminalShellIntegration` object on success, null on timeout.
+ *
+ * Shell integration goes through a brief handshake when the terminal's shell
+ * sources VS Code's integration scripts (zsh / bash / pwsh / fish). On a
+ * cold-start terminal this can take ~200-1500ms. On shells without
+ * integration support (sh, dash, custom shells) it never fires — hence the
+ * timeout.
+ */
+function waitForShellIntegration(
+  term: vscode.Terminal,
+  timeoutMs: number,
+): Promise<vscode.TerminalShellIntegration | null> {
+  return new Promise((resolve) => {
+    if (term.shellIntegration) {
+      resolve(term.shellIntegration);
+      return;
+    }
+    const disposables: vscode.Disposable[] = [];
+    const timer = setTimeout(() => {
+      for (const d of disposables) d.dispose();
+      resolve(null);
+    }, timeoutMs);
+    disposables.push(
+      vscode.window.onDidChangeTerminalShellIntegration((e) => {
+        if (e.terminal === term) {
+          clearTimeout(timer);
+          for (const d of disposables) d.dispose();
+          resolve(e.shellIntegration);
+        }
+      }),
+    );
+  });
+}
+
+/**
+ * Drain a `TerminalShellExecution.read()` async iterator into a single
+ * string, with a hard timeout. The iterator yields stdout+stderr chunks
+ * in order; the loop ends when the command completes (iterator returns)
+ * OR the timeout fires. We strip ANSI escapes since the grader matches
+ * regex against decorated output otherwise.
+ */
+async function readStreamWithTimeout(
+  reader: AsyncIterable<string>,
+  timeoutMs: number,
+): Promise<string> {
+  const chunks: string[] = [];
+  const timeoutPromise = new Promise<never>((_, reject) =>
+    setTimeout(() => reject(new Error(`read timed out after ${timeoutMs}ms`)), timeoutMs),
+  );
+  const drainPromise = (async () => {
+    for await (const chunk of reader) {
+      chunks.push(chunk);
+    }
+  })();
+  await Promise.race([drainPromise, timeoutPromise]);
+  // Strip ANSI escape sequences (CSI / OSC) — graders regex-match plain text.
+  // eslint-disable-next-line no-control-regex
+  const ansiRe = /\x1b\[[0-?]*[ -/]*[@-~]|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)/g;
+  return chunks.join("").replace(ansiRe, "");
 }
