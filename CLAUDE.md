@@ -10,9 +10,24 @@
 # 1. Stop service to avoid races during sync
 ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "sudo systemctl stop skills-lab.service"
 
-# 2. Rsync code (NEVER include .db-shm / .db-wal — corrupts the WAL on remote)
+# 2. Backup remote .env (the rsync below WILL overwrite it if it differs).
+#    The 2026-04-27 deploy lost DATABASE_URL because remote .env wasn't
+#    backed up first AND .env wasn't in the rsync excludes — required
+#    a PG password reset to recover. ALWAYS run this backup step OR
+#    add .env to the exclude list (preferred — see step 3).
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> \
+  "cp /home/ec2-user/skills-lab-v2/.env /home/ec2-user/skills-lab-v2/.env.bak"
+
+# 3. Rsync code (NEVER include .db-shm / .db-wal — corrupts the WAL on remote)
+#    EXCLUDE .env: prod has secrets (ANTHROPIC_API_KEY, DATABASE_URL with
+#    PG password) that don't exist locally; without --exclude=.env, rsync
+#    silently overwrites prod's secrets file with the local one and the
+#    service can't reconnect to PG on restart.
+#    EXCLUDE dl/: the bundled-vsix download dir lives ONLY on prod
+#    (see §VSCODE EXT BUNDLED-VSIX DEPLOY); rsync --delete would wipe it.
+#    EXCLUDE dist-test/: vscode test build artifacts; build per-host.
 rsync -az --delete \
-  --exclude={'.venv','.git','__pycache__','*.pyc','skills_lab.db','*.db-journal','*.db-wal','*.db-shm','.anthropic_budget.json','.skillslab','reviews','.claude','node_modules'} \
+  --exclude={'.venv','.git','__pycache__','*.pyc','skills_lab.db','*.db-journal','*.db-wal','*.db-shm','.anthropic_budget.json','.skillslab','reviews','.claude','node_modules','dist-test','.env','dl'} \
   -e "ssh -i ~/Downloads/ai-agent-demo.pem" \
   ./ ec2-user@<HOST>:/home/ec2-user/skills-lab-v2/
 
@@ -44,6 +59,106 @@ ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
 # 8. Restart + smoke
 ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "sudo systemctl restart skills-lab.service"
 curl -s http://<HOST>/api/courses | jq 'length'  # should match expected count
+
+# 9. (CREATOR-MERGE ONE-TIME) After the 2026-04-27 creator branch merge,
+#    new column `courses.is_published BOOLEAN` defaults to false. Existing
+#    courses created pre-merge default to NULL/false → catalog filters
+#    them out. Backfill ONCE per deploy that crosses this migration:
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
+  PGPASS=\$(grep -E '^DATABASE_URL' /home/ec2-user/skills-lab-v2/.env | sed -E 's|.*://[^:]+:([^@]+)@.*|\\1|')
+  PGPASSWORD=\$PGPASS psql -h localhost -U skillslab -d skills_lab -c \"
+    UPDATE courses
+    SET is_published = true,
+        published_at = COALESCE(published_at, created_at)
+    WHERE is_published IS NOT TRUE
+      AND created_at < '2026-04-27';
+  \"
+"
+# Idempotent — only flips pre-merge rows. New courses (post-merge) keep
+# is_published=false until the creator clicks Publish.
+
+# 10. (V8.6.2-ONWARD ONE-TIME) `/api/creator/{start,refine,generate}` and
+#     review-agent endpoints push work to a Celery worker (added 2026-04-24
+#     in v8.6.2 — replaces the prior `BackgroundTasks.add_task` pattern).
+#     Broker is Redis. Without these, every creator endpoint returns 500
+#     (TaskGroup ExceptionGroup → producer_pool init fails).
+#
+#     Discovered the hard way 2026-04-27 — prod was running v8.6.2 backend
+#     code for 3 days but had never been given Redis. Symptom: nobody hit
+#     the creator UI until the new web flow shipped, then everything 500'd.
+#
+#     Install Redis + start the Celery worker as a systemd unit:
+ssh -i ~/Downloads/ai-agent-demo.pem ec2-user@<HOST> "
+  # Redis (Amazon Linux 2023 ships Redis 6 as redis6 package)
+  sudo dnf install -y redis6
+  sudo systemctl enable --now redis6
+  redis6-cli -h 127.0.0.1 ping  # → PONG
+
+  # Celery deps in the venv
+  /home/ec2-user/skills-lab-v2/.venv/bin/pip install -q celery redis
+
+  # Celery worker as a systemd unit so it restarts on failure / boot
+  sudo tee /etc/systemd/system/skills-lab-celery.service > /dev/null << 'EOF'
+[Unit]
+Description=Skills Lab v2 — Celery worker
+After=network.target redis6.service
+Requires=redis6.service
+
+[Service]
+Type=simple
+User=ec2-user
+WorkingDirectory=/home/ec2-user/skills-lab-v2
+EnvironmentFile=/home/ec2-user/skills-lab-v2/.env
+Environment=PATH=/home/ec2-user/skills-lab-v2/.venv/bin:/usr/local/bin:/usr/bin:/bin
+ExecStart=/home/ec2-user/skills-lab-v2/.venv/bin/celery -A backend.celery_app worker --loglevel=warning --concurrency=1 --pool=solo
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
+EOF
+  sudo systemctl daemon-reload
+  sudo systemctl enable --now skills-lab-celery.service
+  sudo systemctl is-active skills-lab-celery.service  # → active
+"
+
+# Smoke verify:
+curl -s -X POST http://<HOST>/api/creator/start \
+  -H 'Content-Type: application/json' \
+  -d '{"title":"Smoke","description":"infra check","course_type":"technical"}'
+# Expected: {"session_id":"...","task_id":"...","status":"pending"} → 200
+# If 500 with "producer_pool init fails" → Redis isn't reachable; check
+# `sudo systemctl status redis6` and `redis6-cli ping`.
+```
+
+### Celery infra invariants going forward
+
+The `skills-lab-celery.service` MUST run alongside `skills-lab.service` on
+every host serving the API. Three failure modes to watch:
+
+1. **Worker stops** → API returns 200 (queues the task) but the task
+   never executes. `/api/creator/progress/{id}` polls hang. Symptom:
+   creator dashboard spins forever after Generate.
+   Fix: `sudo systemctl restart skills-lab-celery.service` + check
+   `sudo journalctl -u skills-lab-celery -n 50` for the underlying
+   crash.
+
+2. **Redis stops** → API itself returns 500 immediately on any
+   `_celery.send_task(...)` call. Symptom: creator/start fails
+   instantly, learner-side endpoints (catalog, validate, etc.) keep
+   working since they don't touch Celery.
+   Fix: `sudo systemctl start redis6`.
+
+3. **Worker version drift** → if the API is v8.6.X and the worker is
+   running pre-v8.6 code (process didn't restart on deploy), the
+   worker will fail to deserialize new task payloads.
+   Fix: ALWAYS run `sudo systemctl restart skills-lab-celery.service`
+   AS PART OF every deploy that touches `backend/`. Add to step 8
+   (alongside `restart skills-lab.service`).
+
+**Update step 8 of Phase 1 (above) to also restart the worker:**
+```bash
+sudo systemctl restart skills-lab.service skills-lab-celery.service
 ```
 
 ### Phase 2 — Postgres migration (one-shot, on top of Phase 1)
