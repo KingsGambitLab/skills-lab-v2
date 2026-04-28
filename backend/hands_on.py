@@ -250,15 +250,57 @@ def resolve_hands_on(course_slug: str, nn: str, slug: str) -> HandsOnLaunch:
             course_slug, nn_padded, e,
         )
 
-    # Fetch README (per-exercise, larger; learner-facing content)
-    try:
-        readme_md = _fetch_text(_readme_url(owner_repo, branch, exercise_dir))
-        readme_fetched = True
-    except (urllib.error.URLError, urllib.error.HTTPError) as e:
+    # Fetch README — try the canonical path first, then fall back through
+    # other known layouts. 2026-04-28: external course-repos (e.g. the
+    # inspiration repo claude-code-springboot-exercises) keep the problem
+    # statement at the BRANCH ROOT (EXERCISE.md / CLAUDE_INSTRUCTIONS.md)
+    # instead of inside .grading/. The launch endpoint MUST handle both so
+    # the LMS can plug in to externally-authored course-repos without
+    # forcing them to mirror our internal layout.
+    base = f"https://raw.githubusercontent.com/{owner_repo}/{branch}"
+    readme_candidates = [
+        # Skillslab convention (jspring / kimi / aie / future)
+        f"{base}/.grading/{exercise_dir}/README.md",
+        # Inspiration-repo convention (per-exercise dir, no dot-prefix)
+        f"{base}/grading/{exercise_dir}/README.md",
+        # Inspiration-repo convention (problem statement at branch root)
+        f"{base}/EXERCISE.md",
+        # Spring/Java convention some courses ship
+        f"{base}/README.md",
+    ]
+    fetched_parts: list[str] = []
+    for url in readme_candidates:
+        try:
+            text = _fetch_text(url)
+            if text and text.strip():
+                # First successful fetch wins for the primary content. If
+                # subsequent paths also exist (e.g. EXERCISE.md AND
+                # CLAUDE_INSTRUCTIONS.md), the frontend can show them as
+                # collapsible sections via a future enhancement.
+                fetched_parts.append(text)
+                readme_fetched = True
+                break
+        except (urllib.error.URLError, urllib.error.HTTPError):
+            continue
+    if not readme_fetched:
         log.warning(
-            "hands_on: README fetch failed for %s/%s: %s",
-            course_slug, exercise_dir, e,
+            "hands_on: README/EXERCISE.md not found for %s/%s in any of %d candidate paths",
+            course_slug, exercise_dir, len(readme_candidates),
         )
+    # Optionally append CLAUDE_INSTRUCTIONS.md when it lives at branch root
+    # (inspiration-repo pattern) — gives learners the recommended Claude
+    # workflow alongside the problem statement.
+    if readme_fetched:
+        try:
+            ci = _fetch_text(f"{base}/CLAUDE_INSTRUCTIONS.md")
+            if ci and ci.strip():
+                fetched_parts.append(
+                    "\n\n---\n\n## Recommended workflow with Claude Code\n\n" + ci
+                )
+        except (urllib.error.URLError, urllib.error.HTTPError):
+            pass
+    if fetched_parts:
+        readme_md = "\n\n".join(fetched_parts)
 
     return HandsOnLaunch(
         course_slug=course_slug,
