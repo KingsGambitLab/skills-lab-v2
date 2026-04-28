@@ -4398,6 +4398,59 @@ F5 — **AUTHORING terminal_exercise steps MUST emit a `template_files`
      write-CLAUDE.md class of step. Diagnostic steps (M0.S2 etc) are
      unchanged.
 
+F6 — **PREFER `hands_on` FOR AI-TOOL-ON-REAL-REPO COURSES (2026-04-28).**
+
+     User directive (verbatim, 2026-04-28): "look for new assignments in
+     [github.com/tusharbisht/claude-code-springboot-exercises] and update
+     creator to create similar exercises for hands-on ai native courses.
+     These new skills are important to be learnt as part of the course."
+
+     For courses where the LEARNER USES AN AI TOOL (Claude Code / Aider /
+     Cursor / Copilot) ON A REAL REPO to ship production-shape work
+     (jspring, kimi, aie, future fastapi-with-claude, terraform-with-
+     claude, k8s-with-claude, etc.), `hands_on` is the PREFERRED type
+     for code-shape steps. Module structure: ONE concept slide + N
+     hands_on exercises drawing from the 14-archetype pedagogy library
+     (see tools/grading-skeletons/PEDAGOGY_LIBRARY.md):
+
+       01 performance-bug-detect-and-fix    (Hibernate stats / SQL counter)
+       02 validation-bug-fix                (HTTP 400 contract)
+       03 concurrency-race-fix              (thread races, no 500s, 409s)
+       04 tests-from-scratch                (write a test suite from scratch)
+       05 library-migration                 (Spring 3.2→3.3, Pydantic 1→2)
+       06 refactor-preserving-behavior      (split fat controller; tests stay green)
+       07 feature-implement-from-spec       (new endpoint from spec + tests)
+       08 anti-exercise-when-not-to-use-claude  (calibration: 30s manual fix)
+       09 slash-command-authoring           (.claude/commands/<name>.md)
+       10 subagent-authoring                (.claude/agents/<name>.md)
+       11 hooks-wiring                      (.claude/settings.json)
+       12 mcp-wiring-and-consume            (claude mcp list --json)
+       13 claude-md-authoring               (CLAUDE.md at repo root)
+       14 workflow-tour                     (full Claude palette in one drill)
+
+     A WELL-DESIGNED hands_on AI-native course covers ≥5 distinct
+     archetypes + has the anti-exercise (08) somewhere in the middle
+     (calibration) + ends with a capstone of type 06 or 07.
+
+     hands_on emit shape is MINIMAL — see the step_type=="hands_on"
+     branch in this file. The Creator emits ONLY the slide content +
+     the 3-tuple (course_slug, exercise_nn, exercise_slug) pointing
+     at an entry in the course-repo's .grading/manifest.json. NO
+     cli_commands, NO rubric, NO must_contain — those are owned by the
+     harness via the grading-runner overlay (see backend/
+     course_asset_backfill.py). Validation: emit `{}`.
+
+     Pre-condition: the COURSE-REPO must already have the
+     .grading/<exercise_dir>/ infrastructure shipped (Hidden test class
+     OR verify.sh + README.md). If it doesn't, the Creator should emit
+     a different exercise type (concept / terminal_exercise) until the
+     course content lands. The ontology gate REJECTS hands_on steps
+     pointing at non-existent manifest entries.
+
+     terminal_exercise stays as legacy fallback for courses without
+     .grading/ infrastructure + for non-code-shape preflights. Will
+     retire by attrition per buddy-Opus 2026-04-28 advice (2 quarters).
+
 
 COURSE SUBJECT INFERENCE (critical — pick right exercise types):
 - **OPERATIONAL/SANDBOX-FIRST subjects** (SRE, DevOps, SecEng, DataAnalyst, MLops, Accountant, Legal-contract-review, BI): the learner's job is to TOUCH real tools. Use the new sandbox types (see below) heavily. A 2h course on AWS DevOps without `live_sql_playground`, `observability_sandbox`, or `code_exercise_live` is "MCQ cosplay" — reject that design.
@@ -9630,12 +9683,100 @@ ENGINEERING-CAPSTONE GENRE LOCK (non-negotiable):
   * Any "Organizational Readiness" / "Business Case Document"
 - If the course title has words like "Product", "Operations", "Strategy" — the capstone is STILL a coding deliverable. Those words describe the DOMAIN; the capstone is the CODE that ships.
 - Scenario consistency: use the SHARED SCENARIO (see === SHARED ... SCENARIO === block above) — company name, feature, stack — verbatim. Do not invent alternative names here."""
+    elif step_type == "hands_on":
+        # 2026-04-28 — slide + course-repo + native-editor architecture. The
+        # LMS shows the slide; the learner clones the course-repo (Codespace
+        # primary, github.dev / VS Code / Cursor as escape hatches); the
+        # course-repo's .grading/run-grading.sh runs hidden tests against
+        # their SUT; results POST back via skillslab CLI auto-submit + GHA
+        # workflow attestation (source of truth).
+        #
+        # The Creator emits ONLY the slide content + the 3-tuple
+        # (course_slug, exercise_nn, exercise_slug) pointing at an exercise
+        # in the course-repo's .grading/manifest.json. NO LLM-authored
+        # cli_commands, rubric, or must_contain — those are owned by the
+        # harness via the grading-runner overlay.
+        #
+        # Pedagogy: pick from the 14 archetypes documented in
+        # tools/grading-skeletons/PEDAGOGY_LIBRARY.md (performance-bug-detect,
+        # validation-bug-fix, concurrency-race-fix, tests-from-scratch,
+        # library-migration, refactor-preserving-behavior,
+        # feature-implement-from-spec, anti-exercise-when-not-to-use-claude,
+        # slash-command-authoring, subagent-authoring, hooks-wiring,
+        # mcp-wiring-and-consume, claude-md-authoring, workflow-tour).
+        #
+        # See CLAUDE.md §"BEHAVIORAL TEST HARNESS" + §"OUTCOME, NOT JOURNEY".
+        prompt += """{
+  "content": "<HTML SLIDE for the hands-on exercise. 150-300 words. Pure pedagogy — explains the CONCEPT the learner will practice, in styled cards (background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px; margin-bottom:10px;). NO instructions on HOW to solve (those live in the course-repo's .grading/<exercise_dir>/README.md, fetched + rendered inline below the slide). FOCUS: why this concept matters, what the symptom looks like in production, what 'correct' looks like at a high level. May include drag-drop / MCQ / scenario_walkthrough widgets per the rich-pedagogy directive — but keep widgets <script>-clean (CSP-safe, see CLAUDE.md §WIDGET RUNTIME).>",
+  "demo_data": {
+    "course_slug": "<the course's registered asset_slug from backend/course_assets.py — e.g. 'jspring', 'kimi', 'claude-code'. MUST match a course where CourseAsset.grading_runner is set.>",
+    "exercise_nn": "<two-character zero-padded exercise number — '00', '01', '02', ..., '14'. References an entry in the course-repo's .grading/manifest.json under 'exercises'.>",
+    "exercise_slug": "<kebab-case exercise slug — e.g. 'fix-n-plus-one', 'tests-from-scratch', 'concurrency-race'. References the same manifest entry.>",
+    "archetype": "<OPTIONAL but RECOMMENDED — the pedagogy archetype id from tools/grading-skeletons/PEDAGOGY_LIBRARY.md. One of: performance-bug-detect-and-fix, validation-bug-fix, concurrency-race-fix, tests-from-scratch, library-migration, refactor-preserving-behavior, feature-implement-from-spec, anti-exercise-when-not-to-use-claude, slash-command-authoring, subagent-authoring, hooks-wiring, mcp-wiring-and-consume, claude-md-authoring, workflow-tour. The frontend renders this as a meta-tag so learners see which skill family they're practicing.>"
+  },
+  "validation": {}
+}
+
+### HANDS_ON AUTHORING RULES (MANDATORY)
+
+1. **Slide content is for CONCEPT, not instructions.** The README in the
+   course-repo's .grading/<exercise_dir>/README.md carries the problem
+   statement, code refs, and how-to-solve. Slide is for: why this
+   matters · what symptom · what good looks like at a high level.
+   If you find yourself writing 'cd into the repo' / 'run mvnw test' in
+   the slide — STOP. That's README content; emit it as part of the
+   .grading/<exercise>/README.md authoring (a separate workflow), not
+   here.
+
+2. **demo_data is JUST the 3-tuple + optional archetype.** No
+   bootstrap_command, no cli_commands, no dependencies, no paste_slots,
+   no instructions. The grading-runner overlay + the launch endpoint
+   compose all the editor URLs (Codespace, github.dev, clone) from
+   the course-repo's manifest at step-load time.
+
+3. **validation is EMPTY.** Grading flows from skillslab CLI auto-submit
+   (last-passing-run wins) + GHA workflow attestation (source of truth).
+   No LMS-side rubric prose. No must_contain. No cli_commands. The
+   ontology gate REJECTS hands_on steps that emit any of those.
+
+4. **The 3-tuple MUST resolve.** course_slug must be in
+   backend/course_assets.py with grading_runner set. exercise_nn +
+   exercise_slug must match a real entry in the course-repo's
+   .grading/manifest.json — verified by the gate. Drift = unsolvable
+   exercise.
+
+5. **Pick the archetype that fits the pedagogy goal.** A well-designed
+   hands-on AI-native course covers ≥5 distinct archetypes across its
+   modules + ends with a capstone (refactor-preserving-behavior or
+   feature-implement-from-spec) + has the anti-exercise (08) somewhere
+   in the middle (calibration). See PEDAGOGY_LIBRARY.md for the full
+   matrix.
+
+6. **Module structure for hands-on AI-native courses.** Each module
+   should have: ONE concept slide step (existing concept type — rich
+   widgets allowed) + ONE OR MORE hands_on steps (each pointing at its
+   own exercise_dir in the manifest). Multi-hands-on modules are GOOD
+   — scaffold complexity (e.g. M3 hooks: simple-blocker → auto-formatter
+   → test-runner = 3 hands_on steps).
+
+7. **The course-repo MUST have the .grading/ infrastructure already
+   shipped.** The Creator emits LMS-side metadata; the actual hidden
+   test class + README live in the course-repo (authored separately,
+   typically before the Creator runs). If the manifest entry doesn't
+   exist yet, the Creator should emit a different exercise_type (e.g.
+   concept) until the course-repo ships the exercise content."""
+
     elif step_type == "terminal_exercise":
         # 2026-04-25 v2 — TERMINAL-FIRST. Learner runs the skillslab CLI; the
         # CLI auto-runs the declared commands and submits captured output.
         # NO copy-paste from terminal to browser. The web frontend renders a
         # "open your skillslab CLI" pointer for these steps (no paste textarea).
         # SECURITY RULE (CLAUDE.md §HARD RULE): we NEVER collect or see API keys.
+        # 2026-04-28 NOTE: terminal_exercise is now LEGACY for code-shape
+        # courses. New BYO-key tech courses (jspring/kimi/aie/future) should
+        # prefer `hands_on` (above). terminal_exercise stays for backward
+        # compat + non-code-shape preflights. See CLAUDE.md §"OUTCOME, NOT
+        # JOURNEY" + §"BEHAVIORAL TEST HARNESS".
         prompt += """{
   "content": "<HTML briefing, 150-300 words. Explain WHAT this exercise teaches + WHY it matters for real-world use of this tool. NO terminal commands in the briefing — those go in `demo_data.instructions` (for the learner to read) AND `validation.cli_commands` (for the CLI to auto-run). Use styled cards (background:#1e2538; color:#e8ecf4; border:1px solid #2a3352; border-radius:8px; padding:12px 16px;). Include a 'what you'll see' preview — one or two sentences on what success looks like. If Module 1 Step 1, include a compelling hook so the learner feels urgency to install + try. CRITICAL: do NOT use the words 'paste' / 'copy and paste' / 'copy the output' anywhere — `skillslab check` runs the commands and submits captured output automatically. Use 'run `skillslab check`' instead.>",
   "demo_data": {
