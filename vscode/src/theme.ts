@@ -5,7 +5,12 @@
 
 const _THEME_TOKENS: { tokens: string[]; accent: string }[] = [
   // Order matters — most-specific first.
-  { tokens: ["spring boot", "java + spring", "jspring"], accent: "#dc2626" },     // red
+  // 2026-04-27 v0.1.16 — jspring flipped from red (#dc2626) → Spring brand
+  // green (#6db33f). User feedback: "Red indicates something is broken,
+  // unnecessarily puts users alert mode." Red as the dominant accent on
+  // every action button + panel-stripe was reading as constant-error UX.
+  // Spring's official brand color is the natural non-alarmist fit.
+  { tokens: ["spring boot", "java + spring", "jspring"], accent: "#6db33f" },     // Spring brand green
   { tokens: ["kimi k2", "kimi+aider", "kimi", "aider"], accent: "#6366f1" },       // indigo
   { tokens: ["claude code", "claude-code", "ai-augmented engineering"], accent: "#f97316" }, // orange
 ];

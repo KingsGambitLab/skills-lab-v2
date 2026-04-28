@@ -275,6 +275,33 @@ class AssignmentType:
     # Required fields in demo_data / validation for _is_complete to pass.
     required_demo_data: list[str] = field(default_factory=list)
     required_validation: list[str] = field(default_factory=list)
+    # 2026-04-27 — per-field NON-EMPTY policy. Names listed here must be
+    # PRESENT *and* non-empty (list/dict/string truthy). Used for fields
+    # where an empty container is a regression masquerading as compliance,
+    # e.g. terminal_exercise.cli_commands=[] satisfies key-presence but
+    # leaves the step unrenderable.
+    #
+    # IMPORTANT — opt-in only: do NOT add fields where an empty default
+    # is the correct shape (e.g. validation.requirements=[] means "the LLM
+    # has no extra deps to declare" — a legitimate non-empty *answer*).
+    # Buddy-Opus consult 2026-04-27: blanket "empty=reject" breaks
+    # code_exercise gens where empty requirements is correct.
+    non_empty_demo_data: tuple[str, ...] = ()
+    non_empty_validation: tuple[str, ...] = ()
+    # 2026-04-27 (F26 extension to terminal_exercise) — when True, the gate
+    # rejects steps that reference repo-walking work but emit no scaffold
+    # (starter_repo OR starter_files). EXEMPTION: task_kind=="authoring"
+    # bypasses this requirement, since authoring steps create files in a
+    # fresh `.claude/` directory and need no pre-existing repo.
+    #
+    # Set True on terminal_exercise + system_build. Catches today's failure
+    # mode: jspring M1.S2 (step 85115 "Fix N+1 in OrderService") shipped
+    # with no starter_repo + no template_files + cli_commands=[]. Unsolvable.
+    # The gate now blocks any future regression.
+    #
+    # Buddy-Opus 2026-04-27 review: structural signal (task_kind from F5
+    # enum) — NOT regex on briefing prose, NOT LLM-prompt suggestion.
+    requires_scaffold_unless_authoring: bool = False
     # Runtime primitive used to execute the learner's submission.
     runtime: str | None = None  # see RUNTIME_REGISTRY
     # How learner-facing: interactive editor, read-only display, live sim,
@@ -372,6 +399,16 @@ register_assignment(AssignmentType(
     # grade the captured output text. Legacy steps without cli_commands are
     # accepted but flagged for re-regen.
     required_validation=["cli_commands", "any_of:rubric,must_contain"],
+    # 2026-04-27 — cli_commands MUST be non-empty. The 2026-04-27 jspring
+    # regen sweep landed 3 steps with cli_commands=[] (key-present, value
+    # empty) — gate accepted them because key-presence-only is a shallow
+    # check. Now: empty list rejects, retry feedback says exactly which
+    # field is wrong. See backend/ontology.py:validate_step_against_ontology.
+    non_empty_validation=("cli_commands",),
+    # F26 scaffold gate (2026-04-27): repo-walking terminal_exercise steps
+    # MUST declare starter_repo OR starter_files. task_kind=="authoring"
+    # exempts (those steps create files in fresh dirs).
+    requires_scaffold_unless_authoring=True,
     runtime=None,  # runs on learner's machine, not ours
     interaction_mode="byo_execution",
     reality_score="real",
@@ -389,6 +426,12 @@ register_assignment(AssignmentType(
     # probe), `gha_workflow_check` (F24), `state_assertion` (cluster_state_check),
     # `artifact_flag` (flag-submit capstone). _is_complete rejects if all four missing.
     required_validation=["any_of:gha_workflow_check,endpoint_check,state_assertion,artifact_flag"],
+    # F26 scaffold gate (2026-04-27): system_build implies "ship a real
+    # deliverable" — needs a starter_repo to fork/PR/deploy from. authoring
+    # exempts (e.g. zero-code system_build that just emits a markdown
+    # paste — has its own gates). 2026-04-21 §F26 already mandated this
+    # for code_exercise; extending to system_build for parity.
+    requires_scaffold_unless_authoring=True,
     runtime="auto",
     interaction_mode="real_workflow",
     reality_score="real",
@@ -1094,6 +1137,43 @@ def validate_step_against_ontology(
         else:
             if key not in (validation or {}):
                 return False, f"{exercise_type} missing required validation.{key}"
+
+    # 2026-04-27 (F26 extension) — Scaffold gate for terminal_exercise +
+    # system_build. Authoring steps (task_kind=="authoring") are EXEMPT
+    # because they create files in fresh dirs (.claude/, etc) and need
+    # no repo. Non-authoring steps that reference repo-walking work MUST
+    # declare a scaffold or they'll ship unsolvable.
+    if a.requires_scaffold_unless_authoring:
+        # task_kind can live at top-level of the step OR inside demo_data.
+        # The gate accepts both since the persistence layer normalizes.
+        tk_top = (demo_data or {}).get("__step_task_kind")  # set by caller when available
+        tk = tk_top or (demo_data or {}).get("task_kind")
+        if tk != "authoring":
+            has_repo = bool((demo_data or {}).get("starter_repo"))
+            has_files = bool((demo_data or {}).get("starter_files"))
+            if not (has_repo or has_files):
+                return False, (
+                    f"{exercise_type} with task_kind={tk!r} references external "
+                    "filesystem state (e.g. an existing repo) but emits neither "
+                    "demo_data.starter_repo nor demo_data.starter_files. F26 "
+                    "requires a scaffold for non-authoring repo-walking steps."
+                )
+
+    # 2026-04-27 — per-field NON-EMPTY check. Runs AFTER presence check;
+    # both lists are opt-in to avoid regressing fields where empty is the
+    # correct shape (e.g. validation.requirements=[] for code_exercise).
+    # Catches the 2026-04-27 jspring regen failure mode: terminal_exercise
+    # shipped with validation.cli_commands=[] (key-present, value empty)
+    # → step unrenderable in CLI + VS Code → no retry fired because gate
+    # said ✓ on key-presence alone.
+    for key in a.non_empty_demo_data:
+        v = (demo_data or {}).get(key)
+        if v in (None, "", [], {}, ()):
+            return False, f"{exercise_type} requires demo_data.{key} to be non-empty (got {type(v).__name__}={v!r})"
+    for key in a.non_empty_validation:
+        v = (validation or {}).get(key)
+        if v in (None, "", [], {}, ()):
+            return False, f"{exercise_type} requires validation.{key} to be non-empty (got {type(v).__name__}={v!r})"
 
     # Cheese-proof requirement for code assignments: ≥1 primitive other than must_contain.
     if a.is_code_assignment and a.grade_primitives:

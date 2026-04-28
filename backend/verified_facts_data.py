@@ -229,9 +229,12 @@ There is NO /plan, /scaffold, /refactor, /review.
 
 === Model routing — OpenRouter (canonical) ===
 - `--model openrouter/<provider>/<model>` + `OPENROUTER_API_KEY`
-- For Kimi K2: `--model openrouter/moonshotai/kimi-k2`
-- DO NOT use `kimi-k2-0905`, `kimi-k2-latest`, `kimi-k2-0711` — date-stamped
-  variants. Canonical is `moonshotai/kimi-k2` (no date).
+- For Kimi K2: `--model openrouter/moonshotai/kimi-k2-0905`
+- 2026-04-27 (post-v6 senior reviewer note + user product call): the
+  date-stamped slug `-0905` is what litellm/OpenRouter actually accept
+  at runtime. The unversioned `moonshotai/kimi-k2` slug used to be the
+  canonical form but no longer resolves consistently — bare `kimi-k2`
+  causes "model not found" on litellm 1.50+. Use `-0905` everywhere.
 
 === Non-canonical OpenAI-compatible passthrough ===
 - `--openai-api-base https://openrouter.ai/api/v1 --model openai/<slug>`
@@ -248,8 +251,12 @@ There is NO /plan, /scaffold, /refactor, /review.
 """
 
 _AIDER_DRIFTS = [
-    (r"kimi-k2-0\d{3}\b|kimi-k2-latest\b|kimi-k2-0711\b",
-     "uses a date-stamped Kimi K2 slug. The canonical OpenRouter slug is `moonshotai/kimi-k2` — use the unversioned form for stability.",
+    # 2026-04-27 — drift now flags BARE `kimi-k2` (no date suffix) because
+    # litellm 1.50+ doesn't resolve the unversioned form. The canonical
+    # slug is `moonshotai/kimi-k2-0905`. The old drift detector flagged
+    # date-stamped slugs as wrong — that was the real wrong call. Reversed.
+    (r"\bmoonshotai/kimi-k2(?![\w\-/.])|--model\s+kimi-k2(?![\w\-/.])|--model\s+openrouter/moonshotai/kimi-k2(?![\w\-/.])",
+     "uses bare `kimi-k2` (no date suffix). litellm 1.50+ does not resolve the unversioned form; OpenRouter's actual model id is `moonshotai/kimi-k2-0905`. Use the date-stamped slug verbatim.",
      True),
     (r"/load\s+\S*\.(?:md|txt|prompt)\b",
      "teaches `/load <prompt-file>.md` — that's NOT how /load works. /load replays slash-command history; use `/read <file>` or `aider --message-file <file>`.",
@@ -285,7 +292,7 @@ _AIDER_DRIFTS = [
     # `--openai-api-base` flag together. Pick one path: canonical or LiteLLM
     # passthrough. M0.S2 review caught this.
     (r"--model\s+openrouter/\S+.{0,300}--openai-api-base",
-     "mixes canonical `openrouter/<model>` prefix WITH `--openai-api-base` flag — pick one path. Canonical form: `--model openrouter/moonshotai/kimi-k2` + `OPENROUTER_API_KEY` (NO --openai-api-base needed).",
+     "mixes canonical `openrouter/<model>` prefix WITH `--openai-api-base` flag — pick one path. Canonical form: `--model openrouter/moonshotai/kimi-k2-0905` + `OPENROUTER_API_KEY` (NO --openai-api-base needed).",
      True),
 ]
 

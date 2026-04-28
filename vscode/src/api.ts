@@ -53,6 +53,15 @@ export interface ValidateResponse {
   item_results?: any[];
   correct_answer?: any;
   explanations?: any;
+  // v0.1.21 — client-side computed per-token + per-cli_command breakdown
+  // for terminal_exercise grades. Synthesized in runAndAutoSubmit from
+  // captured output + step.validation.{cli_commands, must_contain}, NOT
+  // from the server response. Renders in the feedback panel so learners
+  // see which markers passed/failed instead of just an opaque score.
+  terminal_breakdown?: {
+    cli_commands: Array<{ label: string; cmd: string; expect_pattern: string; matched: boolean }>;
+    must_contain: Array<{ token: string; present: boolean }>;
+  };
 }
 
 export class LmsClient {

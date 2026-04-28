@@ -141,6 +141,7 @@ export class StepWebViewManager {
     onShowInstallHints?: () => void;
     onCopyTemplate?: (template: string, path: string) => void;
     onOpenInBuffer?: (template: string, path: string, language: string) => void;
+    onRecheckToolchain?: () => void;
   } = {};
 
   constructor(private readonly extensionUri: vscode.Uri) {}
@@ -156,6 +157,7 @@ export class StepWebViewManager {
     onShowInstallHints?: () => void,
     onCopyTemplate?: (template: string, path: string) => void,
     onOpenInBuffer?: (template: string, path: string, language: string) => void,
+    onRecheckToolchain?: () => void,
   ): void {
     // ALWAYS update callbacks BEFORE reveal/render — the listener below
     // reads via `this.callbacks.X?.()` so this swap is what makes the
@@ -170,6 +172,7 @@ export class StepWebViewManager {
       onShowInstallHints,
       onCopyTemplate,
       onOpenInBuffer,
+      onRecheckToolchain,
     };
 
     if (this.panel) {
@@ -208,6 +211,22 @@ export class StepWebViewManager {
             this.callbacks.onOpenInBuffer?.(tpl, path, lang);
             break;
           }
+          case "copyStarterClone": {
+            // v0.1.15 — Starter-repo clone command → clipboard. Goes
+            // through the same callback as copyTemplate (clipboard write
+            // + toast); host extension sees it as a generic "copy this
+            // text" intent with no path.
+            const cmd = typeof msg.cloneCommand === "string" ? msg.cloneCommand : "";
+            this.callbacks.onCopyTemplate?.(cmd, "starter-clone");
+            break;
+          }
+          case "recheckToolchain": {
+            // v0.1.20 — User just installed a tool that the pill reported
+            // missing. Clear the per-tool PATH cache + re-render the
+            // step. If everything's now on PATH, pill flips to host-ok.
+            this.callbacks.onRecheckToolchain?.();
+            break;
+          }
         }
       });
     }
@@ -218,6 +237,31 @@ export class StepWebViewManager {
   dispose(): void {
     this.panel?.dispose();
     this.panel = null;
+  }
+
+  /**
+   * v0.1.21 — push a run-progress message to the WebView. Updates the
+   * `<div id="sll-run-progress">` DOM element via a JS listener
+   * (window.addEventListener('message', ...)).
+   *
+   * Phases:
+   *   - start({cmds: [{label, cmd}]})   — populate the list, show panel
+   *   - cmd_start({index})              — flip li to "running"
+   *   - cmd_done({index, ok})           — flip li to "done" + ✓/✗
+   *   - validating                      — switch headline to "Grading…"
+   *   - graded                          — hide the panel; feedback takes over
+   *   - error                           — flip to error state
+   *
+   * No-op if the panel doesn't exist (e.g. step is non-terminal).
+   */
+  postRunProgress(msg: {
+    phase: "start" | "cmd_start" | "cmd_done" | "validating" | "graded" | "error";
+    cmds?: Array<{ label?: string; cmd: string }>;
+    index?: number;
+    ok?: boolean;
+  }): void {
+    if (!this.panel) return;
+    void this.panel.webview.postMessage({ type: "runProgress", ...msg });
   }
 
   private renderHtml(input: StepRenderInput): string {
@@ -274,21 +318,47 @@ export class StepWebViewManager {
     //   - browser-widget exercise type → "Open in Browser" (widget = work)
     //   - everything else (concept / code_read / etc.) → no banner;
     //     the briefing in the WebView is the whole experience.
-    let howToRun = "";
+
+    // Submit & Continue only renders for steps that actually grade a
+    // submission. For pure-read steps (concept), the Next button is
+    // promoted to primary + the host auto-marks the step complete on
+    // its way through.
+    const requiresSubmission = !NO_SUBMIT_TYPES.has(exType);
+
+    // v0.1.17 — collapsed footer action bar from 6 buttons to 3.
+    // User feedback (verbatim, 2026-04-27): "Bottom action bar is a mess,
+    // 6 actions is just too much."
+    //
+    // Surface-aware action set (per user directive: "separate out
+    // terminal and vscode views if needed" — structural, not regex):
+    //
+    //   • terminal surface (terminal_exercise step):
+    //       PRIMARY:  ▸ Run & Submit  (one click — runs cli_commands + auto-submits)
+    //       SECONDARY: ◂ Previous · Next ▸
+    //       MICRO-LINK row: open terminal manually · view in browser ↗
+    //
+    //   • non-terminal surface (concept, code_exercise without surface=terminal):
+    //       PRIMARY:  ▸ Submit & Continue
+    //       SECONDARY: ◂ Previous · Next ▸
+    //       MICRO-LINK row: view in browser ↗
+    //
+    // The "Submit & Continue" + "Run This Step" duality from v0.1.16 was
+    // genuinely confusing — for terminal steps the run IS the submit,
+    // they're not separate actions. Combining them into one primary
+    // CTA is the right call. The legacy "Submit & Continue" surfaces
+    // ONLY for non-terminal steps where the learner pastes manually.
+    let primaryAction = "";
+    let manualTerminalLink = "";
     if (surface === "terminal") {
-      // v0.1.3: primary CTA is "Run This Step" (auto-execute via shell
-      // integration + auto-capture output + auto-submit). Pre-v0.1.3
-      // the only path was "Open Terminal" → learner runs commands by
-      // hand → pastes output OR submits empty (both feel broken).
-      // Manual fallback stays available as a subtle link below.
-      howToRun = `
-        <div class="action-row">
-          <button class="primary" data-vsc-msg="runAuto">▸ Run This Step</button>
-          <span class="muted">runs cli_commands in a terminal, captures output, auto-submits</span>
-          <span class="footer-spacer"></span>
-          <a class="footer-link" href="#" data-vsc-msg="runInTerminal">↳ open terminal manually</a>
-        </div>`;
+      // For terminal_exercise: Run-This-Step IS the submit path.
+      primaryAction = `<button class="primary" data-vsc-msg="runAuto" title="Auto-runs cli_commands in a terminal, captures output, auto-submits">▸ Run &amp; Submit</button>`;
+      manualTerminalLink = `<a class="footer-link" href="#" data-vsc-msg="runInTerminal">↳ open terminal manually</a>`;
+    } else if (requiresSubmission) {
+      primaryAction = `<button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>`;
     }
+    // Kept these names for the layout below.
+    const howToRun = "";
+    const footerRunBlock = "";
     // v0.1.13: in this code path, the only steps reaching renderCodingHtml
     // are CODING types (terminal_exercise / code_exercise / code_read /
     // fill_in_blank / system_build / code). Non-coding types are routed
@@ -300,12 +370,6 @@ export class StepWebViewManager {
     // steps in case the learner wants the dashboard view too (e.g. to
     // see other learners' submissions, comments, etc.).
     const footerBrowserLink = `<a class="footer-link" href="${escapeAttr(browserUrl)}" target="_blank" rel="noopener">view in browser ↗</a>`;
-
-    // Submit & Continue only renders for steps that actually grade a
-    // submission. For pure-read steps (concept), the Next button is
-    // promoted to primary + the host auto-marks the step complete on
-    // its way through.
-    const requiresSubmission = !NO_SUBMIT_TYPES.has(exType);
 
     // v0.1.5 Change #3 — toolchain status pill. Renders ONLY for
     // terminal-surface steps (status !== "n/a"). For host-missing,
@@ -344,6 +408,22 @@ export class StepWebViewManager {
     const filesToAuthorPanel = isAuthoring
       ? renderFilesToAuthorPanel(input.step)
       : "";
+
+    // v0.1.15 — `🎯 Walkthrough` panel renders demo_data.instructions
+    // (the phase-by-phase teaching prose). CLI has surfaced this since
+    // 2026-04-25; WebView dropped it silently. User screenshot 2026-04-27:
+    // CLI shows Phase 1/2/3 with `aider --model openrouter/...` + expected
+    // outputs + common issues; VS Code only showed verification grep/pytest.
+    // Net: learner could not see HOW to do the work. Added back at parity.
+    const instructionsPanel = renderInstructionsPanel(input.step);
+
+    // v0.1.15 — `🌱 Get the starter` banner. Renders when the step has
+    // demo_data.starter_repo (F26 structured) OR demo_data.bootstrap_command.
+    // Critical for jspring M1.S2 etc. where the briefing references a Java
+    // file the learner has no way to find without a clone command upfront.
+    // Track A's harness-side injection will populate starter_repo on every
+    // jspring step automatically; this panel surfaces it.
+    const starterRepoPanel = renderStarterRepoPanel(input.step);
 
     return `<!doctype html>
 <html lang="en">
@@ -427,6 +507,36 @@ export class StepWebViewManager {
                        margin-top: 28px; padding-top: 18px;
                        border-top: 1px solid var(--vscode-panel-border); }
     .footer-spacer { flex: 1; }
+    /* v0.1.17 — micro-links row UNDER the action bar. Reduces footer-bar
+       clutter from 6 → 3 buttons by demoting "open terminal manually"
+       and "view in browser ↗" into low-emphasis links sitting below. */
+    .footer-microlinks {
+      display: flex; gap: 18px;
+      margin-top: 10px;
+      font-size: 0.78rem;
+      opacity: 0.78;
+    }
+    .footer-microlinks:empty { display: none; }
+    /* Surface tip — terminal_exercise on VS Code surface gets a small
+       structural note bridging the CLI-flavored prose and the WebView
+       button (per user 2026-04-27 "separate out terminal and vscode
+       views if needed" — done structurally, not by regex on prose). */
+    .surface-tip {
+      margin: 0 0 16px;
+      padding: 8px 14px;
+      font-size: 0.85rem;
+      background: var(--vscode-textBlockQuote-background);
+      border-left: 3px solid ${accent};
+      border-radius: 0 4px 4px 0;
+      color: var(--vscode-foreground);
+      opacity: 0.92;
+    }
+    .surface-tip code {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 5px; border-radius: 3px;
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.85rem;
+    }
     .footer-link {
       color: var(--vscode-textLink-foreground);
       font-size: 0.82rem;
@@ -439,17 +549,20 @@ export class StepWebViewManager {
           border-radius: 4px; overflow-x: auto; }
     code { font-family: var(--vscode-editor-font-family); }
 
-    /* ── Spec panel — cli_commands / must_contain / rubric ── */
+    /* ── Spec panel — cli_commands / must_contain / rubric ──
+       v0.1.15: subtle muted-border to distinguish from action panels
+       (instructions / files-to-author). Spec is VERIFICATION (what the
+       grader runs); action panels are EXECUTION (what the learner runs). */
     .spec-panel {
-      margin: 16px 0 22px;
-      padding: 14px 18px;
+      margin: 24px 0;
+      padding: 16px 20px;
       background: var(--vscode-sideBar-background);
       border: 1px solid var(--vscode-panel-border);
-      border-radius: 4px;
+      border-radius: 6px;
     }
-    .spec-section { margin-bottom: 14px; }
+    .spec-section { margin-bottom: 16px; }
     .spec-section:last-child { margin-bottom: 0; }
-    .spec-section h3 { margin: 0 0 8px 0; font-size: 0.92rem;
+    .spec-section h3 { margin: 0 0 10px 0; font-size: 0.95rem;
                        font-weight: 600;
                        color: var(--vscode-foreground); }
     .spec-section ol, .spec-section ul {
@@ -468,6 +581,153 @@ export class StepWebViewManager {
       max-height: 180px; overflow: auto;
       font-size: 0.82rem; padding: 10px 12px;
       white-space: pre-wrap;
+    }
+
+    /* ── Instructions panel (v0.1.15) — phase-by-phase walkthrough ──
+       Renders demo_data.instructions, the field that carries the
+       teaching prose for terminal_exercise (e.g. "Phase 1: Generate
+       the architecture plan → run X → expected Y / common issue Z").
+       Pre-v0.1.15 the WebView dropped this field silently — learner saw
+       only the briefing intro + verification commands, never the actual
+       workflow. CLI's render.py has rendered it since 2026-04-25.
+       Visual: accent-stripe LEFT to mark it as ACTION (do this now),
+       same shape as files-to-author for parallel "actions to perform". */
+    .instructions-panel {
+      margin: 24px 0;
+      padding: 18px 22px 20px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-left: 3px solid ${accent};
+      border-radius: 6px;
+    }
+    .instructions-panel > h3 {
+      margin: 0 0 6px;
+      font-size: 1rem;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .instructions-panel > .panel-intro {
+      margin: 0 0 18px;
+      font-size: 0.85rem;
+      color: var(--vscode-descriptionForeground);
+      line-height: 1.55;
+    }
+    .instructions-content { font-size: 0.92rem; line-height: 1.65; }
+    .instructions-content > *:first-child { margin-top: 0; }
+    .instructions-content > *:last-child { margin-bottom: 0; }
+    /* Server-emitted heading hierarchy ("Phase 1:" / "Phase 2:" / etc).
+       Each phase gets accent color so the eye finds them quickly. */
+    .instructions-content h2,
+    .instructions-content h3,
+    .instructions-content h4 {
+      margin: 22px 0 10px;
+      font-size: 0.95rem;
+      font-weight: 700;
+      color: ${accent};
+      letter-spacing: 0.01em;
+    }
+    .instructions-content h2:first-child,
+    .instructions-content h3:first-child,
+    .instructions-content h4:first-child { margin-top: 0; }
+    .instructions-content p { margin: 0 0 12px; }
+    .instructions-content ul,
+    .instructions-content ol { margin: 8px 0 14px; padding-left: 24px; }
+    .instructions-content li { margin-bottom: 6px; }
+    .instructions-content strong { color: var(--vscode-foreground); font-weight: 600; }
+    .instructions-content pre {
+      background: var(--vscode-textBlockQuote-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+      padding: 11px 14px;
+      font-size: 0.85rem;
+      overflow-x: auto;
+      margin: 10px 0 14px;
+      max-height: 360px;
+    }
+    .instructions-content pre code {
+      background: transparent; padding: 0;
+      color: var(--vscode-editor-foreground);
+    }
+    .instructions-content code {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 6px;
+      border-radius: 3px;
+      font-size: 0.85rem;
+      font-family: var(--vscode-editor-font-family);
+    }
+    /* Array-shape rendering — phase-block layout for the older
+       [{label, body, command}] instructions format. Numbered circles +
+       accent label so phases read as a sequence. */
+    .phase-block {
+      display: flex;
+      gap: 14px;
+      margin-bottom: 18px;
+      padding-bottom: 16px;
+      border-bottom: 1px dashed var(--vscode-panel-border);
+    }
+    .phase-block:last-child {
+      border-bottom: 0;
+      padding-bottom: 0;
+      margin-bottom: 0;
+    }
+    .phase-num {
+      flex: 0 0 28px;
+      width: 28px; height: 28px; border-radius: 50%;
+      background: ${accent}; color: #fff;
+      font-weight: 700; font-size: 0.85rem;
+      display: flex; align-items: center; justify-content: center;
+      margin-top: 1px;
+    }
+    .phase-body { flex: 1; min-width: 0; }
+    .phase-label { margin: 4px 0 8px; font-size: 0.95rem;
+                   font-weight: 600; color: var(--vscode-foreground); }
+    .phase-prose { font-size: 0.9rem; line-height: 1.6; margin-bottom: 10px; }
+    .phase-cmd { margin: 0; }
+
+    /* v0.1.15 BEAUTIFY — give the files-to-author panel the same accent
+       treatment as instructions, so all "ACTION" panels visually rhyme. */
+    .files-to-author { border-left: 3px solid ${accent}; }
+
+    /* ── Starter-repo panel (v0.1.15) — clone-banner above the briefing ──
+       Renders when demo_data.starter_repo or demo_data.bootstrap_command
+       is present. Shown before "Run This Step" so the learner clones first. */
+    .starter-repo-panel {
+      margin: 14px 0 22px;
+      padding: 14px 18px 16px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-left: 3px solid ${accent};
+      border-radius: 6px;
+    }
+    .starter-repo-panel .srp-header {
+      display: flex; align-items: center; justify-content: space-between;
+      margin-bottom: 6px;
+    }
+    .starter-repo-panel .srp-header h3 {
+      margin: 0; font-size: 0.98rem; font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .starter-repo-panel .panel-intro {
+      margin: 0 0 12px; font-size: 0.85rem;
+      color: var(--vscode-descriptionForeground); line-height: 1.55;
+    }
+    .starter-repo-panel pre.srp-cmd {
+      margin: 0 0 10px;
+      background: var(--vscode-textBlockQuote-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-radius: 4px;
+      padding: 10px 14px;
+      font-size: 0.85rem;
+      overflow-x: auto;
+      white-space: pre-wrap;
+      word-break: break-all;
+    }
+    .starter-repo-panel pre.srp-cmd code {
+      background: transparent; padding: 0;
+      color: var(--vscode-editor-foreground);
+    }
+    .starter-repo-panel .srp-actions {
+      display: flex; gap: 8px;
     }
 
     /* ── Files-to-author panel (v0.1.14) ──
@@ -583,17 +843,18 @@ export class StepWebViewManager {
     }
     .file-card .file-hints strong { color: var(--vscode-foreground); }
 
-    /* ── Toolchain status pill (terminal_exercise only, v0.1.5) ── */
+    /* ── Toolchain status pill (terminal_exercise only, v0.1.5; v0.1.16 inline-install) ── */
     .toolchain-pill {
-      display: flex; align-items: center; gap: 10px;
       margin: 0 0 14px;
-      padding: 8px 14px;
+      padding: 12px 16px;
       border-radius: 4px;
-      font-size: 0.85rem;
+      font-size: 0.88rem;
       border: 1px solid var(--vscode-panel-border);
     }
     .toolchain-pill.in-container,
     .toolchain-pill.host-ok {
+      display: flex; align-items: center; gap: 10px;
+      padding: 8px 14px;
       background: var(--vscode-inputValidation-infoBackground,
                         var(--vscode-textBlockQuote-background));
       border-left: 3px solid var(--vscode-charts-green, #2dd4bf);
@@ -601,17 +862,108 @@ export class StepWebViewManager {
     .toolchain-pill.host-missing {
       background: var(--vscode-inputValidation-warningBackground,
                         var(--vscode-textBlockQuote-background));
-      border-left: 3px solid var(--vscode-charts-red, #f97316);
+      /* Amber/yellow border — INFORMATIONAL, not alarming. v0.1.16
+         flipped from red (#f97316 was actually orange but read-as-red on
+         dark themes) to amber (#f59e0b) per user feedback on red theme.*/
+      border-left: 3px solid #f59e0b;
+    }
+    .toolchain-pill .pill-row {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 10px;
     }
     .toolchain-pill .pill-icon { font-size: 1rem; }
     .toolchain-pill .pill-text { flex: 1; }
-    .toolchain-pill button {
-      background: var(--vscode-button-background);
-      color: var(--vscode-button-foreground);
-      border: none; padding: 4px 10px; border-radius: 3px;
-      font-size: 0.8rem; cursor: pointer; font-weight: 500;
+    .toolchain-pill ul.quick-install {
+      margin: 8px 0 12px 0;
+      padding: 8px 12px 8px 24px;
+      background: var(--vscode-textBlockQuote-background);
+      border-radius: 4px;
+      font-size: 0.83rem;
+      list-style: disc;
     }
-    .toolchain-pill button:hover { background: var(--vscode-button-hoverBackground); }
+    .toolchain-pill ul.quick-install li {
+      margin-bottom: 6px; line-height: 1.55;
+    }
+    .toolchain-pill ul.quick-install li:last-child { margin-bottom: 0; }
+    .toolchain-pill ul.quick-install code {
+      background: var(--vscode-textCodeBlock-background);
+      padding: 1px 5px; border-radius: 3px;
+      font-family: var(--vscode-editor-font-family);
+    }
+    .toolchain-pill ul.quick-install code.install-line {
+      display: inline; word-break: break-word;
+    }
+    .toolchain-pill .pill-actions {
+      display: flex; align-items: center; gap: 12px;
+      flex-wrap: wrap;
+    }
+    .toolchain-pill button.secondary {
+      background: var(--vscode-button-secondaryBackground);
+      color: var(--vscode-button-secondaryForeground);
+      border: 1px solid transparent;
+      padding: 5px 12px; border-radius: 3px;
+      font-size: 0.82rem; cursor: pointer; font-weight: 500;
+    }
+    .toolchain-pill button.secondary:hover {
+      background: var(--vscode-button-secondaryHoverBackground);
+    }
+
+    /* v0.1.21 — live run-progress card. Replaces the silent gap between
+       click → grade with a per-command status list updated via postMessage. */
+    .run-progress {
+      margin: 0 0 22px;
+      padding: 14px 18px;
+      background: var(--vscode-sideBar-background);
+      border: 1px solid var(--vscode-panel-border);
+      border-left: 3px solid ${accent};
+      border-radius: 6px;
+    }
+    .run-progress .rp-header {
+      display: flex; align-items: center; gap: 10px;
+      margin-bottom: 12px;
+    }
+    .run-progress .rp-spinner { font-size: 1.05rem; }
+    .run-progress .rp-headline {
+      font-weight: 600; flex: 1; font-size: 0.95rem;
+      color: var(--vscode-foreground);
+    }
+    .run-progress .rp-counter {
+      font-size: 0.82rem; opacity: 0.75;
+      font-family: var(--vscode-editor-font-family);
+    }
+    .run-progress ul.rp-cmds {
+      list-style: none; padding: 0; margin: 0 0 10px 0;
+      font-size: 0.85rem; line-height: 1.5;
+    }
+    .run-progress ul.rp-cmds li {
+      display: flex; gap: 10px; align-items: baseline;
+      padding: 6px 10px; border-radius: 4px;
+      margin-bottom: 4px;
+    }
+    .run-progress ul.rp-cmds li.running {
+      background: var(--vscode-textBlockQuote-background);
+      animation: rp-pulse 1.4s ease-in-out infinite;
+    }
+    .run-progress ul.rp-cmds li.done { opacity: 0.85; }
+    .run-progress ul.rp-cmds li .rp-icon {
+      flex: 0 0 18px; text-align: center; font-size: 0.95rem;
+    }
+    .run-progress ul.rp-cmds li .rp-label {
+      flex: 1; color: var(--vscode-foreground);
+    }
+    .run-progress ul.rp-cmds li .rp-cmd {
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.8rem; opacity: 0.7;
+      max-width: 60%; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+    }
+    .run-progress .rp-footnote {
+      margin-top: 8px; font-size: 0.78rem;
+    }
+    @keyframes rp-pulse {
+      0%, 100% { opacity: 1; }
+      50% { opacity: 0.65; }
+    }
 
     /* ── Feedback panel (post-Submit) ── */
     .feedback-panel {
@@ -654,13 +1006,83 @@ export class StepWebViewManager {
     .feedback-panel details { margin-top: 8px; font-size: 0.85rem; }
     .feedback-panel details summary { cursor: pointer; opacity: 0.8; }
 
-    .step-body { font-size: 0.95rem; }
-    .step-body h2, .step-body h3, .step-body h4 { margin-top: 28px; }
-    .step-body p { margin: 0 0 14px; }
+    /* v0.1.21 — terminal_exercise per-token + per-cli_command breakdown.
+       Two grouped sections above the rubric prose so learners see the
+       signal-level result instead of just an opaque %. Computed
+       client-side from captured output. */
+    .feedback-panel .fb-section {
+      margin: 10px 0 14px;
+      padding: 10px 14px;
+      background: var(--vscode-textBlockQuote-background);
+      border-radius: 4px;
+    }
+    .feedback-panel .fb-section h4 {
+      margin: 0 0 8px;
+      font-size: 0.88rem;
+      font-weight: 600;
+      color: var(--vscode-foreground);
+    }
+    .feedback-panel ul.fb-breakdown {
+      list-style: none; margin: 0; padding: 0;
+      font-size: 0.85rem;
+    }
+    .feedback-panel ul.fb-breakdown li {
+      display: flex; gap: 10px; align-items: baseline;
+      padding: 4px 0;
+      border-bottom: 1px dashed var(--vscode-panel-border);
+    }
+    .feedback-panel ul.fb-breakdown li:last-child { border-bottom: 0; }
+    .feedback-panel ul.fb-breakdown li.fb-correct .fb-icon { color: var(--vscode-charts-green, #2dd4bf); }
+    .feedback-panel ul.fb-breakdown li.fb-wrong .fb-icon { color: var(--vscode-charts-red, #f97316); }
+    .feedback-panel ul.fb-breakdown li .fb-icon {
+      flex: 0 0 14px; font-weight: 700; text-align: center;
+    }
+    .feedback-panel ul.fb-breakdown li .fb-label {
+      flex: 1; color: var(--vscode-foreground);
+    }
+    .feedback-panel ul.fb-breakdown li .fb-cmd {
+      font-family: var(--vscode-editor-font-family);
+      font-size: 0.78rem; opacity: 0.7;
+      max-width: 50%; overflow: hidden;
+      text-overflow: ellipsis; white-space: nowrap;
+      background: transparent; padding: 0;
+    }
+
+    /* v0.1.15 — step-body typography. Mirrors CLAUDE.md §"RENDERING LAYER
+       OWNS TYPOGRAPHY" rules: vertical rhythm + density caps + boundary
+       trimming. The browser frontend already has these; bringing the
+       WebView to parity. */
+    .step-body { font-size: 0.95rem; max-width: 76ch; }
+    .step-body > *:first-child { margin-top: 0; }
+    .step-body > *:last-child { margin-bottom: 0; }
+    .step-body h1, .step-body h2 { margin-top: 32px; font-size: 1.15rem;
+                                    color: var(--vscode-foreground); }
+    .step-body h3 { margin-top: 28px; font-size: 1rem;
+                    color: var(--vscode-foreground); }
+    .step-body h4 { margin-top: 22px; font-size: 0.95rem;
+                    color: var(--vscode-foreground); }
+    .step-body p { margin: 0 0 14px; line-height: 1.65; }
     .step-body ul, .step-body ol { margin: 14px 0 18px; padding-left: 24px; }
-    .step-body li { margin-bottom: 6px; }
-    .step-body table { border-collapse: collapse; margin: 14px 0; }
-    .step-body th, .step-body td { padding: 6px 12px; border: 1px solid var(--vscode-panel-border); }
+    .step-body li { margin-bottom: 6px; line-height: 1.6; }
+    .step-body ol + h3, .step-body ul + h3 { margin-top: 32px; }
+    .step-body table { border-collapse: collapse; margin: 14px 0;
+                        width: 100%; font-size: 0.9rem; }
+    .step-body th, .step-body td { padding: 8px 14px;
+                                    border: 1px solid var(--vscode-panel-border);
+                                    text-align: left; }
+    .step-body th { background: var(--vscode-sideBar-background); font-weight: 600; }
+    .step-body pre { max-height: 360px; overflow: auto;
+                      background: var(--vscode-textBlockQuote-background);
+                      border: 1px solid var(--vscode-panel-border);
+                      border-radius: 4px; padding: 12px 14px;
+                      font-size: 0.85rem; margin: 14px 0; }
+    .step-body blockquote {
+      margin: 14px 0; padding: 8px 16px;
+      border-left: 3px solid var(--vscode-panel-border);
+      background: var(--vscode-textBlockQuote-background);
+      color: var(--vscode-descriptionForeground);
+      border-radius: 0 4px 4px 0;
+    }
   </style>
 </head>
 <body>
@@ -676,7 +1098,27 @@ export class StepWebViewManager {
 
   ${feedbackPanel}
 
+  <!-- v0.1.21: live run-progress card. Hidden by default; populated via
+       postMessage from commands.ts:runAndAutoSubmit as each cli_command
+       starts/finishes. User feedback (verbatim, 2026-04-28): "click on
+       submit, right now it waits for 2 seconds and then runs one after
+       the other. The output could be much more intuitive and visually
+       appealing." This panel fills the silent gap between click → grade. -->
+  <div id="sll-run-progress" class="run-progress" style="display:none;">
+    <div class="rp-header">
+      <span class="rp-spinner">⏳</span>
+      <span class="rp-headline">Running this step…</span>
+      <span class="rp-counter"></span>
+    </div>
+    <ul class="rp-cmds"></ul>
+    <div class="rp-footnote muted">Output capture from your terminal — auto-submits on completion.</div>
+  </div>
+
   ${toolchainPill}
+
+  ${surface === "terminal" ? `<div class="surface-tip">📌 This step's instructions reference <code>skillslab check</code> (the CLI command). In VS Code, the <strong>▸ Run &amp; Submit</strong> button at the bottom of the page does the equivalent — runs the verification commands, captures output, and auto-submits. You don't need to install the CLI separately.</div>` : ``}
+
+  ${starterRepoPanel}
 
   ${howToRun}
 
@@ -684,13 +1126,18 @@ export class StepWebViewManager {
 
   ${filesToAuthorPanel}
 
+  ${instructionsPanel}
+
   ${specPanel}
 
   <div class="footer-actions">
-    ${requiresSubmission ? `<button class="primary" data-vsc-msg="submit">▸ Submit &amp; Continue</button>` : ``}
+    ${primaryAction}
     <button class="secondary" data-vsc-msg="prev" title="Go to previous step">◂ Previous</button>
-    <button class="${requiresSubmission ? `secondary` : `primary`}" data-vsc-msg="next" title="Go to next step">Next ▸</button>
+    <button class="${primaryAction ? `secondary` : `primary`}" data-vsc-msg="next" title="Go to next step">Next ▸</button>
     <span class="footer-spacer"></span>
+  </div>
+  <div class="footer-microlinks">
+    ${manualTerminalLink}
     ${footerBrowserLink}
   </div>
 
@@ -717,7 +1164,72 @@ export class StepWebViewManager {
         msg.path = el.getAttribute('data-file-path') || '';
         msg.language = el.getAttribute('data-file-language') || '';
       }
+      // v0.1.15 — Starter-repo "Copy clone command" button.
+      if (type === 'copyStarterClone') {
+        try {
+          const enc = el.getAttribute('data-clone-encoded') || '';
+          msg.cloneCommand = decodeURIComponent(enc);
+        } catch (_) { msg.cloneCommand = ''; }
+      }
       vscode.postMessage(msg);
+    });
+    // v0.1.21 — listen for runProgress messages from the extension and
+    // update the run-progress card. Extension sends:
+    //   { type: 'runProgress', phase: 'start', cmds: [{label, cmd}] }
+    //   { type: 'runProgress', phase: 'cmd_start', index: 0 }
+    //   { type: 'runProgress', phase: 'cmd_done', index: 0, ok: true }
+    //   { type: 'runProgress', phase: 'validating' }
+    //   { type: 'runProgress', phase: 'graded' }    // hides the panel
+    window.addEventListener('message', function(ev) {
+      var m = ev.data || {};
+      if (m.type !== 'runProgress') return;
+      var panel = document.getElementById('sll-run-progress');
+      if (!panel) return;
+      var ul = panel.querySelector('ul.rp-cmds');
+      var headline = panel.querySelector('.rp-headline');
+      var spinner = panel.querySelector('.rp-spinner');
+      var counter = panel.querySelector('.rp-counter');
+      if (m.phase === 'start' && Array.isArray(m.cmds)) {
+        panel.style.display = '';
+        // Auto-scroll into view so the learner sees it immediately
+        try { panel.scrollIntoView({behavior: 'smooth', block: 'center'}); } catch (_) {}
+        ul.innerHTML = m.cmds.map(function(c, i) {
+          var cmdShort = (c.cmd || '').slice(0, 80);
+          return '<li data-i="' + i + '" class="pending">' +
+            '<span class="rp-icon">○</span>' +
+            '<span class="rp-label">' + (c.label || ('Step ' + (i + 1))) + '</span>' +
+            '<span class="rp-cmd">' + cmdShort + '</span>' +
+            '</li>';
+        }).join('');
+        headline.textContent = 'Running this step…';
+        spinner.textContent = '⏳';
+        counter.textContent = '0 / ' + m.cmds.length;
+      } else if (m.phase === 'cmd_start') {
+        var li = ul.querySelector('li[data-i="' + m.index + '"]');
+        if (li) {
+          li.className = 'running';
+          var ic = li.querySelector('.rp-icon');
+          if (ic) ic.textContent = '▶';
+        }
+      } else if (m.phase === 'cmd_done') {
+        var li2 = ul.querySelector('li[data-i="' + m.index + '"]');
+        if (li2) {
+          li2.className = 'done';
+          var ic2 = li2.querySelector('.rp-icon');
+          if (ic2) ic2.textContent = m.ok ? '✓' : '✗';
+        }
+        var total = ul.querySelectorAll('li').length;
+        counter.textContent = (m.index + 1) + ' / ' + total;
+      } else if (m.phase === 'validating') {
+        headline.textContent = 'Grading your output…';
+        spinner.textContent = '⚖';
+      } else if (m.phase === 'graded') {
+        // Hide — feedback panel takes over
+        panel.style.display = 'none';
+      } else if (m.phase === 'error') {
+        headline.textContent = 'Run failed — see notification + try Submit & Continue';
+        spinner.textContent = '⚠';
+      }
     });
     // Re-injected widget runtime (data-action delegator + hoist).
     ${scriptBundle}
@@ -979,14 +1491,64 @@ function renderToolchainPill(
       <span class="pill-text">Devcontainer escape hatch active — toolchain pre-installed (aider · python3 · git · gh)</span>
     </div>`;
   }
-  // host-missing — primary CTA is "Show install steps" (the install IS
-  // the skill); devcontainer is a secondary escape-hatch link.
-  const missing = (status.missingTools || []).map(escapeAttr).join(", ");
+  // host-missing — v0.1.16: render an INLINE quick-install line per missing
+  // tool, then a "Show full install steps" button for the per-OS
+  // troubleshooting + docs link expansion. User feedback (verbatim,
+  // 2026-04-27 jspring screenshot): "mvn not found in toolchain, and not
+  // instructions given for installing. Give something at least." Putting
+  // the install command behind a button-click broke the "give me something"
+  // expectation.
+  //
+  // The lookup table mirrors INSTALL_HINTS in vscode/src/commands.ts but
+  // is inlined here as a one-liner-per-tool quick-install hint. Single
+  // shared source-of-truth (the full INSTALL_HINTS dict) is still behind
+  // the "Show full steps" button, but the LEAD is now visible.
+  const missingTools = status.missingTools || [];
+  const missingDisplay = missingTools.map(escapeAttr).join(", ");
+  const quickInstall = (tool: string): string => {
+    const t = tool.toLowerCase();
+    // Quick one-liner per common tool. Falls back to a generic message
+    // when no entry matches — the "Show full steps" button covers the rest.
+    const QUICK: Record<string, string> = {
+      mvn: "curl -s 'https://get.sdkman.io' | bash && source ~/.sdkman/bin/sdkman-init.sh && sdk install maven",
+      maven: "curl -s 'https://get.sdkman.io' | bash && source ~/.sdkman/bin/sdkman-init.sh && sdk install maven",
+      "./mvnw": "the project wrapper — make executable: chmod +x ./mvnw  (and run ./mvnw -v from repo root)",
+      java: "curl -s 'https://get.sdkman.io' | bash && source ~/.sdkman/bin/sdkman-init.sh && sdk install java 21-tem  (sdkman: cross-platform, no PATH gotchas, no sudo. Avoid `brew install openjdk@21` — it's keg-only + needs a fragile per-machine symlink.)",
+      javac: "curl -s 'https://get.sdkman.io' | bash && source ~/.sdkman/bin/sdkman-init.sh && sdk install java 21-tem  (sdkman: cross-platform, no PATH gotchas, no sudo. Avoid `brew install openjdk@21` — it's keg-only + needs a fragile per-machine symlink.)",
+      aider: "curl -LsSf https://aider.chat/install.sh | sh",
+      claude: "curl -fsSL https://claude.ai/install.sh | sh   (then run: claude /login)",
+      python3: "curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.11",
+      python: "curl -LsSf https://astral.sh/uv/install.sh | sh && uv python install 3.11",
+      pytest: "pip install --user pytest  (or use uv: uv pip install pytest)",
+      go: "macOS: brew install go · Linux: download from go.dev/dl · Windows: winget install GoLang.Go",
+      node: "curl -fsSL https://fnm.vercel.app/install | bash && fnm install --lts",
+      npm: "curl -fsSL https://fnm.vercel.app/install | bash && fnm install --lts",
+      cargo: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+      rustc: "curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh",
+      docker: "macOS/Windows: Download Docker Desktop from docker.com · Linux: see docs.docker.com/engine/install",
+      gh: "macOS: brew install gh · Linux: see https://github.com/cli/cli/blob/trunk/docs/install_linux.md · Windows: winget install GitHub.cli",
+      git: "macOS: comes with Xcode CLI tools (xcode-select --install) · Linux: sudo apt install git · Windows: winget install Git.Git",
+      jq: "macOS: brew install jq · Linux: sudo apt install jq · Windows: winget install jqlang.jq",
+    };
+    return QUICK[t] || `(no quick-install hint for \`${tool}\` — click "Show full steps" below)`;
+  };
+  const inlineHints = missingTools
+    .map(
+      (tool) =>
+        `<li><code>${escapeAttr(tool)}</code>: <code class="install-line">${escapeAttr(quickInstall(tool))}</code></li>`
+    )
+    .join("");
   return `<div class="toolchain-pill host-missing">
-    <span class="pill-icon">🔴</span>
-    <span class="pill-text">Missing on PATH: <strong>${missing}</strong>. Installing these on your machine is part of the course (skill transfer).</span>
-    <button data-vsc-msg="showInstallHints">Show install steps</button>
-    <a class="footer-link" href="#" data-vsc-msg="reopenInContainer" style="margin-left: 8px; font-size: 0.8rem;">or use devcontainer →</a>
+    <div class="pill-row">
+      <span class="pill-icon">⚠</span>
+      <span class="pill-text">Missing on PATH: <strong>${missingDisplay}</strong>. Installing these on your machine is part of the course (skill transfer).</span>
+    </div>
+    <ul class="quick-install">${inlineHints}</ul>
+    <div class="pill-actions">
+      <button class="secondary" data-vsc-msg="recheckToolchain" title="Clear cache + re-check whether tools are now on PATH">↻ Re-check</button>
+      <button class="secondary" data-vsc-msg="showInstallHints">Show full install steps + troubleshooting</button>
+      <a class="footer-link" href="#" data-vsc-msg="reopenInContainer">or use devcontainer →</a>
+    </div>
   </div>`;
 }
 
@@ -1038,6 +1600,66 @@ function isAuthoringTerminalExercise(step: StepSummary): boolean {
  * the existing spec panel only — preserves behavior for diagnostic
  * steps + pre-F5 courses).
  */
+/**
+ * v0.1.15 — `🌱 Get the starter` banner for steps that declare a
+ * `demo_data.starter_repo` (F26 scaffold) OR `demo_data.bootstrap_command`
+ * (resolved one-liner). Renders the clone command prominently with a
+ * copy button so the learner knows WHERE the planted bug / starter code
+ * lives BEFORE they read the briefing.
+ *
+ * Pre-v0.1.15 this was dropped silently — even when the Creator (or
+ * harness, post-Track-A) attached starter_repo, the WebView ignored it.
+ * Net: jspring M1.S2 ("Fix the N+1 in OrderService.getRecentOrders")
+ * referenced a Java file the learner had no way to find. CLI's
+ * render.py has surfaced this since 2026-04-25.
+ *
+ * Renders nothing when neither field is present.
+ */
+function renderStarterRepoPanel(step: StepSummary): string {
+  const dd: any = step.demo_data || {};
+  const starterRepo = dd.starter_repo;
+  const bootstrap = typeof dd.bootstrap_command === "string" ? dd.bootstrap_command : "";
+
+  let cloneCmd = "";
+  let descriptor = "";
+  let url = "";
+
+  if (starterRepo && typeof starterRepo === "object") {
+    url = String(starterRepo.url || "");
+    const ref = String(starterRepo.ref || "");
+    descriptor = String(starterRepo.description || "");
+    if (url) {
+      cloneCmd = ref ? `git clone ${url} && cd $(basename ${url} .git) && git checkout ${ref}` : `git clone ${url}`;
+    }
+  }
+  // Bootstrap_command takes precedence if both present (it may include
+  // additional steps like `cd … && claude`).
+  if (bootstrap.trim().length > 0) {
+    cloneCmd = bootstrap.trim();
+  }
+
+  if (!cloneCmd) return "";
+
+  const cloneAttr = encodeURIComponent(cloneCmd);
+  const urlLink = url
+    ? `<a class="footer-link" href="${escapeAttr(url)}" target="_blank" rel="noopener">view repo ↗</a>`
+    : "";
+
+  return `
+    <div class="starter-repo-panel">
+      <div class="srp-header">
+        <h3>🌱 Get the starter</h3>
+        ${urlLink}
+      </div>
+      ${descriptor ? `<p class="panel-intro">${escapeAttr(descriptor)}</p>` : `<p class="panel-intro">Clone this repo to your machine — the planted code + team conventions live here. Run the command below in your shell.</p>`}
+      <pre class="srp-cmd"><code>${escapeAttr(cloneCmd)}</code></pre>
+      <div class="srp-actions">
+        <button class="secondary" data-vsc-msg="copyStarterClone" data-clone-encoded="${cloneAttr}">Copy clone command</button>
+      </div>
+    </div>`;
+}
+
+
 function renderFilesToAuthorPanel(step: StepSummary): string {
   const stepAny = step as any;
   const dd = stepAny.demo_data || {};
@@ -1130,6 +1752,79 @@ function renderFilesToAuthorPanel(step: StepSummary): string {
       ${cards}
     </div>`;
 }
+
+/**
+ * v0.1.15 — `🎯 Walkthrough` panel for terminal_exercise steps that ship
+ * `demo_data.instructions` (the phase-by-phase teaching prose: "Phase 1:
+ * Generate plan → run X → expected Y / common issue Z").
+ *
+ * Why this exists: the CLI has rendered this since 2026-04-25 (cli/src/
+ * skillslab/render.py:347). VS Code dropped it silently → learners saw
+ * the briefing intro + the 3 verification commands but never the actual
+ * workflow. User screenshot 2026-04-27 (Kimi M3.S2 "extract OrderQuery-
+ * Repository with /architect + /code"): CLI shows Phase 1/2/3 with full
+ * aider invocations + expected outputs + common issues; VS Code showed
+ * just `find . -name 'order_query_repository.py'` and similar verification
+ * grep/pytest. Net: learner had no idea HOW to do the work in VS Code.
+ *
+ * Field shape (matches render.py's both-shape support):
+ *   - String: HTML blob with `<h3>` / `<pre>` / `<p>` / `<code>`. Most
+ *     common shape — what Creator emits since v8.6.1.
+ *   - Array: `[{label, body, command}]`. Older shape; rendered as
+ *     numbered phase-blocks for visual consistency with the new shape.
+ *
+ * CSP-safety: instructions HTML is server-sanitized (no `<script>` tags
+ * survive _sanitize_step_for_learner). Inline `onclick=` if present is
+ * blocked by our `script-src 'nonce-X'` policy — no exec, no harm.
+ */
+function renderInstructionsPanel(step: StepSummary): string {
+  const dd: any = step.demo_data || {};
+  const instructions = dd.instructions;
+  if (!instructions) return "";
+
+  let bodyHtml = "";
+
+  if (typeof instructions === "string") {
+    if (instructions.trim().length === 0) return "";
+    bodyHtml = instructions;
+  } else if (Array.isArray(instructions) && instructions.length > 0) {
+    bodyHtml = instructions
+      .map((it: any, i: number) => {
+        if (typeof it === "string") {
+          return (
+            `<div class="phase-block">` +
+            `<div class="phase-num">${i + 1}</div>` +
+            `<div class="phase-body"><div class="phase-prose">${escapeAttr(it)}</div></div>` +
+            `</div>`
+          );
+        }
+        const label = it.label || it.title || `Step ${i + 1}`;
+        const body = it.body || it.description || it.text || "";
+        const cmd = it.command || it.cmd || "";
+        return (
+          `<div class="phase-block">` +
+          `<div class="phase-num">${i + 1}</div>` +
+          `<div class="phase-body">` +
+          `<h4 class="phase-label">${escapeAttr(String(label))}</h4>` +
+          (body ? `<div class="phase-prose">${body}</div>` : "") +
+          (cmd ? `<pre class="phase-cmd"><code>${escapeAttr(String(cmd))}</code></pre>` : "") +
+          `</div>` +
+          `</div>`
+        );
+      })
+      .join("");
+  } else {
+    return "";
+  }
+
+  return `
+    <div class="instructions-panel">
+      <h3>🎯 Walkthrough</h3>
+      <p class="panel-intro">Follow these phases on your machine. When done, click <strong>▸ Run This Step</strong> above (or run the verification commands listed below) — <code>skillslab check</code> auto-grades the result.</p>
+      <div class="instructions-content">${bodyHtml}</div>
+    </div>`;
+}
+
 
 function renderSpecPanel(
   step: StepSummary,
@@ -1251,6 +1946,58 @@ function renderFeedbackPanel(
     ? `<div class="fb-prose">${escapeAttr(String(feedback.feedback))}</div>`
     : "";
 
+  // v0.1.21 — terminal_exercise breakdown panel. Client-side synthesized
+  // per-cli_command match results + per-must_contain-token presence checks.
+  // Renders as two grouped cards above the rubric prose so learners see
+  // exactly which signals contributed to the score (not just an opaque %).
+  let terminalBreakdownHtml = "";
+  const tb = (feedback as any).terminal_breakdown;
+  if (tb && (tb.cli_commands?.length || tb.must_contain?.length)) {
+    const cliPart = tb.cli_commands?.length
+      ? (() => {
+          const passed = tb.cli_commands.filter((c: any) => c.matched).length;
+          const total = tb.cli_commands.length;
+          const items = tb.cli_commands
+            .map((c: any) => {
+              const icon = c.matched ? "✓" : "✗";
+              const cls = c.matched ? "fb-correct" : "fb-wrong";
+              return (
+                `<li class="${cls}"><span class="fb-icon">${icon}</span>` +
+                `<span class="fb-label">${escapeAttr(String(c.label))}</span>` +
+                `<code class="fb-cmd">${escapeAttr(String(c.cmd))}</code></li>`
+              );
+            })
+            .join("");
+          return (
+            `<div class="fb-section"><h4>Verification commands <span class="muted">(${passed}/${total} matched)</span></h4>` +
+            `<ul class="fb-breakdown">${items}</ul></div>`
+          );
+        })()
+      : "";
+    const mcPart = tb.must_contain?.length
+      ? (() => {
+          const passed = tb.must_contain.filter((m: any) => m.present).length;
+          const total = tb.must_contain.length;
+          const items = tb.must_contain
+            .map((m: any) => {
+              const icon = m.present ? "✓" : "✗";
+              const cls = m.present ? "fb-correct" : "fb-wrong";
+              return (
+                `<li class="${cls}"><span class="fb-icon">${icon}</span>` +
+                `<code class="fb-label">${escapeAttr(String(m.token))}</code>` +
+                `<span class="muted">${m.present ? "found in output" : "missing from output"}</span></li>`
+              );
+            })
+            .join("");
+          return (
+            `<div class="fb-section"><h4>Required output markers <span class="muted">(${passed}/${total} found)</span></h4>` +
+            `<ul class="fb-breakdown">${items}</ul></div>`
+          );
+        })()
+      : "";
+    terminalBreakdownHtml = cliPart + mcPart;
+  }
+
   // Per-item results — common shape across categorization / ordering /
   // sjt / mcq / code_review. Each item has correct: bool + optional
   // user_/expected_ fields + explanation.
@@ -1306,6 +2053,7 @@ function renderFeedbackPanel(
       <span>${headerIcon} ${headerText}</span>
       <span class="fb-score">${pct}%</span>
     </div>
+    ${terminalBreakdownHtml}
     ${proseHtml}
     ${itemsHtml}
     ${canonicalHtml}

@@ -134,6 +134,14 @@ class Course(Base):
     is_published: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
     published_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
+    # 2026-04-27 (post-v6 review) — authoritative asset slug for the course.
+    # Set at course-creation time when the title matches a registered slug
+    # in `backend/course_assets.py`. The harness uses this column directly
+    # instead of fuzzy word-overlap matching on the title at every per-step
+    # regen call. Fuzzy matching survives only as a fallback for rows where
+    # this column is null (legacy courses pre-2026-04-27).
+    asset_slug: Mapped[str | None] = mapped_column(String, nullable=True)
+
     modules: Mapped[list["Module"]] = relationship(
         back_populates="course", cascade="all, delete-orphan", order_by="Module.position"
     )
@@ -189,6 +197,15 @@ class Step(Base):
     # for safety. Buddy-Opus review insisted this be an EXPLICIT declaration,
     # not inferred at runtime — see CLAUDE.md §"Surface-aware split".
     learner_surface: Mapped[str | None] = mapped_column(String, nullable=True)
+    # 2026-04-27 (F5) — explicit step-shape declaration for terminal_exercise.
+    # Values: 'authoring' (learner edits files declared in demo_data.template_files
+    # — settings.json / agents/*.md / commands/*.md), 'diagnostic' (learner runs
+    # a command sequence and the CLI captures output), 'build' (learner authors
+    # AND runs — used for AI-pair feature builds). NULL = legacy step / inferred
+    # from demo_data.template_files presence at the consumer (VS Code extension
+    # + CLI both fall back to template_files non-empty when task_kind is NULL).
+    # Setting this explicitly is preferred — both surfaces grep for it first.
+    task_kind: Mapped[str | None] = mapped_column(String, nullable=True)
 
     module: Mapped["Module"] = relationship(back_populates="steps")
     progress_records: Mapped[list["UserProgress"]] = relationship(
@@ -385,6 +402,20 @@ async def create_tables() -> None:
         table="steps",
         column="learner_surface",
         ddl="ALTER TABLE steps ADD COLUMN learner_surface VARCHAR",
+    )
+    # 2026-04-27 (F5): task_kind for explicit authoring/diagnostic/build declaration
+    # on terminal_exercise steps. Idempotent — _ensure_column no-ops if present.
+    await _ensure_column(
+        table="steps",
+        column="task_kind",
+        ddl="ALTER TABLE steps ADD COLUMN task_kind VARCHAR",
+    )
+    # 2026-04-27 (post-v6): asset_slug authoritative column on courses.
+    # Replaces fuzzy title-hint matching for the harness inject path.
+    await _ensure_column(
+        table="courses",
+        column="asset_slug",
+        ddl="ALTER TABLE courses ADD COLUMN asset_slug VARCHAR",
     )
 
 

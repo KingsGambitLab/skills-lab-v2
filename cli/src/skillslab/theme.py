@@ -71,8 +71,11 @@ _THEMES: dict[str, Theme] = {
     ),
     "jspring": Theme(
         slug="jspring",
-        accent="#dc2626",       # red
-        accent_dim="#b91c1c",
+        # 2026-04-27 — Spring brand green replaces red. User feedback
+        # (verbatim): "Red indicates something is broken, unnecessarily
+        # puts users alert mode."
+        accent="#6db33f",       # Spring brand green
+        accent_dim="#4f8c2a",
         icon="▲",
         label="Claude Code for Spring Boot",
         box=_box.ROUNDED,

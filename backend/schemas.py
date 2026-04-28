@@ -64,6 +64,11 @@ class StepOut(BaseModel):
     # 'terminal'; CLI prints "open in browser" when 'web'. NULL = legacy
     # step (treated as 'web' by both consumers).
     learner_surface: str | None = None
+    # 2026-04-27 (F5) — 'authoring' | 'diagnostic' | 'build' | None.
+    # Explicit signal consumers (VS Code extension's renderFilesToAuthorPanel
+    # + CLI's `## Files to author` section) check first; both fall back to
+    # demo_data.template_files non-empty when task_kind is None.
+    task_kind: str | None = None
     content: str | None = None
     code: str | None = None
     expected_output: str | None = None

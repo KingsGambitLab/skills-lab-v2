@@ -201,22 +201,45 @@ const INSTALL_HINTS: Record<string, InstallHint> = {
     docs: "https://go.dev/dl",
   },
   java: {
-    what: "JDK 21+ — for Spring Boot / jspring courses. Recommended via sdkman (manages JDK + Maven + Gradle versions).",
+    what: "JDK 21+ — install via sdkman (the single recommended path; works on macOS / Linux / WSL with no PATH gotchas, no sudo, no per-OS symlink dance).",
     macos:
       "curl -s 'https://get.sdkman.io' | bash\n" +
       "source ~/.sdkman/bin/sdkman-init.sh\n" +
       "sdk install java 21-tem\n" +
-      "  # Fallback: brew install openjdk@21",
+      "\n" +
+      "# Verify (works in current AND every future shell — sdkman wires JAVA_HOME + PATH automatically):\n" +
+      "java --version\n" +
+      "\n" +
+      "# Why NOT `brew install openjdk@21`? brew installs Java as 'keg-only' on\n" +
+      "# macOS, leaving you with EITHER (a) a sudo-required symlink to a hard-\n" +
+      "# coded /opt/homebrew path that breaks on Intel Macs (/usr/local) and\n" +
+      "# breaks again if you bump JDK versions, OR (b) a PATH export to ~/.zshrc\n" +
+      "# that doesn't affect the running shell. Both fragile + machine-specific.\n" +
+      "# sdkman sidesteps all of it.",
     linux:
       "curl -s 'https://get.sdkman.io' | bash\n" +
       "source ~/.sdkman/bin/sdkman-init.sh\n" +
       "sdk install java 21-tem\n" +
-      "  # Fallback: sudo apt install openjdk-21-jdk",
+      "java --version\n" +
+      "  # Avoid `apt install openjdk-21-jdk` if you can — sdkman gives you per-\n" +
+      "  # project version switching (`sdk use java 17.0.x` etc) which apt can't.",
     windows:
+      "# WSL (Linux subsystem) is the recommended path — sdkman works identically inside WSL:\n" +
+      "wsl --install   # if WSL not yet installed\n" +
+      "# Then inside WSL: same sdkman commands as Linux above.\n" +
+      "\n" +
+      "# Native Windows alternative (no WSL):\n" +
       "PowerShell: winget install EclipseAdoptium.Temurin.21.JDK\n" +
-      "  # sdkman supports Windows via WSL — see sdkman.io/install for details",
+      "  # winget handles PATH automatically. Open a NEW PowerShell window after install.",
     troubleshoot:
-      "After sdkman install, open a NEW terminal so .sdkman/bin/sdkman-init.sh is sourced.\n" +
+      "If you went down the `brew install openjdk@21` path before reading this and now `java --version` says 'Unable to locate a Java Runtime' (verbatim user-filed 2026-04-27): brew installed it as 'keg-only' (not on PATH, not in /Library/Java/JavaVirtualMachines).\n" +
+      "  - CLEANEST recovery: switch to sdkman. `brew uninstall openjdk@21 && <sdkman install commands above>`. No symlink dance, no sudo, works on Intel + Apple Silicon identically.\n" +
+      "  - If you MUST keep brew (e.g. corporate proxy blocks sdkman.io): use brew's auto-detect prefix to build a portable symlink:\n" +
+      "        sudo ln -sfn \"$(brew --prefix openjdk@21)/libexec/openjdk.jdk\" \\\n" +
+      "          /Library/Java/JavaVirtualMachines/openjdk-21.jdk\n" +
+      "    `brew --prefix` returns /opt/homebrew/opt/... on Apple Silicon and /usr/local/opt/... on Intel Macs, so this command is at least architecture-portable. But it's still macOS-only, still requires sudo, still re-breaks if you change JDK versions. sdkman remains the better answer.\n" +
+      "\n" +
+      "After sdkman install, open a NEW terminal OR run `source ~/.sdkman/bin/sdkman-init.sh` in your current one.\n" +
       "Verify: `java --version` should print openjdk 21.x or temurin-21.x.",
     docs: "https://sdkman.io/install",
   },
@@ -226,6 +249,36 @@ const INSTALL_HINTS: Record<string, InstallHint> = {
     linux: "sdk install maven   # if sdkman is already installed\n  # Fallback: sudo apt install maven",
     windows: "PowerShell: winget install Apache.Maven",
     docs: "https://sdkman.io/sdks#maven",
+  },
+  // 2026-04-27 v0.1.17 — `./mvnw` (Maven wrapper) is NOT a system-wide
+  // install. It's a script that ships INSIDE the cloned course repo. If
+  // the toolchain check reports `./mvnw` missing, the right fix is
+  // (a) clone the repo first, (b) chmod +x ./mvnw if needed,
+  // (c) run from repo root. User feedback (verbatim, 2026-04-27):
+  // "Hint still absent" — the OutputChannel was emitting a generic
+  // "no install hint registered" message because INSTALL_HINTS only
+  // had `mvn` not `./mvnw`. Registry entry, not regex hardcode.
+  "./mvnw": {
+    what: "`./mvnw` is the Maven wrapper script that lives INSIDE the cloned course repo (not a system tool). It runs Maven without requiring system-installed `mvn`.",
+    macos: "1. Clone the course repo (see the 🌱 Get-the-starter banner above).\n" +
+      "2. cd into the cloned dir.\n" +
+      "3. If ./mvnw is not executable: chmod +x ./mvnw\n" +
+      "4. Run from repo root: ./mvnw -v",
+    linux: "1. Clone the course repo (see the 🌱 Get-the-starter banner above).\n" +
+      "2. cd into the cloned dir.\n" +
+      "3. If ./mvnw is not executable: chmod +x ./mvnw\n" +
+      "4. Run from repo root: ./mvnw -v",
+    windows: "1. Clone the course repo (see the 🌱 Get-the-starter banner above).\n" +
+      "2. cd into the cloned dir.\n" +
+      "3. PowerShell: .\\mvnw.cmd -v   (Windows uses mvnw.cmd, not ./mvnw)",
+    troubleshoot:
+      "If `./mvnw -v` says 'No such file or directory':\n" +
+      "  - You're not in the cloned repo's root. cd to where pom.xml lives.\n" +
+      "  - The repo's git checkout didn't include mvnw — re-clone fresh.\n" +
+      "If `./mvnw -v` says 'Permission denied':\n" +
+      "  - chmod +x ./mvnw\n" +
+      "If you don't want to use the wrapper at all, install Maven directly (see the `mvn` entry).",
+    docs: "https://maven.apache.org/wrapper/",
   },
   docker: {
     what: "Docker Desktop — for the optional 'Reopen in Container' escape hatch.",
@@ -482,7 +535,19 @@ export class CommandHandlers {
   /**
    * Pull the first whitespace-delimited token off each cli_command.
    * `aider --version` → `aider`. `python3 -m pytest` → `python3`.
-   * Skips comment-only entries (`# foo`).
+   * Skips comment-only entries (`# foo`) and PATH-RELATIVE paths
+   * (`./mvnw`, `../bin/foo`, `/usr/local/bin/x`) — those are per-project
+   * scripts or absolute paths, not system tools that belong in the
+   * "is X on $PATH" toolchain check.
+   *
+   * 2026-04-27 v0.1.20 — user-filed: `./mvnw` was being flagged as
+   * "missing on PATH" because firstTokensOf included it AND
+   * isToolOnPath ran `command -v ./mvnw` from VS Code's cwd (HOME,
+   * not the cloned repo), which always fails. The pill stayed red
+   * even after the learner cloned the repo + ran ./mvnw successfully
+   * in their terminal. Filtering path-shaped tokens out is the
+   * structural fix — `./mvnw` is the project's own wrapper, not a
+   * system dep we can pre-install.
    */
   private firstTokensOf(cliCommands: any[]): string[] {
     const tokens = new Set<string>();
@@ -492,6 +557,14 @@ export class CommandHandlers {
       if (!m) continue;
       const tok = m[1];
       if (tok.startsWith("#")) continue;
+      // Skip relative + absolute paths (./foo, ../foo, /usr/local/bin/foo).
+      // These are per-project scripts or hardcoded paths, not system
+      // tools the learner needs to install. The cli_commands runner
+      // executes inside the cloned repo so per-project scripts work
+      // there — the toolchain pill should only check truly-system tools.
+      if (tok.startsWith("./") || tok.startsWith("../") || tok.startsWith("/")) {
+        continue;
+      }
       tokens.add(tok);
     }
     return [...tokens];
@@ -797,6 +870,17 @@ export class CommandHandlers {
       (template: string, path: string) => void this.copyTemplateToClipboard(template, path),
       (template: string, path: string, language: string) =>
         void this.openTemplateInBuffer(template, path, language),
+      // v0.1.20 — manual toolchain re-check. Clears the per-tool PATH
+      // cache and re-renders the step. Surfaces in the host-missing
+      // pill as the ↻ Re-check button so a learner who just installed
+      // a tool can flip the pill green without restarting VS Code.
+      () => {
+        this.clearToolchainCache();
+        // Re-open the same step — re-runs computeToolchainStatus on a
+        // fresh cache, re-renders the pill. The webview reuses the
+        // existing panel since this.panel is already non-null.
+        void this.openStep(courseId, moduleId, step);
+      },
     );
   }
 
@@ -1302,7 +1386,7 @@ export class CommandHandlers {
    * prompts (claude /login, gh auth login).
    */
   async runStepInTerminal(step: StepSummary): Promise<void> {
-    const cmds: { cmd: string; label?: string }[] =
+    const cmds: { cmd: string; label?: string; expect?: string }[] =
       (step.validation && step.validation.cli_commands) || [];
     if (cmds.length === 0) {
       vscode.window.showInformationMessage(
@@ -1360,7 +1444,7 @@ export class CommandHandlers {
     moduleId: number,
     step: StepSummary,
   ): Promise<void> {
-    const cmds: { cmd: string; label?: string }[] =
+    const cmds: { cmd: string; label?: string; expect?: string }[] =
       (step.validation && step.validation.cli_commands) || [];
     if (cmds.length === 0) {
       vscode.window.showInformationMessage(
@@ -1413,6 +1497,15 @@ export class CommandHandlers {
       return;
     }
 
+    // v0.1.21 — surface live run progress in the WebView so the learner
+    // sees per-command status instead of staring at a silent panel for
+    // 10-30s. Posts to the run-progress card; falls through if WebView
+    // isn't open.
+    this.webview.postRunProgress({
+      phase: "start",
+      cmds: cmds.map((c) => ({ label: c.label, cmd: c.cmd })),
+    });
+
     // Stream-execute each cmd; capture stdout+stderr via the read iterator.
     let combinedOutput = "";
     const TIMEOUT_MS = 60_000;
@@ -1423,15 +1516,26 @@ export class CommandHandlers {
       const banner = `# ${i + 1}/${cmds.length}: ${c.label || ""}`;
       combinedOutput += `${banner}\n$ ${c.cmd}\n`;
 
+      this.webview.postRunProgress({ phase: "cmd_start", index: i });
+
+      let cmdOk = false;
       try {
         const exec = integration.executeCommand(c.cmd);
         const reader = exec.read();
         const cmdOutput = await readStreamWithTimeout(reader, TIMEOUT_MS);
         combinedOutput += cmdOutput;
         if (!combinedOutput.endsWith("\n")) combinedOutput += "\n";
+        // Best-effort "ok" signal: regex matched if `expect` is provided.
+        // Falls back to "captured ANY output" → ok if we got at least 1 line.
+        const expectRe = c.expect
+          ? (() => { try { return new RegExp(c.expect); } catch { return null; } })()
+          : null;
+        cmdOk = expectRe ? expectRe.test(cmdOutput) : cmdOutput.trim().length > 0;
       } catch (e: any) {
         combinedOutput += `[skillslab] command failed or timed out: ${e?.message || e}\n`;
       }
+
+      this.webview.postRunProgress({ phase: "cmd_done", index: i, ok: cmdOk });
 
       if (combinedOutput.length > MAX_OUTPUT_BYTES) {
         combinedOutput =
@@ -1440,6 +1544,9 @@ export class CommandHandlers {
         break;
       }
     }
+
+    // Switch headline to "Grading…" while /validate is in flight.
+    this.webview.postRunProgress({ phase: "validating" });
 
     // Submit captured output as the paste field — the grader's
     // terminal_exercise validator reads `response.paste` (single-slot
@@ -1453,10 +1560,43 @@ export class CommandHandlers {
         attempt,
       );
     } catch (e: any) {
+      this.webview.postRunProgress({ phase: "error" });
       vscode.window.showErrorMessage(
         `Auto-submit failed: ${e?.message || e}. Try ${labelOf(step)}'s "Submit & Continue" button.`,
       );
       return;
+    }
+
+    // Hide the run-progress card now that the feedback panel takes over.
+    this.webview.postRunProgress({ phase: "graded" });
+
+    // v0.1.21 — synthesize per-token + per-cli_command breakdown from the
+    // captured output. The grader returns an opaque score+prose; learners
+    // benefit MUCH more from "saw `claude` in output ✓ but didn't match
+    // the version regex ✗". Computed client-side because the validator
+    // doesn't expose this granularity in its response.
+    try {
+      const breakdownCli = cmds.map((c) => {
+        const expect = c.expect || "";
+        let matched = false;
+        if (expect) {
+          try { matched = new RegExp(expect).test(combinedOutput); } catch { matched = false; }
+        } else {
+          matched = combinedOutput.includes(c.cmd);
+        }
+        return { label: c.label || c.cmd, cmd: c.cmd, expect_pattern: expect, matched };
+      });
+      const mustContainList: string[] = (step.validation?.must_contain || []) as string[];
+      const breakdownMC = mustContainList.map((token: string) => ({
+        token,
+        present: combinedOutput.toLowerCase().includes(String(token).toLowerCase()),
+      }));
+      (validated as any).terminal_breakdown = {
+        cli_commands: breakdownCli,
+        must_contain: breakdownMC,
+      };
+    } catch (_e) {
+      // breakdown is best-effort; never fail the submit on a synth error
     }
 
     // v0.1.12 — auto-advance on PASS, same as submitAndContinue.
