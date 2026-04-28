@@ -23,6 +23,10 @@
 <script src="/templates/code.js?v=1.1.2" defer></script>
 <script src="/templates/project.js?v=1.1.3" defer></script>
 <script src="/templates/terminal.js?v=1.1.6" defer></script>
+<!-- 2026-04-28 — markdown renderer for hands_on step's README fetched
+     from course-repo. Pinned to a specific minor; loaded with `defer` so
+     it doesn't block page render. CDN-only; the LMS doesn't bundle it. -->
+<script src="https://cdn.jsdelivr.net/npm/marked@12.0.2/marked.min.js" defer></script>
 <style>
 /* ===== CSS Variables ===== */
 :root {
@@ -4755,6 +4759,233 @@ ${esc(wrapper)} check                    <span style="color:#8892a8"># grades + 
 }
 
 
+// ════════════════════════════════════════════════════════════════════════
+// hands_on step renderer (2026-04-28) — slide + course-repo + native editor.
+//
+// Per CLAUDE.md §"BEHAVIORAL TEST HARNESS" and the 2026-04-28 architectural
+// pivot: the LMS is plumbing here. The real work happens in the learner's
+// editor (Codespace primary, github.dev / local clone as escape hatches).
+// The course-repo's `.grading/exercise-NN-<slug>/README.md` is the truth
+// for problem statement. This renderer:
+//   1. Shows the LLM-authored slide (rawStep.content) — concept teaching
+//      that may include drag-drop / MCQ / interactive widgets per the
+//      pedagogy directive.
+//   2. Renders the bootstrap CTAs.
+//   3. Mounts a placeholder for the README; setupHandsOn fetches it
+//      async via /api/courses/{slug}/exercises/{nn}/{slug}/launch and
+//      renders via marked.js.
+//
+// Submission: per user decisions 2026-04-28 — last-passing-run wins.
+// `skillslab check` auto-posts to LMS on PASS. GHA workflow attestation is
+// the source of truth for completion (Phase 3d).
+// ════════════════════════════════════════════════════════════════════════
+function renderHandsOnPanel(rawStep, index) {
+  const dd = rawStep.demo_data || {};
+  const courseSlug = esc(dd.course_slug || '');
+  const nn = esc(String(dd.exercise_nn || '').padStart(2, '0'));
+  const exerciseSlug = esc(dd.exercise_slug || '');
+  const title = esc(rawStep.title || `Exercise ${nn}`);
+  const stepIdAttr = rawStep.id ? ` data-step-id="${esc(String(rawStep.id))}"` : '';
+
+  // Module repo banner (existing convention — surfaces on every step).
+  const _modSteps = (state.currentModuleData && state.currentModuleData.steps) || [];
+  const _modRepo = _findModuleRepoMeta(_modSteps);
+  const _repoBanner = _modRepo ? _renderModuleRepoBanner(_modRepo) : '';
+
+  // Slide content (LLM-authored briefing). Optional but recommended —
+  // this is where drag-drop / MCQ / scenario_walkthrough widgets live
+  // when the Creator emits them inline. Empty content → just CTAs+README.
+  const slideHtml = (rawStep.content && typeof rawStep.content === 'string')
+    ? rawStep.content
+    : '';
+
+  // Creator tools strip (regenerate / edit) — same pattern as other types.
+  const courseId = state.currentCourse ? state.currentCourse.id : null;
+  const creatorStrip = (courseId && rawStep.id) ? `
+    <div class="creator-tools-strip" style="display:flex; gap:8px; margin-top:8px; font-size:12px;">
+      <button onclick="openRegenerateStepModal(${rawStep.id}, '${esc(rawStep.title || '').replace(/'/g, "\\'")}')"
+              style="background:#1e2538; color:#8892a8; border:1px solid #2a3352; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px;">🔄 Regenerate</button>
+      <button onclick="openEditStepModal(${rawStep.id})"
+              style="background:#1e2538; color:#8892a8; border:1px solid #2a3352; border-radius:6px; padding:4px 10px; cursor:pointer; font-size:12px;">✏️ Edit</button>
+    </div>` : '';
+
+  return `
+    <div class="step-content"${stepIdAttr} data-hands-on="1">
+      ${_repoBanner}
+      <div class="step-header">
+        <div class="ho-banner" style="display:inline-block; padding:4px 10px; border-radius:12px; background:#1a2f1a; color:#7fd17f; font-size:11px; font-weight:600; letter-spacing:0.05em; margin-bottom:8px;">🛠 HANDS-ON</div>
+        <div class="step-title">${title}</div>
+        <div class="ho-meta" id="ho-meta-${esc(String(rawStep.id || index))}" style="color:#8892a8; font-size:13px; margin-top:4px;">
+          <span class="ho-meta-loading">Loading exercise metadata…</span>
+        </div>
+        ${creatorStrip}
+      </div>
+
+      ${slideHtml ? `<div class="ho-slide" style="margin:18px 0;">${slideHtml}</div>` : ''}
+
+      <!-- Bootstrap CTAs — primary = Codespace, escape hatches = github.dev + clone. -->
+      <div class="ho-bootstrap" id="ho-bootstrap-${esc(String(rawStep.id || index))}" style="display:none; margin:20px 0;">
+        <h3 style="color:#e8ecf4; font-size:14px; margin:0 0 10px 0; text-transform:uppercase; letter-spacing:0.06em; color:#8892a8;">Open in your editor</h3>
+        <div class="ho-cta-grid" style="display:grid; gap:10px;">
+          <a class="ho-cta ho-cta-primary" target="_blank" rel="noopener" data-cta="codespace"
+             style="background:linear-gradient(135deg,#1a2f1a 0%,#0e2a1a 100%); border:1px solid #2dd96f; border-radius:10px; padding:14px 18px; text-decoration:none; color:#e8ecf4; display:flex; align-items:center; gap:14px;">
+            <span style="font-size:24px;">🚀</span>
+            <div style="flex:1;">
+              <div style="font-weight:600; font-size:15px;">Open in GitHub Codespace</div>
+              <div style="color:#8892a8; font-size:12px; margin-top:2px;">Zero-setup. Devcontainer-pinned. Recommended.</div>
+            </div>
+            <span style="color:#2dd96f; font-size:18px;">→</span>
+          </a>
+          <a class="ho-cta" target="_blank" rel="noopener" data-cta="github_dev"
+             style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:12px 18px; text-decoration:none; color:#c9d1df; display:flex; align-items:center; gap:14px;">
+            <span style="font-size:20px;">💻</span>
+            <div style="flex:1;">
+              <div style="font-weight:500; font-size:14px;">Open in github.dev (web VS Code)</div>
+              <div style="color:#8892a8; font-size:12px; margin-top:2px;">Instant in-browser editor. No clone.</div>
+            </div>
+            <span style="color:#8892a8;">→</span>
+          </a>
+          <details class="ho-clone-details" style="background:#1e2538; border:1px solid #2a3352; border-radius:10px; padding:10px 14px; color:#c9d1df;">
+            <summary style="cursor:pointer; font-size:13px; color:#8892a8;">Or clone locally</summary>
+            <pre style="margin:10px 0 0 0; padding:10px 12px; background:#0d121f; border:1px solid #1f2640; border-radius:6px; font-size:12px; color:#a8c5e8; white-space:pre-wrap; word-break:break-all;" data-clone-cmd></pre>
+          </details>
+        </div>
+      </div>
+
+      <!-- README from course-repo. Rendered via marked.js once fetched. -->
+      <div class="ho-readme-wrap" style="margin:20px 0;">
+        <h3 style="color:#e8ecf4; font-size:14px; margin:0 0 10px 0; text-transform:uppercase; letter-spacing:0.06em; color:#8892a8;">Problem statement</h3>
+        <div class="ho-readme" id="ho-readme-${esc(String(rawStep.id || index))}"
+             style="background:#161b2c; border:1px solid #2a3352; border-radius:10px; padding:18px 22px; color:#c9d1df; line-height:1.6; min-height:120px;">
+          <div class="ho-readme-loading" style="color:#8892a8; font-style:italic;">Fetching README from course-repo…</div>
+        </div>
+      </div>
+
+      <!-- Submit hint — Phase 3c will populate with last-passing-run status. -->
+      <div class="ho-submit-hint" style="margin:20px 0; padding:14px 18px; background:#1a1f30; border-left:3px solid #4a7cff; border-radius:6px; color:#c9d1df; font-size:13px; line-height:1.6;">
+        <strong style="color:#e8ecf4;">How to submit:</strong>
+        Run <code style="background:#0d121f; padding:2px 6px; border-radius:4px; color:#a8c5e8;">skillslab check</code>
+        in your terminal (or the VS Code extension's "Run This Step" button). On PASS, your result auto-submits.
+        GHA on the course-repo attests as the source of truth.
+        Network required at submit; offline = retry when reconnected.
+      </div>
+    </div>
+  `;
+}
+
+
+async function setupHandsOn(rawStep, index) {
+  const dd = rawStep.demo_data || {};
+  const courseSlug = dd.course_slug;
+  const nn = String(dd.exercise_nn || '').padStart(2, '0');
+  const slug = dd.exercise_slug;
+  const idKey = String(rawStep.id || index);
+
+  if (!courseSlug || !nn || !slug) {
+    const meta = document.getElementById(`ho-meta-${idKey}`);
+    if (meta) meta.innerHTML = '<span style="color:#ff8888;">Step is missing course_slug / exercise_nn / exercise_slug in demo_data.</span>';
+    return;
+  }
+
+  let bundle;
+  try {
+    const r = await fetch(`/api/courses/${encodeURIComponent(courseSlug)}/exercises/${encodeURIComponent(nn)}/${encodeURIComponent(slug)}/launch`);
+    if (!r.ok) throw new Error(`HTTP ${r.status}`);
+    bundle = await r.json();
+  } catch (err) {
+    const meta = document.getElementById(`ho-meta-${idKey}`);
+    if (meta) meta.innerHTML = `<span style="color:#ff8888;">Could not load exercise metadata: ${esc(err.message)}.</span>`;
+    return;
+  }
+
+  // Render meta line — kind, estimated time, primitive.
+  const meta = document.getElementById(`ho-meta-${idKey}`);
+  if (meta) {
+    const parts = [];
+    if (bundle.kind) parts.push(esc(bundle.kind));
+    if (bundle.estimated_minutes) parts.push(`~${bundle.estimated_minutes} min`);
+    if (bundle.primitive) parts.push(`graded by <code style="background:#0d121f; padding:1px 5px; border-radius:3px; color:#a8c5e8;">${esc(bundle.primitive)}</code>`);
+    parts.push(`branch <code style="background:#0d121f; padding:1px 5px; border-radius:3px; color:#a8c5e8;">${esc(bundle.branch)}</code>`);
+    meta.innerHTML = parts.join(' · ');
+  }
+
+  // Wire CTA hrefs.
+  const bootstrap = document.getElementById(`ho-bootstrap-${idKey}`);
+  if (bootstrap) {
+    bootstrap.style.display = 'block';
+    const codespaceA = bootstrap.querySelector('[data-cta="codespace"]');
+    const githubDevA = bootstrap.querySelector('[data-cta="github_dev"]');
+    const cloneCmdEl = bootstrap.querySelector('[data-clone-cmd]');
+    if (codespaceA) codespaceA.href = bundle.codespace_url;
+    if (githubDevA) githubDevA.href = bundle.github_dev_url;
+    if (cloneCmdEl) cloneCmdEl.textContent = bundle.clone_command;
+  }
+
+  // Render the README via marked.js (loaded from CDN, see <head>).
+  const readmeEl = document.getElementById(`ho-readme-${idKey}`);
+  if (readmeEl) {
+    if (!bundle.readme_md) {
+      readmeEl.innerHTML = `
+        <div style="color:#ff8888;">README not found in course-repo. Check
+          <a href="https://github.com/${esc(bundle.owner_repo)}/tree/${esc(bundle.branch)}/.grading/${esc(bundle.exercise_dir)}" target="_blank" rel="noopener" style="color:#a8c5e8;">.grading/${esc(bundle.exercise_dir)}/</a>.
+        </div>`;
+    } else if (typeof window.marked === 'undefined') {
+      // marked.js still loading or blocked — fallback to <pre>.
+      readmeEl.innerHTML = `<pre style="white-space:pre-wrap; font-family:'SF Mono', Menlo, Monaco, monospace; font-size:13px; color:#c9d1df;">${esc(bundle.readme_md)}</pre>`;
+    } else {
+      try {
+        // marked.parse is sync; configure for our content shape.
+        const html = window.marked.parse(bundle.readme_md, { breaks: false, gfm: true });
+        readmeEl.innerHTML = html;
+        // Add inline styles to elements marked.js produces — minimal pass
+        // so the rendered MD looks consistent with the dark theme.
+        readmeEl.querySelectorAll('h1,h2,h3,h4').forEach(h => {
+          h.style.color = '#e8ecf4';
+          h.style.marginTop = '24px';
+          h.style.marginBottom = '8px';
+        });
+        readmeEl.querySelectorAll('pre').forEach(p => {
+          p.style.background = '#0d121f';
+          p.style.border = '1px solid #1f2640';
+          p.style.borderRadius = '6px';
+          p.style.padding = '12px 14px';
+          p.style.overflow = 'auto';
+          p.style.fontSize = '12px';
+        });
+        readmeEl.querySelectorAll('code').forEach(c => {
+          if (c.parentElement && c.parentElement.tagName !== 'PRE') {
+            c.style.background = '#0d121f';
+            c.style.padding = '2px 6px';
+            c.style.borderRadius = '4px';
+            c.style.color = '#a8c5e8';
+            c.style.fontSize = '90%';
+          }
+        });
+        readmeEl.querySelectorAll('a').forEach(a => {
+          a.style.color = '#7fd17f';
+          a.target = '_blank';
+          a.rel = 'noopener';
+        });
+        readmeEl.querySelectorAll('blockquote').forEach(bq => {
+          bq.style.borderLeft = '3px solid #4a7cff';
+          bq.style.paddingLeft = '14px';
+          bq.style.color = '#a8b3c8';
+          bq.style.margin = '14px 0';
+        });
+      } catch (e) {
+        readmeEl.innerHTML = `<div style="color:#ff8888;">Failed to render markdown: ${esc(String(e))}</div><pre style="white-space:pre-wrap;">${esc(bundle.readme_md)}</pre>`;
+      }
+    }
+  }
+
+  // Soft warnings if manifest / README fetches failed (still rendered the
+  // CTAs since we have CourseAsset-derived URLs regardless).
+  if (!bundle.manifest_fetched) {
+    console.warn('[hands_on] manifest fetch failed — meta + grading_runner are best-effort');
+  }
+}
+
+
 // 2026-04-25 v6 — _runWidgetScripts: re-execute every <script> in the
 // container so widget code lands. innerHTML doesn't auto-run scripts;
 // we rebuild each into a fresh <script> element + replace. Wraps the
@@ -4959,6 +5190,18 @@ function renderStep(rawStep, index) {
     _runWidgetScripts(container);
     _installWidgetActionDelegator();
     _rewriteOnclicksToDataActions(container);
+    return;
+  }
+  // 2026-04-28 — hands_on step type: course-repo + native editor flow.
+  // The LMS shows the slide + bootstrap CTAs; the actual work happens in
+  // the learner's editor (Codespace primary, github.dev / local clone as
+  // escape hatches). README is fetched from the course-repo at step-load.
+  if (rawStep && rawStep.exercise_type === 'hands_on') {
+    container.innerHTML = renderHandsOnPanel(rawStep, index);
+    _runWidgetScripts(container);
+    _installWidgetActionDelegator();
+    _rewriteOnclicksToDataActions(container);
+    setupHandsOn(rawStep, index);  // async — fetches launch bundle + README
     return;
   }
   // Merge demo_data and validation into step so renderers can access fields directly.

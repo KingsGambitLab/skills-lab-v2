@@ -1049,6 +1049,32 @@ async def admin_get_course_raw(course_id: str, db: AsyncSession = Depends(get_db
     return out
 
 
+@app.get("/api/courses/{course_slug}/exercises/{nn}/{exercise_slug}/launch")
+async def hands_on_launch(course_slug: str, nn: str, exercise_slug: str):
+    """Resolve a hands_on step's launch bundle.
+
+    Returns: editor-launch URLs (Codespace primary, github.dev + clone
+    command as escape hatches) + (best-effort) manifest data + per-exercise
+    README content fetched from the course-repo's
+    `.grading/exercise-NN-<slug>/README.md`.
+
+    Per CLAUDE.md §"BEHAVIORAL TEST HARNESS" + 2026-04-28 architectural pivot:
+    the LMS is plumbing here. The real work happens in the learner's editor
+    (VS Code / Codespace / Cursor). The course-repo is the source of truth.
+    See backend/hands_on.py for the resolver implementation.
+
+    URL shape examples:
+      /api/courses/jspring/exercises/01/fix-n-plus-one/launch
+      /api/courses/kimi/exercises/03/fastapi-pagination/launch  (future)
+    """
+    from backend.hands_on import resolve_hands_on
+    try:
+        bundle = resolve_hands_on(course_slug, nn, exercise_slug)
+    except ValueError as e:
+        raise HTTPException(404, str(e))
+    return bundle.to_dict()
+
+
 @app.get("/api/courses/{course_id}/content-etag")
 async def get_course_content_etag(course_id: str, db: AsyncSession = Depends(get_db)):
     """Return a short hash that changes whenever any step content / metadata
