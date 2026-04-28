@@ -1049,6 +1049,136 @@ async def admin_get_course_raw(course_id: str, db: AsyncSession = Depends(get_db
     return out
 
 
+@app.post("/api/courses/{course_slug}/exercises/{nn}/{exercise_slug}/submit")
+async def hands_on_submit(
+    course_slug: str,
+    nn: str,
+    exercise_slug: str,
+    request: Request,
+    db: AsyncSession = Depends(get_db),
+):
+    """Receive a grading-runner result from skillslab CLI or GHA workflow.
+
+    Per CLAUDE.md §"BEHAVIORAL TEST HARNESS" + 2026-04-28 architectural pivot.
+    Per buddy-Opus 2026-04-28: GHA = source of truth, CLI = fast-feedback hint.
+    Per user decision 1b: last-passing-run wins. We update the same
+    UserProgress row on every submission; once completed=True, it stays.
+
+    Body shape (matches grading-result.json emitted by .grading/scripts/parse-*.sh):
+      {
+        "exercise": "exercise-01-fix-n-plus-one",
+        "status": "passed" | "failed",
+        "via": "mvn-surefire" | "verify.sh" | "pytest-json-report",
+        "total": int, "passed": int, "failures": int, "errors": int, "skipped": int,
+        "mavenExitCode": int,
+        "timestamp": "ISO-8601",
+        "source": "cli" | "gha",            # client-attached metadata
+        "git_sha": "optional sha",          # client-attached metadata
+        "failed_tests": [...]               # optional diagnostic detail
+      }
+
+    Returns:
+      {ok, step_id, user_id, submission_status, step_completed,
+       first_completed_at, score, via, source}
+    """
+    body = await request.json()
+    if not isinstance(body, dict):
+        raise HTTPException(400, "request body must be a JSON object")
+
+    # Soft auth (consistent with /api/exercises/validate). request.state.user
+    # is populated by middleware reading the Bearer token.
+    auth_user = getattr(request.state, "user", None)
+    user_id = str(auth_user.id) if auth_user else "default"
+
+    from backend.course_assets import get_course_assets
+    asset = get_course_assets(course_slug)
+    if not asset:
+        raise HTTPException(404, f"Unknown course_slug: {course_slug!r}")
+
+    nn_padded = str(nn).zfill(2)
+
+    # Find the hands_on step matching {course_slug, nn, slug}. Course is
+    # identified by Course.asset_slug column populated at registration time.
+    step_q = (
+        select(Step)
+        .join(Module, Module.id == Step.module_id)
+        .join(Course, Course.id == Module.course_id)
+        .where(Step.exercise_type == "hands_on")
+        .where(Course.asset_slug == course_slug)
+    )
+    candidates = (await db.execute(step_q)).scalars().all()
+    target_step: Step | None = None
+    for s in candidates:
+        dd = s.demo_data or {}
+        if (str(dd.get("exercise_nn", "")).zfill(2) == nn_padded and
+            dd.get("exercise_slug") == exercise_slug):
+            target_step = s
+            break
+    if not target_step:
+        raise HTTPException(
+            404,
+            f"No hands_on step for {course_slug}/{nn_padded}/{exercise_slug}. "
+            f"Run tools/migrate_step_to_hands_on.py first if this is the first migration."
+        )
+
+    # Determine pass/fail from grading-result.json.
+    is_pass = (
+        body.get("status") == "passed"
+        and int(body.get("mavenExitCode", body.get("exitCode", 0)) or 0) == 0
+    )
+
+    # Get-or-create UserProgress. Last-passing-run wins: once completed, stays.
+    prog_q = select(UserProgress).where(
+        UserProgress.user_id == user_id,
+        UserProgress.step_id == target_step.id,
+    )
+    prog = (await db.execute(prog_q)).scalars().first()
+
+    if prog is None:
+        prog = UserProgress(
+            user_id=user_id,
+            step_id=target_step.id,
+            completed=is_pass,
+            score=1.0 if is_pass else 0.0,
+            response_data=body,
+            completed_at=datetime.utcnow() if is_pass else None,
+        )
+        db.add(prog)
+    else:
+        # Always update response_data with the latest submission so the UI can
+        # surface diagnostic detail (failed_tests, etc.) even on FAIL.
+        prog.response_data = body
+        if is_pass:
+            # Lock completed once we have a passing run.
+            prog.completed = True
+            prog.score = max(prog.score or 0.0, 1.0)
+            if prog.completed_at is None:
+                prog.completed_at = datetime.utcnow()
+        # On FAIL, do NOT reset completed (last-passing-run wins).
+
+    await db.commit()
+    await db.refresh(prog)
+
+    log_msg = (
+        f"hands_on_submit: course={course_slug} ex={nn_padded}/{exercise_slug} "
+        f"step={target_step.id} user={user_id} status={'PASS' if is_pass else 'FAIL'} "
+        f"src={body.get('source', 'cli')} via={body.get('via')}"
+    )
+    logger.info(log_msg)
+
+    return {
+        "ok": True,
+        "step_id": target_step.id,
+        "user_id": user_id,
+        "submission_status": "passed" if is_pass else "failed",
+        "step_completed": bool(prog.completed),
+        "first_completed_at": prog.completed_at.isoformat() if prog.completed_at else None,
+        "score": prog.score,
+        "via": body.get("via"),
+        "source": body.get("source", "cli"),
+    }
+
+
 @app.get("/api/courses/{course_slug}/exercises/{nn}/{exercise_slug}/launch")
 async def hands_on_launch(course_slug: str, nn: str, exercise_slug: str):
     """Resolve a hands_on step's launch bundle.
