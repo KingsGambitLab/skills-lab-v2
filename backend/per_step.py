@@ -521,6 +521,10 @@ async def regenerate_single_step(
         "capstone_scenario": None,
         "is_capstone_module": False,
         "prior_course_context": prior_ctx,  # NEW: shared context for dependencies
+        # 2026-04-27 (post-v6) — authoritative asset_slug from the Course row.
+        # The harness inject + course_context block both prefer this column
+        # over fuzzy title-matching. Falls through to None for legacy rows.
+        "asset_slug": getattr(course_row, "asset_slug", None),
     }
     # v8.6 (2026-04-24) — language detection + pin, mirror of the fix in
     # _creator_generate_impl. Previously this path shipped NO language key,
@@ -667,6 +671,67 @@ async def regenerate_single_step(
             except Exception as e:
                 logger.warning("per_step code_exercise critic failed: %s", e)
 
+        # 2026-04-27 (F26 PRE-GATE harness inject) — must run BEFORE the
+        # ontology gate, NOT after persist. If the LLM's candidate has no
+        # starter_repo (we tell it not to emit one — harness owns it) and
+        # the step is repo-walking (non-authoring), the gate would reject.
+        # Injecting here means the gate sees the populated demo_data + the
+        # gate-accept path runs normally.
+        # Earlier post-persist inject is now redundant but kept as belt-
+        # and-suspenders (idempotent — checks for existing starter_repo).
+        try:
+            from backend.main import _inject_starter_repo_if_needed
+            mod_pos = getattr(mod_row, "position", None)
+            course_title = course_context.get("title") if isinstance(course_context, dict) else ""
+            asset_slug = course_context.get("asset_slug") if isinstance(course_context, dict) else None
+            if isinstance(mod_pos, int) and isinstance(candidate, dict):
+                if _inject_starter_repo_if_needed(candidate, course_title or "", mod_pos, course_asset_slug=asset_slug):
+                    logger.info(
+                        "per_step regen attempt %d: pre-gate harness-injected starter_repo (mod_pos=%d)",
+                        attempt, mod_pos,
+                    )
+        except Exception as _inj_err:
+            logger.warning("per_step pre-gate harness inject error: %s", _inj_err)
+
+        # 2026-04-28 — Grading-runner overlay (harness-side post-LLM injection).
+        # Per CLAUDE.md §"BEHAVIORAL TEST HARNESS": for courses with a
+        # grading_runner registered in CourseAsset + this step's
+        # (module_position, step_position) mapped in exercise_dirs, we
+        # OVERWRITE the LLM's cli_commands / rubric / must_contain with
+        # the generic grading-runner shape. This eliminates ~40% of the
+        # surface where rubric drift / fabricated CLI flags / multi-cli
+        # shell-state bugs occur. The LLM keeps authoring narrative
+        # (briefing, instructions, hint); we own the grading machinery.
+        try:
+            from backend.course_asset_backfill import apply_grading_runner_overlay
+            _asset_slug_overlay = (
+                course_context.get("asset_slug")
+                if isinstance(course_context, dict) else None
+            )
+            _mod_pos_overlay = getattr(mod_row, "position", None)
+            _step_pos_overlay = getattr(step_row, "position", None)
+            # Always log the attempt context (WARNING-level so it surfaces in
+            # journalctl by default; downgrade once we trust the dispatch).
+            logger.warning(
+                "grading-runner overlay attempt: slug=%r mod_pos=%r step_pos=%r "
+                "candidate_is_dict=%s exercise_type=%r",
+                _asset_slug_overlay, _mod_pos_overlay, _step_pos_overlay,
+                isinstance(candidate, dict),
+                (candidate.get("exercise_type") if isinstance(candidate, dict) else None),
+            )
+            if isinstance(candidate, dict) and _asset_slug_overlay and \
+               isinstance(_mod_pos_overlay, int) and isinstance(_step_pos_overlay, int):
+                candidate, _overlaid = apply_grading_runner_overlay(
+                    candidate, _asset_slug_overlay,
+                    _mod_pos_overlay, _step_pos_overlay,
+                )
+                logger.warning(
+                    "grading-runner overlay result: overlaid=%s slug=%s M%s.S%s",
+                    _overlaid, _asset_slug_overlay, _mod_pos_overlay, _step_pos_overlay,
+                )
+        except Exception as _gr_err:
+            logger.warning("grading-runner overlay soft-fail: %s", _gr_err)
+
         ok, reason = _minimal_completeness_check(candidate, ex_type)
         if not ok:
             last_reason = reason
@@ -699,9 +764,55 @@ async def regenerate_single_step(
                 )
                 continue
         except Exception as _onto_err:
-            # Gate bug must NOT hard-fail regen — log + continue (parity
-            # with main.py:_is_complete's soft-pass behavior).
-            logger.warning("per_step regen ontology gate error (soft-pass): %s", _onto_err)
+            # 2026-04-27 — REJECT-on-exception, NOT soft-pass.
+            # Prior code logged + fell through to persist on any exception
+            # raised by validate_step_against_ontology. That masked legit
+            # gate failures (e.g. an enum/registry change that raised KeyError
+            # ended up persisting bad content silently). The new behavior:
+            # treat ANY gate exception as a REJECT for this attempt and feed
+            # the exception text into retry feedback. The retry loop can
+            # still escape after max_retries with a clear `failure_class`.
+            last_reason = f"ontology gate exception (treated as REJECT): {_onto_err}"
+            last_failure_class = "ontology_exception"
+            logger.warning(
+                "per_step regen attempt %d ontology gate exception (REJECT): %s",
+                attempt, _onto_err,
+            )
+            continue
+
+        # 2026-04-28 — Track A + B structural validator (post-v7 hybrid plan,
+        # Opus-aligned). Catches the bug class that v6/v7 reviewers kept
+        # surfacing: semantic-key-as-branch, fabricated CLI flags, file
+        # paths / class names / GHA jobs that don't exist on the actual
+        # repo. Mutation suite (tools/test_mutation_suite.py) proves 6/6
+        # bug-class closure deterministically.
+        #
+        # Skipped when no asset_slug (course not registered in
+        # course_assets) OR when STRICT_VALIDATION env var disables it.
+        # Failures here flow into retry feedback with SPECIFIC actionable
+        # messages (e.g. "real classes that may be what you meant: [...]").
+        try:
+            import os as _os
+            if _os.environ.get("SKILLSLAB_STRICT_VALIDATION", "1") != "0":
+                from backend.output_validator import validate_step_candidate
+                _asset_slug = (
+                    course_context.get("asset_slug")
+                    if isinstance(course_context, dict) else None
+                )
+                _mod_pos = getattr(mod_row, "position", None)
+                if _asset_slug and isinstance(_mod_pos, int):
+                    _val = validate_step_candidate(candidate, _asset_slug, _mod_pos)
+                    if not _val.ok:
+                        last_reason = _val.reason
+                        last_failure_class = "output_validator_failed"
+                        logger.warning(
+                            "per_step regen attempt %d output_validator REJECT: %s",
+                            attempt, _val.reason[:200],
+                        )
+                        continue
+        except Exception as _ov_err:
+            # Soft-fail — don't block regen on validator infra issues
+            logger.warning("output_validator soft-fail (%s) — letting candidate through", _ov_err)
 
         # v8.6 (2026-04-24) UNIFY WITH COURSE GEN — user directive post-v14:
         # "don't duplicate code for step regen". Shared invariant-check
@@ -761,7 +872,51 @@ async def regenerate_single_step(
     if "validation" in llm_content:
         step_row.validation = llm_content.get("validation") or step_row.validation
     if "demo_data" in llm_content:
-        step_row.demo_data = llm_content.get("demo_data") or step_row.demo_data
+        # 2026-04-27 (post-v6-reviewer Bug Y) — MERGE harness-managed fields
+        # forward from the prior step_row when the LLM omits them. Pre-fix
+        # this was wholesale replace, which wiped backfilled bootstrap_command
+        # + dependencies + paste_slots + (in some cases) template_files on
+        # every kimi step that got regenerated. The set of harness-owned
+        # fields is co-located with `_inject_starter_repo_if_needed` in
+        # main.py per buddy-Opus review (co-location > abstraction).
+        new_dd_raw = llm_content.get("demo_data")
+        if isinstance(new_dd_raw, dict) and new_dd_raw:
+            new_dd = dict(new_dd_raw)
+            old_dd = dict(step_row.demo_data or {}) if isinstance(step_row.demo_data, dict) else {}
+            try:
+                from backend.main import HARNESS_MANAGED_DEMO_DATA_FIELDS
+                for k in HARNESS_MANAGED_DEMO_DATA_FIELDS:
+                    if k not in new_dd and k in old_dd:
+                        new_dd[k] = old_dd[k]
+            except Exception as _merge_err:
+                logger.warning("per_step demo_data merge fallback (no HARNESS_MANAGED set): %s", _merge_err)
+            step_row.demo_data = new_dd
+        # else: empty/None LLM demo_data → preserve prior (existing behavior)
+
+    # 2026-04-27 (F26 harness inject) — post-LLM, pre-commit: if the course
+    # has a registered asset AND the step is non-authoring AND demo_data
+    # has neither starter_repo nor starter_files, harness adds starter_repo
+    # deterministically. Closes the failure mode where the LLM omits the
+    # scaffold and the gate then rejects (or the step ships unsolvable).
+    # Same logic as main.py:_inject_starter_repo_if_needed.
+    try:
+        from backend.main import _inject_starter_repo_if_needed
+        # Find the module's 1-indexed position for this step
+        mod_pos = getattr(mod_row, "position", None)
+        course_title = course_context.get("course_title") if isinstance(course_context, dict) else ""
+        if isinstance(step_row.demo_data, dict) and isinstance(mod_pos, int):
+            mut = {"demo_data": step_row.demo_data, "task_kind": step_row.task_kind}
+            if _inject_starter_repo_if_needed(mut, course_title or "", mod_pos):
+                # _inject mutated mut["demo_data"] in place; SQLAlchemy needs
+                # a reassignment to mark JSON column dirty.
+                step_row.demo_data = dict(mut["demo_data"])
+                logger.info(
+                    "per_step regen: harness-injected starter_repo for step %s (mod_pos=%d)",
+                    step_row.id, mod_pos,
+                )
+    except Exception as _inj_err:
+        logger.warning("per_step starter_repo inject error (soft-fail): %s", _inj_err)
+
     # Phase 2 (2026-04-25): if the regen LLM declared a fresh learner_surface
     # (because the regen touched interactivity / changed exercise_type),
     # respect it. Otherwise keep the stored value — it was already
@@ -774,6 +929,21 @@ async def regenerate_single_step(
                 step_row.learner_surface = _new_surface
         except Exception:
             pass  # surface module missing → keep prior value
+
+    # 2026-04-27 (F5) — persist task_kind when LLM declares it. Validates
+    # against the small enum to prevent typos / future drift; on unknown
+    # value, leaves the prior value intact (consumers fall back to
+    # demo_data.template_files presence anyway). Setting task_kind=null
+    # explicitly clears the declaration; setting it absent preserves prior.
+    if "task_kind" in llm_content:
+        _tk = llm_content.get("task_kind")
+        if _tk is None:
+            step_row.task_kind = None
+        elif isinstance(_tk, str) and _tk.strip().lower() in ("authoring", "diagnostic", "build"):
+            step_row.task_kind = _tk.strip().lower()
+        # else: silently keep prior — log via _last_invariant_reason on the
+        # gen path; here on regen just no-op so a typo doesn't blast the
+        # existing declaration.
 
     await db.commit()
     await db.refresh(step_row)
@@ -788,6 +958,7 @@ async def regenerate_single_step(
             "position": step_row.position,
             "title": step_row.title,
             "exercise_type": step_row.exercise_type,
+            "task_kind": step_row.task_kind,
             "content": step_row.content,
             "code": step_row.code,
             "expected_output": step_row.expected_output,
@@ -920,6 +1091,7 @@ async def patch_step_fields(
             "position": step_row.position,
             "title": step_row.title,
             "exercise_type": step_row.exercise_type,
+            "task_kind": step_row.task_kind,
             "content": step_row.content,
             "code": step_row.code,
             "expected_output": step_row.expected_output,

@@ -2159,6 +2159,373 @@ When reviewing any future acceptance-gate code, ask:
 
 Tier 2 survivors (accepted brittleness): dark-theme CSS sanitizer (`_darkify_html_content` — no runtime equivalent without headless rendering), and the sha256 pre-filter (trivial, zero false-positives). Everything else went to execution.
 
+## 🧪 BEHAVIORAL TEST HARNESS — the test class IS the rubric (2026-04-28)
+
+**User directive (verbatim, 2026-04-28):** *"This testing framework is excellent.
+Add to CLAUDE.md."*
+
+### The pattern
+
+For any code-fixing / feature-build / refactor course step where the
+LEARNING is a non-trivial property (performance, security, idempotency,
+contract conformance, state-machine correctness, scaling, etc.), put
+the assertion of that property INTO the course-repo's test class —
+NOT into the LMS rubric. The LMS rubric collapses to one line:
+`./mvnw test -Dtest=<TestClass>` exits 0.
+
+This is the operational form of §"NO REGEX UNLESS WHITELISTED" + §"OUTCOME,
+NOT JOURNEY" + §"EXECUTION IS GROUND TRUTH". Three rules, one
+implementation: the test class is the rubric.
+
+### Why this is structurally correct (and not just a tidier rubric)
+
+| Concern | LMS-rubric grading | Test-class grading |
+|---|---|---|
+| **Determinism** | LLM rubric grader, ±0.10 variance | Test exit code: deterministic |
+| **Local runnability** | Learner can't replicate the grader | `./mvnw test` is what they already run |
+| **Maintainability** | Edit Creator-prompt rubric prose | Add a test method to the test class |
+| **False-positive surface** | Anything in stdout/stderr/source | Only the assertion contract |
+| **Adversarial robustness** | Learner can game prose-grading | Assertion runs in-tree; can't be faked |
+| **Pedagogy alignment** | Decoupled from real-world testing | IS real-world testing |
+| **Scaling to new languages** | New rubric prompt per language | New test framework per language (already done) |
+
+### The 5-step recipe
+
+For every code-shape course step:
+
+1. **Identify the LEARNING property.** What does "did the work" mean
+   pedagogically? Performance fix? Auth header? Idempotent retry?
+   Contract conformance? Be specific.
+2. **Find the framework's native assertion primitive** for that
+   property. (See the table below — every major language has them.)
+3. **Write a test method** that uses that primitive to assert the
+   property holds. The assertion FAILS on the starter code (broken
+   state) and PASSES on the canonical fix.
+4. **Verify the test fails on the starter** by running it locally.
+   No-op tests (`assertTrue(true)`) are decorative — they cannot
+   detect ANY bug. Reject before shipping.
+5. **LMS rubric collapses to**:
+   ```yaml
+   cli_commands:
+     - cmd: "./mvnw test -Dtest=<TestClass>"
+       expect_exit_code: 0     # better than `expect: "BUILD SUCCESS"` regex
+   must_contain: ["BUILD SUCCESS"]   # cheap fallback for runners that can't expose exit codes
+   rubric: "Full credit if tests pass (./mvnw exit 0). Zero if tests fail."
+   ```
+
+That's it. The rubric is 30 words. The test class does the work.
+
+### Native assertion primitives by language/framework
+
+| Language | Framework | Performance | Security | State / contract | Idempotency |
+|---|---|---|---|---|---|
+| **Java/Spring** | JUnit 5 + Hibernate | `Statistics.getPrepareStatementCount()` ≤ N | `MockMvc.perform(...).andExpect(status().isUnauthorized())` | `@Sql` fixtures + `assertEquals` on entity state | Run twice, assert state-after-2 == state-after-1 |
+| **Java/Spring** | Testcontainers | `@QueryCountAssert` (quickperf), JFR profile | `@WithMockUser` + auth assertions | `@DynamicPropertySource` for env-driven contracts | `@Transactional` rollback for repeat |
+| **Python** | Pytest + FastAPI | `pytest-benchmark`, `time.perf_counter` deltas | `httpx.AsyncClient` 401/403 assertions | `respx`/`vcr.py` for HTTP contracts | `freezegun` to replay clock |
+| **Python** | SQLAlchemy | `sqlalchemy.event.listen` query counter | `pytest-mock` patches | `factory_boy` fixtures + state assertions | `pytest.mark.parametrize` repeat |
+| **Node/Express** | Jest + Supertest | `jest-bench`, `performance.now()` | `supertest(app).expect(401)` | `nock` HTTP contracts, `jest.spyOn` | `jest.useFakeTimers().advanceTimersByTime(0)` |
+| **Node/NestJS** | Jest + @nestjs/testing | `Test.createTestingModule().overrideProvider()` | `Reflector` guard tests | `INestApplication` E2E | `Injectable()` re-instantiation |
+| **Go** | `testing` stdlib | `testing.B` benchmarks, `pprof` profiles | `httptest` + status assertions | `go-cmp` deep-equal contracts | `t.Run("twice", ...)` |
+| **Rust** | `cargo test` | `cargo bench` (nightly), `criterion` crate | `mockall` for interface mocks | `assert_matches!` enum contracts | `proptest!` round-trip |
+| **Ruby/Rails** | RSpec | `rspec-benchmark`, `bullet` gem (N+1) | `request.headers` + `expect(response).to be_unauthorized` | `factory_bot` + state matchers | `Timecop.freeze` |
+| **Frontend/React** | Jest + RTL | `performance.measure`, render-count via `Profiler` | (auth handled server-side) | `userEvent` flow + `screen.getBy*` | `act` re-render |
+
+When a course adds a new framework, add its primitives to this table.
+The grading shape stays identical: test class asserts; LMS grades exit
+code.
+
+### Anti-patterns (the "decorative test" smell)
+
+A test class is decorative — UNFIT for behavioral grading — if any of:
+- Body is `assertTrue(true)` / `assert True` / `expect(true).toBeTruthy()`.
+- Asserts only that the function "doesn't throw" without checking
+  return value or side effects.
+- Asserts only the return TYPE, not the return VALUE.
+- Asserts the structure of the SUT's source code (e.g. "the @EntityGraph
+  annotation is present") rather than the BEHAVIOR.
+- Mocks the very thing under test (e.g. mocks the database query, then
+  asserts the mock was called — proves nothing about real DB behavior).
+
+If a starter test class has any of these shapes, it CANNOT be the
+ground truth. Either upgrade it to assert real behavior, OR keep the
+LMS rubric grading on outcome signals (grep + tests + GHA) until the
+test class lands.
+
+### Two-branch test setup (starter must FAIL, solution must PASS)
+
+The course-repo's per-module branches must satisfy the same invariant
+LangGraph enforces for `code_exercise`:
+- On `module-N-starter`: the test class FAILS (proves the bug exists).
+- On `module-N-solution`: the test class PASSES (proves the canonical
+  fix works).
+
+Add `tools/verify_module_invariants.sh` (or equivalent per-language)
+that checks out each branch, runs `./mvnw test`, and asserts the
+expected outcome. CI-runnable. Without this, tests can drift from the
+content (test was decorative all along, or test got broken when a
+helper was added). Course bug.
+
+### When the LMS rubric retains regex fallbacks
+
+For runners that CAN'T expose exit codes (older terminal_exercise
+runner versions, paste-mode submissions, asciinema-pasted outputs),
+keep `must_contain: ["BUILD SUCCESS"]` as a Tier 2 fallback. But the
+PRIMARY signal is exit code. Document the version requirement so old
+runners don't silently downgrade.
+
+### Migration template — upgrading a decorative test class
+
+1. Add the assertion primitive(s) needed (Hibernate Statistics,
+   pytest-benchmark, etc.) to the project's test dependencies.
+2. Replace `assertTrue(true)` with a real assertion of the learning
+   property.
+3. Run the test on `module-N-starter` — confirm FAIL.
+4. Cherry-pick the canonical fix from `module-N-solution` (or a known
+   reference) — confirm test PASSES.
+5. Push to both branches.
+6. Regen the LMS step with the new rubric (1 cli_command, exit code).
+7. Run the Layer 2 grading-paths harness against the regenerated step
+   to confirm STRONG → 1.0 / WEAK → 0.0 differentiation.
+
+### Reference
+
+- §"NO REGEX UNLESS WHITELISTED" → "course-repo corollary" — tests must
+  assert behavior, not just correctness.
+- §"OUTCOME, NOT JOURNEY" — cli_commands grade work, not ceremony.
+- §"EXECUTION IS GROUND TRUTH" — delete pattern-matching gates when the
+  runtime can answer.
+- §"STRUCTURED TEST OUTPUT" — JUnit XML / Jest JSON over regex on prose.
+
+---
+
+## 🚫 NO REGEX UNLESS WHITELISTED — exit codes + structured outputs FIRST (2026-04-28)
+
+**User directive (verbatim, 2026-04-28):** *"Is there a way to not do regex
+everywhere. As a general rule, add to CLAUDE.md — don't do regex anywhere
+unless whitelisted."*
+
+This is the natural extension of §"EXECUTION IS GROUND TRUTH" (2026-04-23
+v8.5) and §"NO MEDIATORS BETWEEN TOOL OUTPUT AND LLM" (2026-04-23 v8.5
+Phase E). Stop reaching for regex when a structured signal already exists.
+
+### The rule
+
+Before writing ANY regex against tool output (stdout, stderr, log lines,
+command output, file contents), walk this checklist top to bottom and use
+the FIRST signal that fits. Regex is the last resort, not the default.
+
+1. **Exit code.** Did the command succeed (0) or fail (non-zero)? `./mvnw
+   test` exits 0 iff all tests pass — that's stronger than
+   `grep "BUILD SUCCESS"` because it's the test runner's own contract.
+   Maven, npm, go, cargo, pytest, jest, kubectl, terraform — every one
+   of them returns a meaningful exit code. Use it.
+2. **Structured output format.** Does the tool emit JSON / XML / NDJSON /
+   TAP? JUnit XML (`--junitxml`), Jest (`--json`), go test (`-json`),
+   cargo (`--message-format=json`), kubectl (`-o json`), gh (`gh api`).
+   Parse the structure, don't regex the prose. Per §"STRUCTURED TEST
+   OUTPUT" (2026-04-22 v6).
+3. **The tool's own assertion.** Can the test ITSELF assert what we want
+   to know? Hibernate `SessionFactory.getStatistics().getQueryCount()`
+   makes N+1 detection a 1-line assertion. The test fails on N+1, passes
+   on the canonical fix. We grade on exit code; the test does the work.
+   This is the strongest signal — the assertion runs IN-TREE, not as a
+   post-hoc grep.
+4. **First-party tool subcommand.** `gh api`, `kubectl get`, `mvn
+   dependency:tree`, `go list -m all`, `claude mcp list` — first-party
+   structured queries beat parsing tool output.
+5. **ONLY THEN, regex.** And when you do, LABEL it Tier 2 in-code with a
+   comment: `# Tier 2 heuristic — drifts; revisit when <X> is available`.
+
+### Whitelisted regex use cases (the ONLY places regex is acceptable)
+
+- **No structured alternative exists.** Some legacy CLIs print prose
+  only. Note in-code why structured is unavailable.
+- **`must_contain` as a cheap first-pass gate.** Per CLAUDE.md §F1 — at
+  most 5% weight; never the only signal.
+- **Sentinel-bounded structured-block extraction** (e.g.
+  `__GO_NDJSON_START__` / `__JEST_JSON_START__`). The PARSING is
+  structured; the regex just bounds the scope.
+- **LLM-prose validation.** Inspecting LLM-emitted text for banned
+  patterns (Track A `_DEPRECATED_RUBRIC_PATTERNS`, dark-theme CSS
+  sanitizer). There is no structured alternative for inspecting
+  free-prose; these are the load-bearing exceptions.
+- **Frontend HTML/CSS sanitization** (`_darkify_html_content`) — no
+  headless-browser equivalent without renderer overhead. Tier 2 by
+  design.
+
+### Where this applies
+
+| Surface | OLD (regex on output) | NEW (structured / exit code) |
+|---|---|---|
+| `terminal_exercise.cli_commands.expect` | `expect: "BUILD SUCCESS"` | `expect_exit_code: 0` (runner change queued) |
+| Test outcome grading | grep `passed: N, failed: M` | parse JUnit XML `<testsuite tests="..." failures="...">` |
+| GHA workflow check | regex `Run completed successfully` | `gh api .../runs/{id}` → `.conclusion == "success"` |
+| MCP availability | grep claude session output | `claude mcp list` JSON parse |
+| Branch presence | grep `git branch` | `gh api repos/{owner}/{repo}/branches/{name}` |
+| Performance assertion | grep "BUILD SUCCESS" + grep canonical pattern | Test class uses `Statistics.getQueryCount()` → exit code |
+
+### Anti-pattern to retire
+
+When you find yourself writing `re.search(r"...", captured_output)` in
+ANY new code path, STOP. Ask:
+1. Does the tool emit JSON or XML?
+2. Does it have an exit code?
+3. Does the test framework expose a programmatic API?
+4. Is there a `gh api` / `kubectl -o json` / `mvn` subcommand that
+   returns structured data?
+
+The answer is yes ≥90% of the time. The remaining 10% is when the
+above five whitelisted exceptions apply — and you must say so in code.
+
+### The course-repo corollary — TESTS MUST ASSERT BEHAVIOR, NOT JUST CORRECTNESS
+
+A test that only asserts return-value correctness CANNOT detect
+performance bugs (N+1 queries, missing indexes, wrong cache keys,
+unbounded recursion, accidental O(n²)). For any course step where
+the LEARNING is about a non-correctness property (performance,
+security, scaling, idempotency), the test class itself must assert
+that property:
+
+- **Performance**: Hibernate `Statistics.getQueryCount()`, Spring
+  `@QueryCountAssert`, JaCoCo `metric.executionTime`, custom
+  benchmarking with `Assertions.assertTimeoutPreemptively`.
+- **Security**: assert `verify(response).status(401)` on missing
+  auth, assert hashed-not-plaintext via field-shape check.
+- **Idempotency**: run the operation twice, assert state-after-once
+  == state-after-twice.
+- **Cache hit**: instrument the cache, assert hit count > 0.
+
+If the starter test class is `assertTrue(true)`, the LMS rubric has
+NO ground truth — the test can't tell whether the learner did the
+work. Fix the test, not the rubric.
+
+### Reference
+
+- §"EXECUTION IS GROUND TRUTH" (2026-04-23 v8.5) — delete
+  pattern-matching gates when the runtime can answer.
+- §"NO MEDIATORS BETWEEN TOOL OUTPUT AND LLM" (2026-04-23 v8.5 Phase
+  E) — raw tool output to a capable reader; mediators silently fail.
+- §"STRUCTURED TEST OUTPUT" (2026-04-22 v6) — JUnit XML / Jest JSON /
+  go -json over regex on prose.
+
+---
+
+## 🎯 OUTCOME, NOT JOURNEY — terminal_exercise grades work, not ceremony (2026-04-28)
+
+**User directive (paraphrased, 2026-04-28):** the VS Code "Run This Step"
+button broke on jspring M1.S2 because the rubric was grading the JOURNEY
+(did you `git clone`? did `claude -p` print "Applied edit"? did `git diff`
+show changes?) instead of the OUTCOME (does the fix work?). The journey
+is uncatchable for the runner anyway (claude session output is
+non-deterministic, varies by API key, depends on rate limits) and
+irrelevant pedagogically (the SKILL is the fix, not the workflow).
+
+### The rule
+
+`terminal_exercise.validation.cli_commands` grades **what the learner's
+work PRODUCED**, NEVER **how they got there**.
+
+- **Grade**: tests pass / canonical pattern in source / endpoint returns
+  expected JSON / file exists with expected shape / GHA conclusion =
+  success.
+- **Don't grade**: claude session transcript / git commit history /
+  shell command sequence / any signal that requires the learner to
+  follow a specific tool-use ceremony.
+
+### Three sub-rules
+
+1. **`cli_commands` ≤ 2 entries.** If you find yourself emitting 5
+   commands to verify one step, you're grading the journey. Cut to
+   the OUTCOME signals only. M1.S2 went from 5 commands (clone +
+   claude -p + mvnw test + git diff + grep) to 2 (mvnw test + grep)
+   under this rule.
+2. **No `cd <repo>` prefixes in `cli_commands`.** Each command runs
+   in a fresh subshell starting from the learner's PWD. The
+   `bootstrap_command` is responsible for setting up the workspace
+   and leaving the learner inside it. `cli_commands` assume PWD is
+   the project root and run RELATIVE paths. If you prepend `cd
+   jspring-course-repo &&` to every command, the second `cd` will
+   FAIL whenever the learner's interactive shell already happens to
+   be inside `jspring-course-repo` (which is exactly where the
+   bootstrap leaves them). The 2026-04-28 M1.S2 failure was this bug.
+3. **No `git clone` or interactive-tool invocations in
+   `cli_commands`.** `bootstrap_command` clones once at session
+   start. cli_commands run when the learner submits — they verify
+   the OUTCOME, they don't repeat the setup. And they NEVER include
+   `claude -p`, `aider --message`, or any interactive-tool call —
+   those are journey, not outcome, AND their output is
+   non-deterministic.
+
+### What "outcome" means concretely (per exercise pedagogy)
+
+| Course family | OUTCOME signals (cli_commands grade these) | JOURNEY signals (NEVER grade these) |
+|---|---|---|
+| **Refactor / fix bugs** | `./mvnw test` exit 0; canonical pattern in source via grep | claude session output; git commit message; git diff |
+| **Build & deploy** | `gh api .../runs/{id}` conclusion=success; deployed-endpoint health probe | local `docker build` output; `git push` confirmation |
+| **MCP / plugin wiring** | `claude mcp list` shows the registered server (JSON parse); the MCP responds to a smoke query | the wiring command's prose output; settings.json contents |
+| **Toolchain preflight** | tool's `--version` exits 0 with a version on stdout | which install method was used (brew vs sdkman vs curl) |
+| **Database / SQL** | query result JSON matches expected shape; row count assertion via `psql -c` | which IDE the learner used to write the query |
+
+### Example transformations
+
+**WRONG (journey-graded, what M1.S2 had):**
+```yaml
+cli_commands:
+  - cmd: "git clone ... && cd jspring-course-repo && git checkout module-1-starter"
+    expect: "Switched to branch"
+  - cmd: "cd jspring-course-repo && claude -p 'Fix the N+1...'"
+    expect: "Applied edit"
+  - cmd: "cd jspring-course-repo && ./mvnw test -Dtest=OrderServiceTest"
+    expect: "BUILD SUCCESS"
+  - cmd: "cd jspring-course-repo && git diff --stat"
+    expect: "OrderService\\.java"
+  - cmd: "cd jspring-course-repo && grep -r 'EntityGraph|JOIN FETCH' src/"
+    expect: "EntityGraph|JOIN FETCH"
+must_contain: ["Applied edit", "BUILD SUCCESS", "OrderService.java"]
+```
+
+**RIGHT (outcome-graded, what M1.S2 now has):**
+```yaml
+cli_commands:
+  - cmd: "./mvnw test -Dtest=OrderServiceTest"
+    expect: "BUILD SUCCESS"   # better: expect_exit_code: 0 (runner change queued)
+  - cmd: "grep -rE 'EntityGraph|JOIN FETCH' src/main/java/"
+    expect: "EntityGraph|JOIN FETCH"   # only valid if test class can't assert query count
+must_contain: ["BUILD SUCCESS"]
+```
+
+### When `cli_commands` aren't enough → upgrade the test class
+
+If the OUTCOME requires a behavior assertion that `./mvnw test` doesn't
+make today (e.g. N+1 detection — a learner can leave the bug in place
+and tests still pass), the FIX is to upgrade the test class so the
+assertion runs in-tree. See §"NO REGEX UNLESS WHITELISTED" → "course-repo
+corollary." The LMS rubric stays simple (1 cli_command, exit code 0);
+the test class does the structural verification.
+
+### Anti-pattern detector
+
+If a `terminal_exercise` step has any of these in `cli_commands`,
+regenerate it with the OUTCOME-NOT-JOURNEY rule:
+- `claude -p` / `claude --message` / `aider --message`
+- `git commit -m`
+- `git push`
+- `cd <anything>` (use bootstrap_command for setup; cli_commands run
+  from PWD)
+- More than 2 commands per step
+- `expect` regex that contains "Applied edit" / "Cloning into" /
+  "Switched to branch" / "Author: " / git timestamps
+
+### Operational rule for future steps
+
+Every new `terminal_exercise` step's cli_commands array must answer ONE
+question: "what did the learner's work PRODUCE that we can verify with
+a deterministic, non-interactive command?" If the answer is more than
+2 commands or includes a tool-session transcript, the design is wrong;
+upgrade the test class so behavior is assertable in-tree.
+
+---
+
 ## 🪞 NO MEDIATORS BETWEEN TOOL OUTPUT AND LLM (2026-04-23 v8.5 Phase E final)
 
 **User directive (verbatim, 2026-04-23):** "Is it necessary to use regex? I am hoping we avoid this pattern."

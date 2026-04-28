@@ -577,6 +577,113 @@ def _strip_answer_comments_from_code(code: str) -> str:
     return "\n".join(out)
 
 
+# 2026-04-27 (F5) — task_kind enum normalizer. Accepts {authoring, diagnostic,
+# build} (case-insensitive, whitespace-trimmed). Anything else → None so the
+# consumer falls back to demo_data.template_files presence as the authoring
+# signal. Kept tiny + stateless on purpose; new task_kind values land here as
+# enum extensions, never as string-pattern matching elsewhere.
+_TASK_KIND_ENUM = frozenset({"authoring", "diagnostic", "build"})
+
+
+def _normalize_task_kind(raw) -> str | None:
+    if raw is None:
+        return None
+    if not isinstance(raw, str):
+        return None
+    v = raw.strip().lower()
+    return v if v in _TASK_KIND_ENUM else None
+
+
+# 2026-04-27 (post-v6-reviewer Bug Y) — fields the harness owns end-to-end.
+# When per_step regen persists, these fields are MERGED forward from the prior
+# step_row.demo_data if the LLM omits them — preventing the wholesale-replace
+# regression that wiped backfilled bootstrap_command + dependencies +
+# paste_slots on every regenerated kimi step.
+#
+# Co-located with _inject_starter_repo_if_needed (per buddy-Opus review:
+# "co-location > abstraction here") so any new harness-managed field added
+# to the inject helper is also added to this set in the same diff.
+HARNESS_MANAGED_DEMO_DATA_FIELDS: frozenset[str] = frozenset({
+    "starter_repo",       # F26 scaffold — harness-injected from course_assets
+    "starter_files",      # F26 alternative scaffold (inline files)
+    "bootstrap_command",  # backfill-injected one-liner clone command
+    "dependencies",       # backfill-injected runtime-deps panel
+    "paste_slots",        # backfill-injected structured paste shape
+    "step_slug",          # backfill-injected M<N>.S<M> identifier
+    "step_task",          # backfill-injected step-task descriptor
+})
+
+
+def _inject_starter_repo_if_needed(
+    candidate: dict,
+    course_title: str,
+    module_position_1based: int,
+    course_asset_slug: str | None = None,
+) -> bool:
+    """Harness-side scaffold injection. Mutates candidate in-place.
+    Returns True if a starter_repo was injected, False otherwise.
+
+    Per CLAUDE.md §F26 + §"NO MEDIATORS" + 2026-04-27 buddy-Opus review:
+    don't trust the LLM to remember to emit starter_repo. The harness
+    resolves it deterministically from backend/course_assets.py post-
+    LLM-call. Closes the failure mode at the source rather than retrying
+    around it.
+
+    Authoritative slug resolution order (post-v6 review):
+      1. course_asset_slug param (passed by callers that have access to
+         the Course row's asset_slug column — set at create-time)
+      2. detect_slug_for_course(course_title) fuzzy fallback for legacy
+         rows where asset_slug is null
+
+    Skip conditions (in order):
+      1. candidate already has demo_data.starter_repo or starter_files
+      2. task_kind == "authoring" (no repo needed)
+      3. No asset slug resolves (course not registered)
+      4. Module position out of range for the registered slug
+    """
+    if not isinstance(candidate, dict):
+        return False
+    dd = candidate.get("demo_data")
+    if not isinstance(dd, dict):
+        dd = {}
+        candidate["demo_data"] = dd
+    if dd.get("starter_repo") or dd.get("starter_files"):
+        return False
+    tk = _normalize_task_kind(candidate.get("task_kind") or dd.get("task_kind"))
+    if tk == "authoring":
+        return False
+    try:
+        from backend.course_assets import (
+            detect_slug_for_course,
+            module_key_for_position,
+            get_course_assets,
+        )
+    except Exception:
+        return False
+    # Prefer authoritative column → fuzzy match fallback
+    slug = course_asset_slug or detect_slug_for_course(course_title or "")
+    if not slug:
+        return False
+    asset = get_course_assets(slug)
+    if not asset:
+        return False
+    mod_key = module_key_for_position(slug, module_position_1based)
+    if not mod_key:
+        return False
+    branch = asset.module_branches.get(mod_key)
+    if not branch:
+        return False
+    dd["starter_repo"] = {
+        "url": asset.course_repo,
+        "ref": branch,
+        "description": (
+            f"Module {module_position_1based} starter — {asset.title_hint}. "
+            f"Branch `{branch}` carries the planted code + team conventions."
+        ),
+    }
+    return True
+
+
 def _resolve_learner_surface(
     *,
     ex_type: str | None,
@@ -925,6 +1032,13 @@ async def admin_get_course_raw(course_id: str, db: AsyncSession = Depends(get_db
                 {
                     "id": s.id, "position": s.position, "title": s.title,
                     "step_type": s.step_type, "exercise_type": s.exercise_type,
+                    # 2026-04-27 (F5) — task_kind needs to flow through admin
+                    # /raw too. Verifier scripts + reviewers query /raw to
+                    # confirm the persistence layer landed authoring/diagnostic
+                    # declarations. Public learner endpoints already expose
+                    # task_kind via StepOut.model_validate(s).model_dump().
+                    "task_kind": getattr(s, "task_kind", None),
+                    "learner_surface": getattr(s, "learner_surface", None),
                     "content": s.content, "code": s.code,
                     "expected_output": s.expected_output,
                     "validation": s.validation, "demo_data": s.demo_data,
@@ -8851,6 +8965,27 @@ STRICT SCENARIO-CONSISTENCY RULES:
     except Exception:
         ontology_brief = ""
 
+    # 2026-04-27 (post-v6-reviewer URL hallucination fix) — authoritative
+    # course-context block listing the registered repo URL + per-module
+    # branches + MCP names verbatim. The LLM was hallucinating short slugs
+    # like `tusharbisht/kimi-course-repo` (404) on 9 regen attempts; this
+    # injects the canonical URL into the prompt at every call so the LLM
+    # has a SINGLE SOURCE OF TRUTH to quote from instead of guessing.
+    # Sourced from `backend/course_assets.py` registry — same source the
+    # harness-side starter_repo injection uses.
+    _course_context_block = ""
+    try:
+        _asset_slug = course_context.get("asset_slug") if isinstance(course_context, dict) else None
+        if not _asset_slug:
+            from backend.course_assets import detect_slug_for_course
+            _asset_slug = detect_slug_for_course(course_context.get("title") or "")
+        if _asset_slug:
+            from backend.course_assets import build_course_context_block
+            _course_context_block = build_course_context_block(_asset_slug)
+    except Exception as _ccb_err:
+        logging.warning("course_context_block assembly soft-failed: %s", _ccb_err)
+        _course_context_block = ""
+
     prompt = f"""Generate production-quality content for this course step.
 
 Course: {course_context.get('title')} ({course_context.get('course_type')})
@@ -8861,6 +8996,8 @@ Exercise type: {step_type}
 Subject type: {"Non-engineering (research/design/business/soft-skills)" if is_non_engineering else "Engineering (code/infra)"}
 
 {ontology_brief}
+
+{_course_context_block}
 
 {authority_block}{grounding_preamble}{capstone_preamble}{prior_course_context_block}
 IMPORTANT: For non-engineering subjects, code/Python is INAPPROPRIATE. Use text/scenarios/rankings instead. Content must be grounded in the actual subject (e.g., interview protocols, research plans, stakeholder docs — not Python).
@@ -9384,7 +9521,15 @@ ENGINEERING-CAPSTONE GENRE LOCK (non-negotiable):
 9. **Briefing must excite + orient**. M1.S1 answers "what's the wow moment?" in the first sentence. Later modules assume prior progress and jump straight to the new concept.
 10. **hint** is a single sentence. A stuck beginner should unblock within 10 seconds of reading it.
 11. **NEVER invent CLI commands, flags, or subcommands.** Every cmd in cli_commands MUST be (a) quoted from the runtime-deps brief / source_material verbatim, OR (b) a command you KNOW exists in the tool's public docs. If unsure whether a flag or subcommand exists, OMIT it. Invented CLI syntax is the single most common trust-breaker on a first-CLI-touch.
-12. **For Aider courses (BYO via OpenRouter): the model arg ALWAYS uses the openrouter/ provider prefix.** The bare `moonshotai/kimi-k2` is the OpenRouter SLUG, NOT the aider --model ARG — litellm rejects it at runtime. Canonical form for course content: `openrouter/moonshotai/kimi-k2-0905` (date-stamped, stable). NEVER emit a bare `aider --model moonshotai/kimi-k2 ...` invocation."""
+12. **For Aider courses (BYO via OpenRouter): the model arg ALWAYS uses the openrouter/ provider prefix.** The bare `moonshotai/kimi-k2` is the OpenRouter SLUG, NOT the aider --model ARG — litellm rejects it at runtime. Canonical form for course content: `openrouter/moonshotai/kimi-k2-0905` (date-stamped, stable). NEVER emit a bare `aider --model moonshotai/kimi-k2 ...` invocation.
+13. **DEPRECATED RUBRIC SHAPES — NEVER EMIT (deprecation date 2026-04-28):** The evaluation ontology BANS subjective free-prose grading. The following rubric shapes are REJECTED at the gate and MUST NOT be emitted:
+    - "Full credit if the learner documents X's style choices in their notes file with **meaningful observations** about Y..."
+    - "Grade on the learner's observations.txt / notes.txt / reflection.md / style-observations.txt"
+    - "Partial credit if **observations are minimal**. Zero if **no documentation provided**."
+    - "Score on **writing style** / **your writing** / **reflect on** / **describe in your own words**"
+    - "Documents claude's / kimi's / aider's behavior / approach / conventions / reasoning"
+    - Any rubric criterion that grades free-prose text the learner wrote ABOUT the tool (rather than canonical CLI output the tool itself produced).
+    INSTEAD, every terminal_exercise rubric grades on OBJECTIVE artifacts the CLI captured: did pytest pass? did `git diff --stat` show the expected file? did the cli_command's stdout contain the canonical token? did the GHA workflow conclusion = "success"? did the test class assertion fire? Write rubrics that an LLM grader can decide DETERMINISTICALLY from captured terminal output, NOT from prose the learner wrote about their experience. If the only thing you can grade on is "the learner observed X about the tool's style" — REPLACE the exercise type (use `code_exercise` with hidden_tests, or `system_build` with gha_workflow_check, or drop the step). Subjective-observation grading was the #1 source of false-positive grades in the 2026-04 cohort and is permanently retired."""
     elif step_type == "adaptive_roleplay":
         prompt += """{
   "content": "<HTML setup (30-80 words) — framing for the roleplay. Kept short because the live chat does the teaching.>",
@@ -11072,6 +11217,18 @@ async def _creator_generate_impl(
     # The pitch is an action-oriented 1-2 sentence framing ("Automate X, then ship Y instead of Z")
     # rather than a topic summary. See _llm_capstone_pitch docstring.
     effective_subtitle = (pitch_text or "").strip() or session.get("description", "")[:200]
+    # 2026-04-27 (post-v6) — authoritative asset_slug detection at create time.
+    # Stores in the column so the harness inject + course_context block both
+    # read it directly instead of fuzzy-matching the title every per-step call.
+    # Returns None for unregistered courses (left null in DB; fuzzy fallback
+    # remains for legacy rows).
+    _detected_slug: str | None = None
+    try:
+        from backend.course_assets import detect_slug_for_course
+        _detected_slug = detect_slug_for_course(title or "")
+    except Exception:
+        _detected_slug = None
+
     course = Course(
         id=course_id,
         title=title,
@@ -11082,6 +11239,7 @@ async def _creator_generate_impl(
         tags=[course_type, "ai-generated", course_level],
         estimated_time=session["answers"].get("duration", "2hr"),
         module_count=len(req.outline.modules),
+        asset_slug=_detected_slug,
     )
     # Mark the course as in-flight so the public learner index hides it until
     # generation completes (2026-04-21 change paired with per-step commits).
@@ -12576,6 +12734,19 @@ async def _creator_generate_impl(
                     if not demo_data:
                         demo_data = {}
                     demo_data["deployment_config"] = llm_content["deployment_config"]
+                # 2026-04-27 (F26 harness inject) — pre-Step() construction,
+                # add starter_repo to demo_data when course is registered +
+                # step is non-authoring + has no scaffold. Mutates llm_content
+                # in-place so the constructed Step picks up the injected field.
+                # Post-v6: prefer the authoritative course-level asset_slug
+                # (detected at creation time + stored on Course.asset_slug)
+                # over fuzzy title matching every per-step call.
+                _inject_starter_repo_if_needed(
+                    llm_content, title, mod.position,
+                    course_asset_slug=_detected_slug,
+                )
+                demo_data = llm_content.get("demo_data") or demo_data
+
                 # Skip fallback defaults below
                 step = Step(
                     module_id=module.id,
@@ -12590,6 +12761,7 @@ async def _creator_generate_impl(
                         declared=llm_content.get("learner_surface"),
                         validation=validation,
                     ),
+                    task_kind=_normalize_task_kind(llm_content.get("task_kind")),
                     content=content,
                     code=code,
                     expected_output=expected_output,
@@ -12948,6 +13120,7 @@ async def _creator_generate_impl(
                     declared=(llm_content or {}).get("learner_surface"),
                     validation=validation,
                 ),
+                task_kind=_normalize_task_kind((llm_content or {}).get("task_kind")),
                 content=content,
                 code=code,
                 expected_output=expected_output,

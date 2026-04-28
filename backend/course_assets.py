@@ -72,6 +72,34 @@ class CourseAsset:
     # The expected GHA job name (grader asserts this job passed).
     gha_grading_job: str = "grade"
 
+    # ── Behavioral test harness (2026-04-28) ──
+    # Per CLAUDE.md §"BEHAVIORAL TEST HARNESS — the test class IS the
+    # rubric": when a course has a hidden grading harness in its repo,
+    # the LMS grades by running this command + reading exit code.
+    # Universal contract:
+    #   - Command takes one arg: the exercise-dir (e.g. "exercise-01-fix-n-plus-one")
+    #   - Stages hidden tests, runs language-default test runner with 120s timeout,
+    #     emits "RESULT: PASS|FAIL" line + grading-result.json, exits 0/1.
+    #   - See tools/grading-skeletons/README.md for the full contract.
+    # When set, Creator prompt rule #14 collapses the per-step rubric to a
+    # single generic line (cli_command runs this; rubric is "exit 0 = pass").
+    # When None, falls back to per-step LLM-authored rubric prose (legacy path
+    # for non-code-fix courses + courses that haven't migrated yet).
+    grading_runner: str | None = None
+    # Language hint for test framework selection in the runner; informational.
+    # Values: "java", "python", "node", "go", "rust", "ruby" — corresponds
+    # to subdirectories under tools/grading-skeletons/.
+    grading_test_lang: str | None = None
+    # Per-step → exercise-dir mapping. The Creator (or harness-side overlay)
+    # emits the cli_command with this exercise-dir baked in:
+    #   bash .grading/run-grading.sh <exercise-dir>
+    # Keys are "M{module_position}.S{step_position}" — 1-indexed in BOTH dims,
+    # matching the DB Module.position + Step.position fields. Values are the
+    # exercise dir name under .grading/ on the course-repo.
+    # Steps NOT in this map fall back to the legacy LLM-authored rubric path
+    # (preflight steps, deprecated reflection steps, system_build with GHA, etc.).
+    exercise_dirs: dict[str, str] = field(default_factory=dict)
+
 
 # ═══════════════════════════════════════════════════════════════════
 # Registry
@@ -124,20 +152,140 @@ def resolve_asset(slug: str, kind: str, **kwargs) -> str | None:
     return None
 
 
+def detect_slug_for_course(course_title: str) -> str | None:
+    """Match a course title to a registered asset slug via title_hint
+    fuzzy word-overlap. Returns the best-matching slug at score >= 0.6,
+    or None if no asset matches well enough.
+
+    2026-04-27 — added for harness-side starter_repo injection. The gate
+    fires REJECT for repo-walking terminal_exercise / system_build steps
+    that emit no scaffold; the harness reads this fn to find the
+    course's repo + injects starter_repo deterministically post-LLM-call.
+    Buddy-Opus 2026-04-27: "URL injection is harness-side, not LLM-prompt-
+    side. Don't trust LLM to remember; gate-time enforcement, harness-side
+    injection, never via prompt nag."
+
+    Word-overlap (not regex/substring) so "Open-Source AI Coding: Kimi K2"
+    + "Open-Source AI Coding: Ship Production Features with Kimi K2 +
+    Aider" matches; "Claude Code in Production" doesn't bleed into
+    "Claude Code for Spring Boot" because the differentiating words
+    ("production" vs "spring", "boot") win.
+    """
+    if not course_title:
+        return None
+    title_words = {w.strip(":,.+") for w in course_title.lower().split() if len(w.strip(":,.+")) > 3}
+    if not title_words:
+        return None
+    best_match: str | None = None
+    best_key = (0.0, 0)  # (score_ratio, raw_match_count)
+    for slug, asset in _COURSE_ASSETS.items():
+        hint = (asset.title_hint or "").lower()
+        if not hint:
+            continue
+        hint_words = {w.strip(":,.+") for w in hint.split() if len(w.strip(":,.+")) > 3}
+        if not hint_words:
+            continue
+        matches = sum(1 for w in hint_words if w in title_words)
+        score = matches / len(hint_words)
+        if score < 0.6:
+            continue
+        # Tie-break: when two slugs have equal score (e.g. jspring "Claude Code
+        # for Spring Boot" 4/4=1.0 + claude-code "Claude Code in Production"
+        # 3/3=1.0 both fire on a Spring Boot title that happens to contain
+        # "production"), prefer the slug with MORE absolute hint-word matches.
+        # That's the more SPECIFIC match — every word of jspring's hint
+        # appeared, including the differentiating "spring" + "boot".
+        key = (score, matches)
+        if key > best_key:
+            best_key = key
+            best_match = slug
+    return best_match
+
+
+def module_key_for_position(slug: str, position_1based: int) -> str | None:
+    """Map a course's module POSITION (1-indexed) to its registered
+    branch key. Convention is "first registered key = M0 / position 1,
+    second = M1 / position 2, ...". Today this lines up across the 3
+    BYO-key courses (kimi, jspring, claude-code) which all register
+    keys in the same order: preflight, first-fix, claudemd, agents,
+    hooks, mcp, capstone.
+    """
+    a = get_course_assets(slug)
+    if not a:
+        return None
+    keys = list(a.module_branches.keys())
+    if 1 <= position_1based <= len(keys):
+        return keys[position_1based - 1]
+    return None
+
+
+def build_course_context_block(slug: str) -> str:
+    """Authoritative course-context for the LLM at every per-step gen call.
+
+    2026-04-27 (post-v6-reviewer URL hallucination findings): the LLM
+    regenerated 9 kimi steps and emitted prose like
+    `git clone tusharbisht/kimi-course-repo` — a SHORT slug that doesn't
+    exist on GitHub. The real slug is `kimi-eng-course-repo`. The harness-
+    injected `starter_repo.url` is correct; only briefing prose drifts.
+
+    Per CLAUDE.md §"NO MEDIATORS": no regex on prose to fix this. Per
+    buddy-Opus 2026-04-27: the structural fix is to inject a
+    course_context block into the system prompt at every call, listing
+    the FULL repo URL + per-module branches verbatim. Single source of
+    truth, present on every call, ~50 tokens.
+
+    Returns empty string when the slug is unknown / unregistered, so the
+    block is just absent from the prompt rather than emitting noise.
+    """
+    a = get_course_assets(slug)
+    if not a:
+        return ""
+    lines: list[str] = []
+    lines.append("=== COURSE CONTEXT (authoritative — quote VERBATIM, do not abbreviate) ===")
+    lines.append(f"Course slug: {slug}")
+    lines.append(f"Course repo: {a.course_repo}")
+    lines.append("Per-module branches:")
+    for key, branch in a.module_branches.items():
+        lines.append(f"  - {key}: {branch}")
+    if a.mcp_servers:
+        lines.append("MCP servers (use these names + repos verbatim):")
+        for m in a.mcp_servers:
+            lines.append(f"  - name: {m.name} | repo: {m.repo} | transport: {m.transport}")
+    lines.append("RULE: when emitting `git clone`, prose, or any URL reference, USE THE FULL")
+    lines.append("repo URL above. Do NOT invent short slugs like `<org>/<short-name>`. Branch")
+    lines.append("names are exactly as listed — no abbreviations.")
+    lines.append("=== END COURSE CONTEXT ===")
+    return "\n".join(lines)
+
+
 def build_bootstrap_command(
     slug: str,
     module_key: str,
     *,
-    post_clone_cmd: str = "claude",
+    post_clone_cmd: str = "",
 ) -> str | None:
     """Build the one-line copy-to-terminal bootstrap for a given
     (course, module). Returns None if the course/module isn't registered.
 
-    Result shape:
+    Result shape (default — no post-clone trailing command):
+      git clone <course_repo> && cd <repo_basename> && git checkout <branch>
+
+    With post_clone_cmd:
       git clone <course_repo> && cd <repo_basename> && git checkout <branch> && <post_clone_cmd>
 
-    The terminal-template JS layer wraps this with the SLL step-aware
-    banner + shell prompt indicator, so callers don't need to add those.
+    2026-04-27 (v0.1.17 fix) — default post_clone_cmd flipped from
+    `"claude"` to `""` (empty). User feedback: the bootstrap was ending
+    in `&& claude` for EVERY step including M0 preflight (toolchain
+    verification), so clicking the clone command immediately dropped the
+    learner into Claude Code's interactive REPL — wrong for a step whose
+    only goal is verifying `claude --version`, `java -version`, `./mvnw -v`
+    on the host. Cloning is universal; starting Claude is a per-step
+    decision that belongs in `cli_commands` or instructions, not in the
+    clone command.
+
+    Callers that genuinely want `&& claude` (e.g. M1.S2 "fix the N+1 with
+    Claude Code") can pass `post_clone_cmd="claude"` explicitly. But the
+    default no longer footguns the diagnostic / preflight steps.
     """
     a = get_course_assets(slug)
     if not a:
@@ -149,12 +297,14 @@ def build_bootstrap_command(
     import re as _re
     m = _re.search(r"/([^/]+?)(?:\.git)?/?$", a.course_repo)
     dirname = m.group(1) if m else "course-repo"
-    return (
-        f"git clone {a.course_repo} && "
-        f"cd {dirname} && "
-        f"git checkout {branch} && "
-        f"{post_clone_cmd}"
-    )
+    parts = [
+        f"git clone {a.course_repo}",
+        f"cd {dirname}",
+        f"git checkout {branch}",
+    ]
+    if post_clone_cmd:
+        parts.append(post_clone_cmd)
+    return " && ".join(parts)
 
 
 # ═══════════════════════════════════════════════════════════════════
@@ -238,6 +388,38 @@ register_course_assets(CourseAsset(
             ),
         ),
     ),
+    # 2026-04-28 — Behavioral test harness wired. .grading/ skeleton lives
+    # on every module branch (commit ce7df23). Creator prompt rule #14
+    # picks up grading_runner and emits generic shape for code-fix steps.
+    grading_runner="bash .grading/run-grading.sh",
+    grading_test_lang="java",
+    exercise_dirs={
+        # Keys: "M{module_position}.S{step_position}" — 1-indexed.
+        # Looked up by harness post-LLM via Step.position + Module.position.
+
+        # M2.S2 — Fix N+1 in OrderService.getRecentOrders (no CLAUDE.md)
+        "M2.S2": "exercise-01-fix-n-plus-one",
+        # M3.S4 — Retry the N+1 fix WITH CLAUDE.md (same hidden test;
+        # different SUT branch tells us whether CLAUDE.md context helped)
+        "M3.S4": "exercise-01-fix-n-plus-one",
+        # M4.S2 — Slash command /controller-review (verify.sh)
+        "M4.S2": "exercise-03-slash-command-controller-review",
+        # M4.S3 — mockito-test-writer subagent (verify.sh)
+        "M4.S3": "exercise-04-subagent-mockito-test-writer",
+        # M5.S2 — Three hooks wired in .claude/settings.json (verify.sh)
+        "M5.S2": "exercise-05-hooks-three-wired",
+        # M6.S2 — team-tickets MCP wired (verify.sh + claude mcp list --json)
+        "M6.S2": "exercise-06-mcp-team-tickets-wired",
+        # M7.S3 — Capstone: OrdersController + integration test
+        "M7.S3": "exercise-02-orders-controller",
+        # NOT mapped (fall back to legacy LLM-rubric path):
+        #   M1.S2 preflight — toolchain version checks via exit codes only
+        #   M2.S4 conventions reflection — Tier E (deprecated, will redesign)
+        #   M3.S2 draft CLAUDE.md — Tier E borderline (defer)
+        #   M6.S4 consume MCP — Tier E (defer; needs MCP-side change)
+        #   M7.S2 fork+baseline — exit-code only via gh-api
+        #   M7.S4 push+GHA — already system_build + gha_workflow_check
+    },
 ))
 
 
