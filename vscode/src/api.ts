@@ -178,4 +178,68 @@ export class LmsClient {
     if (responseData) body.response_data = responseData;
     return await this.req("POST", "/api/progress/complete", { body });
   }
+
+  // ── hands_on (2026-04-28) ───────────────────────────────────────
+  // Slide + course-repo + native-editor architecture. The course-repo's
+  // .grading/<exercise>/{Hidden*Test, verify.sh} carries the pedagogy.
+  // Per buddy-Opus: GHA = source of truth, CLI = fast-feedback hint.
+
+  /** Resolve a hands_on step's launch bundle: editor URLs + manifest meta + README. */
+  async getHandsOnLaunch(
+    courseSlug: string,
+    nn: string,
+    exerciseSlug: string,
+  ): Promise<HandsOnLaunch> {
+    const path = `/api/courses/${encodeURIComponent(courseSlug)}/exercises/${encodeURIComponent(nn)}/${encodeURIComponent(exerciseSlug)}/launch`;
+    return await this.req("GET", path, { needAuth: false });
+  }
+
+  /** Post a grading-result.json from skillslab CLI / GHA. Per user decision 1b
+   * (last-passing-run wins): every PASS marks completed=True; subsequent
+   * FAILs do NOT reset. Per 2b: hard-fail offline (caller surfaces the
+   * actionable retry hint). */
+  async submitHandsOn(
+    courseSlug: string,
+    nn: string,
+    exerciseSlug: string,
+    payload: any,
+  ): Promise<HandsOnSubmitResponse> {
+    const path = `/api/courses/${encodeURIComponent(courseSlug)}/exercises/${encodeURIComponent(nn)}/${encodeURIComponent(exerciseSlug)}/submit`;
+    return await this.req("POST", path, { body: payload });
+  }
+}
+
+export interface HandsOnLaunch {
+  course_slug: string;
+  exercise_nn: string;
+  exercise_slug: string;
+  course_repo: string;
+  owner_repo: string;
+  branch: string;
+  exercise_dir: string;
+  title: string | null;
+  kind: string | null;
+  estimated_minutes: number | null;
+  pedagogy: string | null;
+  primitive: string | null;
+  assertion: string | null;
+  codespace_url: string;
+  github_dev_url: string;
+  clone_command: string;
+  grading_runner: string;  // e.g. "bash .grading/run-grading.sh exercise-01-fix-n-plus-one"
+  readme_md: string | null;
+  manifest_fetched: boolean;
+  readme_fetched: boolean;
+}
+
+export interface HandsOnSubmitResponse {
+  ok: boolean;
+  step_id: number;
+  user_id: string;
+  submission_status: "passed" | "failed";
+  step_completed: boolean;
+  first_completed_at: string | null;
+  score: number | null;
+  via: string | null;
+  source: string;
 }

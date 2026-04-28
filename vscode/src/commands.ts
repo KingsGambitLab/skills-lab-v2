@@ -1444,6 +1444,16 @@ export class CommandHandlers {
     moduleId: number,
     step: StepSummary,
   ): Promise<void> {
+    // 2026-04-28 — hands_on dispatch. Course-repo + grading-runner architecture.
+    // Per CLAUDE.md §"BEHAVIORAL TEST HARNESS": no LLM-authored cli_commands;
+    // grading is `bash .grading/run-grading.sh <exercise_dir>` against the
+    // learner's local clone (Codespace / VS Code / Cursor). On PASS we POST
+    // grading-result.json to /submit (last-passing-run wins per user 1b).
+    if ((step.exercise_type || "").toLowerCase() === "hands_on") {
+      await this.runHandsOnAndAutoSubmit(courseId, moduleId, step);
+      return;
+    }
+
     const cmds: { cmd: string; label?: string; expect?: string }[] =
       (step.validation && step.validation.cli_commands) || [];
     if (cmds.length === 0) {
@@ -1630,6 +1640,232 @@ export class CommandHandlers {
     // panel (v0.1.2) shows pass/fail + grader prose + per-token results
     // inline. Same shape Submit & Continue uses.
     await this.openStep(courseId, moduleId, step, validated);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // hands_on auto-submit (2026-04-28 v0.1.23)
+  //
+  // For exercise_type='hands_on' steps. Per CLAUDE.md §"BEHAVIORAL TEST
+  // HARNESS" + buddy-Opus 2026-04-28: course-repo's
+  // .grading/run-grading.sh runs the hidden test class (or verify.sh)
+  // against the learner's local SUT; emits RESULT: PASS|FAIL on stdout
+  // + grading-result.json. We POST that JSON (with source=cli) to the
+  // LMS /submit endpoint. Last-passing-run wins (user decision 1b);
+  // hard-fail on offline (user decision 2b).
+  //
+  // GHA workflow on the course-repo is the OFFICIAL source of truth.
+  // This CLI path is fast-feedback for the learner during local dev —
+  // they don't have to wait 60-90s for GHA to run.
+  // ════════════════════════════════════════════════════════════════════
+  async runHandsOnAndAutoSubmit(
+    courseId: string,
+    moduleId: number,
+    step: StepSummary,
+  ): Promise<void> {
+    const dd = step.demo_data || {};
+    const courseSlug: string | undefined = dd.course_slug;
+    const nnRaw: string | undefined = dd.exercise_nn;
+    const exerciseSlug: string | undefined = dd.exercise_slug;
+
+    if (!courseSlug || !nnRaw || !exerciseSlug) {
+      vscode.window.showErrorMessage(
+        `${labelOf(step)} is hands_on but demo_data is missing course_slug / exercise_nn / exercise_slug. ` +
+          `This is a step-config bug; ask the course author to regenerate.`,
+      );
+      return;
+    }
+    const nn = String(nnRaw).padStart(2, "0");
+    const exerciseDir = `exercise-${nn}-${exerciseSlug}`;
+
+    // Locate the workspace folder. Prefer one whose name matches
+    // <something>-course-repo (Skillslab convention); fall back to first.
+    const folders = vscode.workspace.workspaceFolders || [];
+    if (folders.length === 0) {
+      vscode.window.showWarningMessage(
+        `${labelOf(step)} needs the course-repo cloned. ` +
+          `Click "Open in Codespace" or the local-clone command on the step page first.`,
+      );
+      return;
+    }
+    const wsf =
+      folders.find((f) => /-course-repo$/.test(f.uri.fsPath)) || folders[0];
+    const wsfFs = wsf.uri.fsPath;
+
+    // Verify .grading/ exists in the workspace folder. If not, the
+    // learner is in the wrong dir or hasn't switched to the right branch.
+    const gradingDir = path.join(wsfFs, ".grading");
+    if (!fs.existsSync(gradingDir)) {
+      vscode.window.showErrorMessage(
+        `No .grading/ directory found in ${wsfFs}. ` +
+          `Switch to an exercise/* branch (e.g. \`git checkout exercise/${nn}-${exerciseSlug}\`) ` +
+          `or re-clone the course-repo from the step's "Open in Codespace" / clone command.`,
+      );
+      return;
+    }
+    const exerciseSubdir = path.join(gradingDir, exerciseDir);
+    if (!fs.existsSync(exerciseSubdir)) {
+      vscode.window.showErrorMessage(
+        `No .grading/${exerciseDir}/ in the workspace. ` +
+          `Are you on the right branch? Try \`git checkout exercise/${nn}-${exerciseSlug}\`.`,
+      );
+      return;
+    }
+
+    const slug = courseId;
+    const attempt = this.state.recordAttempt(slug, step.id);
+    const runnerCmd = `bash .grading/run-grading.sh ${exerciseDir}`;
+
+    // Live progress in the WebView (single-command run; reuses the
+    // run-progress card from runAndAutoSubmit).
+    this.webview.postRunProgress({
+      phase: "start",
+      cmds: [{ label: `Run hidden grading harness (${exerciseDir})`, cmd: runnerCmd }],
+    });
+
+    const term = await this.getOrCreateTerminal(`Skillslab`);
+    term.sendText("", false);
+    term.sendText(`echo "───── ${labelOf(step)} (hands_on grader · attempt ${attempt}) ─────"`, true);
+    // Make sure we're in the workspace folder (not wherever the terminal happened
+    // to land). Critical for `bash .grading/run-grading.sh` to find the file.
+    term.sendText(`cd "${wsfFs}"`, true);
+
+    const integration = await waitForShellIntegration(term, 4000);
+    if (!integration) {
+      // Manual fallback — run the command for them, but we can't capture
+      // grading-result.json without polling, so guide them to read it.
+      vscode.window.showWarningMessage(
+        `Shell integration unavailable. Running grader in terminal — read RESULT: PASS|FAIL from output, ` +
+          `then click Submit & Continue once you see PASS.`,
+      );
+      term.sendText(runnerCmd, true);
+      this.webview.postRunProgress({ phase: "error" });
+      return;
+    }
+
+    this.webview.postRunProgress({ phase: "cmd_start", index: 0 });
+
+    // Run the grader. 3-min timeout — Maven + Testcontainers can be slow on
+    // first run (image pull + Hibernate boot).
+    const TIMEOUT_MS = 180_000;
+    let runnerOutput = "";
+    try {
+      const exec = integration.executeCommand(runnerCmd);
+      const reader = exec.read();
+      runnerOutput = await readStreamWithTimeout(reader, TIMEOUT_MS);
+    } catch (e: any) {
+      this.webview.postRunProgress({ phase: "error" });
+      vscode.window.showErrorMessage(
+        `Grader run failed or timed out after ${TIMEOUT_MS / 1000}s: ${e?.message || e}.`,
+      );
+      return;
+    }
+
+    // Parse the RESULT: line for fast UI signal (the grader emits exactly
+    // one such line as the LAST stdout line).
+    const cliPass = /^RESULT:\s*PASS\s*$/m.test(runnerOutput);
+
+    this.webview.postRunProgress({ phase: "cmd_done", index: 0, ok: cliPass });
+
+    // Read grading-result.json from the workspace folder. Written by
+    // .grading/scripts/parse-surefire.sh per the universal contract.
+    const resultPath = path.join(wsfFs, "grading-result.json");
+    let gradingResult: any = null;
+    try {
+      const raw = fs.readFileSync(resultPath, "utf-8");
+      gradingResult = JSON.parse(raw);
+    } catch (e: any) {
+      this.webview.postRunProgress({ phase: "error" });
+      vscode.window.showErrorMessage(
+        `grading-result.json not found at ${resultPath}. The grader may have crashed before writing it. ` +
+          `Re-run the grader in the terminal: ${runnerCmd}`,
+      );
+      return;
+    }
+
+    // Augment with CLI source metadata before POSTing.
+    const payload = {
+      ...gradingResult,
+      source: "cli",
+      cli_runner_output_tail: runnerOutput.slice(-2000),  // last 2KB for diagnostics
+    };
+
+    this.webview.postRunProgress({ phase: "validating" });
+
+    let submitRes;
+    try {
+      submitRes = await this.api.submitHandsOn(courseSlug, nn, exerciseSlug, payload);
+    } catch (e: any) {
+      this.webview.postRunProgress({ phase: "error" });
+      // Per user decision 2b: hard-fail offline with actionable retry hint.
+      const msg = String(e?.message || e);
+      const isNet = /fetch failed|ENOTFOUND|ECONNREFUSED|ETIMEDOUT|getaddrinfo|network|offline/i.test(msg);
+      if (isNet) {
+        vscode.window.showErrorMessage(
+          `Cannot submit (offline?). Re-run the grader when you have network: ${runnerCmd}`,
+        );
+      } else if (e?.status === 404) {
+        vscode.window.showErrorMessage(
+          `LMS doesn't recognize this exercise. The hands_on step's demo_data may be wrong, ` +
+            `or this exercise hasn't been migrated to hands_on yet. Server said: ${msg}`,
+        );
+      } else {
+        vscode.window.showErrorMessage(`Submit failed: ${msg}`);
+      }
+      return;
+    }
+
+    this.webview.postRunProgress({ phase: "graded" });
+
+    // PASS — auto-advance. Last-passing-run wins (user decision 1b): the
+    // server has marked completed=True; our cursor follows.
+    if (submitRes.submission_status === "passed") {
+      this.tree.refresh();
+      vscode.window.showInformationMessage(
+        `✓ ${labelOf(step)} PASSED — auto-submitted as ${submitRes.source}. Advancing.`,
+      );
+      const cursor = this.state.getCursor(slug);
+      if (cursor) {
+        this.state.setCursor(slug, courseId, cursor.stepIdx + 1);
+      }
+      await this.next(courseId, moduleId, step);
+      return;
+    }
+
+    // FAIL — surface diagnostic detail from grading-result.json so the
+    // learner knows which test failed without parsing terminal output.
+    const failedTests: Array<{ test_name?: string; message?: string }> =
+      Array.isArray(gradingResult.failed_tests) ? gradingResult.failed_tests : [];
+    let summary = "";
+    if (failedTests.length > 0) {
+      summary = failedTests
+        .slice(0, 3)
+        .map((t) => `• ${t.test_name || "?"}: ${(t.message || "").slice(0, 120)}`)
+        .join("\n");
+      if (failedTests.length > 3) summary += `\n…+${failedTests.length - 3} more`;
+    } else {
+      summary =
+        `Runner exit ${gradingResult.mavenExitCode ?? gradingResult.exitCode ?? "?"} · ` +
+        `${gradingResult.passed ?? "?"} pass / ${gradingResult.failures ?? "?"} fail / ` +
+        `${gradingResult.errors ?? "?"} err`;
+    }
+
+    vscode.window.showWarningMessage(
+      `${labelOf(step)} FAILED grader.\n${summary}\n\nFix the code + click Run again. ` +
+        `(GHA on the course-repo is the official attestation — push your fix to your fork to confirm.)`,
+    );
+
+    // Re-render the WebView with a synthesized ValidateResponse-like object
+    // so the feedback panel shows fail prose. The hands_on shape doesn't
+    // populate item_results / explanations the way other types do — we
+    // pass through enough to render a useful panel.
+    const validatedShape: ValidateResponse = {
+      correct: false,
+      score: 0,
+      feedback:
+        `Grader emitted RESULT: FAIL.\n${summary}\n\n` +
+        `via=${gradingResult.via || "?"} · exercise=${gradingResult.exercise || exerciseDir}`,
+    };
+    await this.openStep(courseId, moduleId, step, validatedShape);
   }
 
   // ── ToC ─────────────────────────────────────────────────────────
