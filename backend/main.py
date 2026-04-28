@@ -1180,13 +1180,23 @@ async def hands_on_submit(
 
 
 @app.get("/api/courses/{course_slug}/exercises/{nn}/{exercise_slug}/launch")
-async def hands_on_launch(course_slug: str, nn: str, exercise_slug: str):
+async def hands_on_launch(
+    course_slug: str,
+    nn: str,
+    exercise_slug: str,
+    kind: str = "exercise",
+):
     """Resolve a hands_on step's launch bundle.
 
     Returns: editor-launch URLs (Codespace primary, github.dev + clone
     command as escape hatches) + (best-effort) manifest data + per-exercise
-    README content fetched from the course-repo's
-    `.grading/exercise-NN-<slug>/README.md`.
+    README content fetched from the course-repo.
+
+    Query params:
+      - kind: branch family. "exercise" (default), "meta", "tour", "extra".
+        Determines branch shape (exercise/NN-<slug> vs meta/NN-<slug> vs
+        tour/<slug>) + grading dir naming. Set when calling for cc-spring's
+        meta/* exercises (build-claude-md, hooks-and-commands, etc.).
 
     Per CLAUDE.md §"BEHAVIORAL TEST HARNESS" + 2026-04-28 architectural pivot:
     the LMS is plumbing here. The real work happens in the learner's editor
@@ -1195,11 +1205,15 @@ async def hands_on_launch(course_slug: str, nn: str, exercise_slug: str):
 
     URL shape examples:
       /api/courses/jspring/exercises/01/fix-n-plus-one/launch
-      /api/courses/kimi/exercises/03/fastapi-pagination/launch  (future)
+      /api/courses/cc-spring/exercises/03/optimize-n-plus-one/launch
+      /api/courses/cc-spring/exercises/01/build-claude-md/launch?kind=meta
+      /api/courses/cc-spring/exercises/00/workflow/launch?kind=tour
     """
     from backend.hands_on import resolve_hands_on
+    if kind not in ("exercise", "meta", "tour", "extra"):
+        raise HTTPException(400, f"Unknown kind: {kind!r}; expected exercise/meta/tour/extra")
     try:
-        bundle = resolve_hands_on(course_slug, nn, exercise_slug)
+        bundle = resolve_hands_on(course_slug, nn, exercise_slug, kind=kind)
     except ValueError as e:
         raise HTTPException(404, str(e))
     return bundle.to_dict()

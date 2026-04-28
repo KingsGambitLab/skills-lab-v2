@@ -83,14 +83,38 @@ def _owner_repo(course_repo: str) -> str:
     return s
 
 
-def _branch_for(nn: str, slug: str) -> str:
-    """Per-exercise branch convention (Opus 2026-04-28): exercise/NN-<slug>."""
-    return f"exercise/{nn}-{slug}"
+def _branch_for(nn: str, slug: str, kind: str = "exercise") -> str:
+    """Per-exercise branch convention. Default `exercise/NN-<slug>`
+    (Opus 2026-04-28). Other kinds for AI-tool meta-skills:
+
+      - kind="exercise" → exercise/NN-<slug>   (code-fix / feature / refactor)
+      - kind="meta"     → meta/NN-<slug>       (AI-tool authoring: CLAUDE.md,
+                                                hooks, subagents, MCP, etc.)
+      - kind="tour"     → tour/<slug>          (guided walkthrough — no NN)
+      - kind="extra"    → extra/<slug>         (bonus content)
+
+    Add kinds via the launch endpoint's `kind` query param OR
+    demo_data.exercise_kind on hands_on steps. Defaults to "exercise"
+    for backwards-compat.
+    """
+    if kind == "tour":
+        return f"tour/{slug}"
+    if kind == "extra":
+        return f"extra/{slug}"
+    return f"{kind}/{nn}-{slug}"
 
 
-def _exercise_dir(nn: str, slug: str) -> str:
-    """Per-exercise dir convention: .grading/exercise-NN-<slug>/"""
-    return f"exercise-{nn}-{slug}"
+def _exercise_dir(nn: str, slug: str, kind: str = "exercise") -> str:
+    """Per-exercise dir convention. Default exercise-NN-<slug>; for
+    kind=meta returns meta-NN-<slug>; for tour returns just <slug>.
+    Mirrors _branch_for so the launch endpoint composes branch + dir
+    consistently per kind.
+    """
+    if kind == "tour":
+        return slug
+    if kind == "extra":
+        return slug
+    return f"{kind}-{nn}-{slug}"
 
 
 def _codespace_url(owner_repo: str, branch: str) -> str:
@@ -192,14 +216,25 @@ class HandsOnLaunch:
         }
 
 
-def resolve_hands_on(course_slug: str, nn: str, slug: str) -> HandsOnLaunch:
+def resolve_hands_on(
+    course_slug: str,
+    nn: str,
+    slug: str,
+    kind: str = "exercise",
+) -> HandsOnLaunch:
     """Resolve a hands_on step's launch bundle.
 
     Args:
-        course_slug: Course identifier (e.g. "jspring") — must be registered
-            in backend.course_assets.
+        course_slug: Course identifier (e.g. "jspring", "cc-spring") — must
+            be registered in backend.course_assets.
         nn: Two-character zero-padded exercise number ("00", "01", ...).
-        slug: Kebab-case exercise slug ("fix-n-plus-one").
+            Ignored for kind="tour" / kind="extra".
+        slug: Kebab-case exercise slug ("fix-n-plus-one", "build-claude-md").
+        kind: 2026-04-28 — branch family. "exercise" (default), "meta",
+            "tour", "extra". See `_branch_for`/`_exercise_dir` for shapes.
+            Required for cc-spring's meta/* branches (build-claude-md,
+            hooks-and-commands, custom-subagent, etc.) since they live
+            outside the exercise/* family.
 
     Returns: HandsOnLaunch with composed URLs + (best-effort) manifest data
         and README content. Manifest/README fetches are SOFT FAILS — the
@@ -216,8 +251,8 @@ def resolve_hands_on(course_slug: str, nn: str, slug: str) -> HandsOnLaunch:
 
     nn_padded = str(nn).zfill(2)
     owner_repo = _owner_repo(asset.course_repo)
-    branch = _branch_for(nn_padded, slug)
-    exercise_dir = _exercise_dir(nn_padded, slug)
+    branch = _branch_for(nn_padded, slug, kind=kind)
+    exercise_dir = _exercise_dir(nn_padded, slug, kind=kind)
 
     title = None
     kind = None

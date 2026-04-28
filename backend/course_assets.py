@@ -455,6 +455,7 @@ register_course_assets(CourseAsset(
     title_hint="Claude Code Spring Boot Exercises (TaskManager)",
     course_repo="https://github.com/tusharbisht/claude-code-springboot-exercises",
     module_branches={
+        # exercise/* family (code-fix / refactor / build / migrate / calibrate)
         "validation":     "exercise/01-fix-validation-bug",
         "search":         "exercise/02-implement-search",
         "n-plus-one":     "exercise/03-optimize-n-plus-one",
@@ -464,6 +465,21 @@ register_course_assets(CourseAsset(
         "migration":      "exercise/07-migration",
         "anti-exercise":  "exercise/08-when-not-to-use-claude",
         "confident-wrong": "exercise/09-confident-but-wrong",
+        # meta/* family (Claude Code authoring + integration skills) —
+        # 2026-04-28: user directive "All meta exercises are crucial to
+        # build claude code understanding support." These teach the
+        # FACETS of Claude Code itself (CLAUDE.md authoring, slash
+        # commands, hooks, custom subagents, MCP, prompting tactics)
+        # rather than fixing/building code in the SUT. The launch
+        # endpoint handles `meta/NN-<slug>` branch shape via kind=meta
+        # query param; per-exercise dir is `meta-NN-<slug>` (NOT
+        # `exercise-NN-<slug>`).
+        "build-claude-md":    "meta/01-build-claude-md",
+        "hooks-commands":     "meta/02-hooks-and-commands",
+        "custom-subagent":    "meta/03-custom-subagent",
+        "open-ended-feature": "meta/04-open-ended-feature",
+        "mcp-servers":        "meta/05-mcp-servers",
+        "prompting-tactics":  "meta/06-prompting-tactics",
     },
     mcp_servers=(),  # cc-spring doesn't ship an MCP server today
     # No GHA attestation for cc-spring — its grade.yml is local-only.

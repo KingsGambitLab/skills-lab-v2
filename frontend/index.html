@@ -4879,6 +4879,9 @@ async function setupHandsOn(rawStep, index) {
   const courseSlug = dd.course_slug;
   const nn = String(dd.exercise_nn || '').padStart(2, '0');
   const slug = dd.exercise_slug;
+  // 2026-04-28 — kind selects branch family: exercise (default), meta,
+  // tour, extra. cc-spring's 6 meta/* exercises use kind=meta.
+  const kind = (dd.exercise_kind || 'exercise').toLowerCase();
   const idKey = String(rawStep.id || index);
 
   if (!courseSlug || !nn || !slug) {
@@ -4889,7 +4892,8 @@ async function setupHandsOn(rawStep, index) {
 
   let bundle;
   try {
-    const r = await fetch(`/api/courses/${encodeURIComponent(courseSlug)}/exercises/${encodeURIComponent(nn)}/${encodeURIComponent(slug)}/launch`);
+    const url = `/api/courses/${encodeURIComponent(courseSlug)}/exercises/${encodeURIComponent(nn)}/${encodeURIComponent(slug)}/launch?kind=${encodeURIComponent(kind)}`;
+    const r = await fetch(url);
     if (!r.ok) throw new Error(`HTTP ${r.status}`);
     bundle = await r.json();
   } catch (err) {
