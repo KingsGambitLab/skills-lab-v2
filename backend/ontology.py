@@ -68,12 +68,15 @@ Each `AssignmentType.grade_primitives` is a list drawn from:
 - `artifact_flag`        — sha256(learner_submitted_string) == expected
 - `llm_rubric`           — Haiku-scored criteria (tone, clarity, depth)
 - `benchmark_score`      — held-out eval set score above threshold
+- `grading_runner_exit_code` — course-repo `.grading/run-grading.sh` exit 0 (2026-04-28)
+                            via skillslab CLI auto-submit (last-passing-run wins) +
+                            (Phase 3c) GHA workflow attestation as source of truth
 
 Registry caps: `compile`, `hidden_tests`, `property_test`, `lint`, `must_contain`
 are per-source grading; `state_assertion`, `endpoint_probe`, `gha_workflow_check`,
-`artifact_flag` are per-artifact grading; `llm_rubric` and `benchmark_score` are
-per-output grading. Registry enforces: every code assignment needs ≥1 cheese-proof
-primitive (anything except `must_contain` alone).
+`artifact_flag`, `grading_runner_exit_code` are per-artifact grading; `llm_rubric`
+and `benchmark_score` are per-output grading. Registry enforces: every code
+assignment needs ≥1 cheese-proof primitive (anything except `must_contain` alone).
 """
 
 from __future__ import annotations
@@ -305,8 +308,14 @@ class AssignmentType:
     # Runtime primitive used to execute the learner's submission.
     runtime: str | None = None  # see RUNTIME_REGISTRY
     # How learner-facing: interactive editor, read-only display, live sim,
-    # dialogic (LLM turn loop), real (actual external workflow).
-    interaction_mode: Literal["static", "interactive", "simulation", "dialogic", "real_workflow"] = "interactive"
+    # dialogic (LLM turn loop), real (actual external workflow), byo_execution
+    # (learner runs commands on their own machine via skillslab CLI),
+    # native_editor (hands_on — learner solves in VS Code / Codespace / Cursor;
+    # course-repo + grading-runner are the truth).
+    interaction_mode: Literal[
+        "static", "interactive", "simulation", "dialogic",
+        "real_workflow", "byo_execution", "native_editor",
+    ] = "interactive"
     # Reality score: simulated sandbox, shadow (no real-world effects), real
     # (actual artifacts produced — a real PR, a real deploy).
     reality_score: Literal["simulated", "shadow", "real"] = "simulated"
@@ -437,6 +446,53 @@ register_assignment(AssignmentType(
     reality_score="real",
     is_code_assignment=True,
     supports_solution_starter_invariant=True,
+))
+
+# ───────────────────────────────────────────────────────────────────────────
+# hands_on (2026-04-28) — slide + course-repo + native editor architecture
+# ───────────────────────────────────────────────────────────────────────────
+register_assignment(AssignmentType(
+    id="hands_on",
+    description=(
+        "Course-repo-grounded hands-on exercise with native editor flow. The "
+        "LEARNER's primary surface is their editor (VS Code / GitHub "
+        "Codespace / Cursor / GitHub.dev) — not the LMS browser. The LMS "
+        "shows: title, brief framing (optional), bootstrap CTAs (Open in "
+        "Codespace = primary, Open in VS Code + clone command = escape "
+        "hatches). The exercise's instructions, code, and grader all live "
+        "in the course-repo at .grading/<exercise_dir>/. Grading dispatches "
+        "via `bash .grading/run-grading.sh <exercise_dir>` which emits the "
+        "universal RESULT: PASS|FAIL stdout protocol + grading-result.json. "
+        "\n\nGrade flow (per buddy-Opus 2026-04-28): primary fast-feedback "
+        "via skillslab CLI auto-submit (last-passing-run wins per user "
+        "decision 1b); GHA workflow attestation is the SOURCE OF TRUTH (LMS "
+        "marks step officially complete only when GHA confirms). Network "
+        "required at submit time — offline submission hard-fails with "
+        "actionable error (per user decision 2b)."
+        "\n\nNo LLM-authored grading machinery. The Creator emits ONLY "
+        "demo_data.{course_slug, exercise_nn, exercise_slug} pointing at the "
+        "course-repo's manifest entry. validation is empty — grading is "
+        "external. ~3× cheaper to generate than terminal_exercise; ~80% "
+        "smaller validator surface (Track A/B drift checks unreachable here)."
+    ),
+    grade_primitives=["grading_runner_exit_code"],
+    grade_weights={"grading_runner_exit_code": 1.0},
+    # 3-tuple keys into the manifest at the course-repo's
+    # .grading/manifest.json — LMS resolves to {repo, branch, exercise_dir}
+    # at step-load time via course_assets registry.
+    required_demo_data=["course_slug", "exercise_nn", "exercise_slug"],
+    # No LMS-side validation — grading flows from the course-repo's
+    # run-grading.sh exit code via skillslab CLI / GHA. The Creator does
+    # NOT author cli_commands, rubric, or must_contain for hands_on steps.
+    required_validation=[],
+    # F26 scaffold gate doesn't apply: course-repo IS the scaffold (the
+    # learner clones it directly via Codespace / VS Code clone URL).
+    requires_scaffold_unless_authoring=False,
+    runtime=None,  # learner's machine / Codespace, not ours
+    interaction_mode="native_editor",
+    reality_score="real",
+    is_code_assignment=False,  # the LMS doesn't compile/run the code; the
+                                # course-repo's grader does
 ))
 
 # ---- READ-ONLY / STATIC ----
