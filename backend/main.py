@@ -3998,6 +3998,77 @@ _creator_sessions: dict[str, dict] = {}
 # also sweep entries older than 1h as belt-and-suspenders.
 _creator_progress: dict[str, dict] = {}
 
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2026-05-04 — REDIS-BACKED progress state (cross-process). The in-memory
+# dict above is now write-through cache only. Reads fall back to redis
+# when the session_id isn't in our process's cache. Why: the Creator
+# generate task runs in the celery WORKER process, but /api/creator/
+# progress/{session_id} is served from the FastAPI process. The worker's
+# writes to `_creator_progress` go to its own copy of the dict; FastAPI
+# never sees them. Result: progress bar shows {phase: "waiting"} forever.
+# Fix: every write goes to redis too; reads pull from redis on cache miss.
+# ═══════════════════════════════════════════════════════════════════════════
+_progress_redis = None  # lazily initialized
+
+def _get_progress_redis():
+    """Returns a connected redis.Redis or None on failure (silently
+    degrades to in-memory-only). Lazy because some non-celery code paths
+    don't have redis available + we don't want import-time failures."""
+    global _progress_redis
+    if _progress_redis is None:
+        try:
+            import redis as _redis_pkg
+            url = os.environ.get("SLL_REDIS_URL", "redis://127.0.0.1:6379/0")
+            _progress_redis = _redis_pkg.Redis.from_url(url, decode_responses=True)
+            _progress_redis.ping()
+        except Exception as _e:
+            logging.warning("redis unavailable for progress state: %s — falling back to in-memory", _e)
+            _progress_redis = False  # sentinel for "tried + failed"
+    return _progress_redis if _progress_redis is not False else None
+
+
+def _progress_redis_key(session_id: str) -> str:
+    return f"skillslab:creator:progress:{session_id}"
+
+
+def _progress_write(session_id: str, state: dict) -> None:
+    """Write progress state to BOTH the in-memory cache AND redis (so the
+    other process — celery worker or FastAPI — can read it). 1h TTL on
+    redis so dead sessions get garbage-collected."""
+    _creator_progress[session_id] = state
+    r = _get_progress_redis()
+    if r is None:
+        return
+    try:
+        r.setex(_progress_redis_key(session_id), 3600, json.dumps(state, default=str))
+    except Exception as _e:
+        # Don't fail the gen pipeline on redis write errors; the in-memory
+        # write succeeded and that's enough for same-process reads.
+        logging.warning("redis progress write failed for %s: %s", session_id, _e)
+
+
+def _progress_read(session_id: str) -> dict | None:
+    """Read progress state. Tries in-memory first; falls back to redis on
+    miss (so the FastAPI process can see writes from the celery worker
+    process, and vice versa)."""
+    state = _creator_progress.get(session_id)
+    if state is not None:
+        return state
+    r = _get_progress_redis()
+    if r is None:
+        return None
+    try:
+        raw = r.get(_progress_redis_key(session_id))
+        if raw:
+            state = json.loads(raw)
+            # Cache in-memory so subsequent same-process reads are fast.
+            _creator_progress[session_id] = state
+            return state
+    except Exception as _e:
+        logging.warning("redis progress read failed for %s: %s", session_id, _e)
+    return None
+
 def _progress_init(session_id: str, outline) -> None:
     import time as _t
     modules_list = list(outline.modules) if hasattr(outline, "modules") else []
@@ -4020,7 +4091,7 @@ def _progress_init(session_id: str, outline) -> None:
                 "completed_at": None,
                 "note": "",
             })
-    _creator_progress[session_id] = {
+    _progress_write(session_id, {
         "phase": "scenario",
         "total_steps": total_steps,
         "completed_steps": 0,
@@ -4034,7 +4105,7 @@ def _progress_init(session_id: str, outline) -> None:
         "updated_at": _t.time(),
         "error": None,
         "course_id": None,
-    }
+    })
 
 
 def _progress_mark_step(
@@ -4046,9 +4117,10 @@ def _progress_mark_step(
     note: str = "",
 ) -> None:
     """Flip a specific step's state in the feed. Matches on (module_title,
-    step_title) since those are stable across generation."""
+    step_title) since those are stable across generation. Reads-modify-writes
+    redis so the change is visible to the FastAPI process."""
     import time as _t
-    state = _creator_progress.get(session_id)
+    state = _progress_read(session_id)
     if not state:
         return
     feed = state.get("steps_feed") or []
@@ -4069,19 +4141,22 @@ def _progress_mark_step(
                 entry["note"] = note
             break
     state["updated_at"] = now
+    _progress_write(session_id, state)
 
 def _progress_update(session_id: str, **fields) -> None:
     import time as _t
-    state = _creator_progress.get(session_id)
+    state = _progress_read(session_id)
     if not state:
         return
     state.update(fields)
     state["updated_at"] = _t.time()
+    _progress_write(session_id, state)
 
 def _progress_increment_step(session_id: str, module_title: str, step_title: str) -> None:
-    """Called when ONE step's content generation completes."""
+    """Called when ONE step's content generation completes. Writes to
+    redis so the FastAPI-served progress endpoint sees the increment."""
     import time as _t
-    state = _creator_progress.get(session_id)
+    state = _progress_read(session_id)
     if not state:
         return
     state["completed_steps"] = state.get("completed_steps", 0) + 1
@@ -4093,6 +4168,7 @@ def _progress_increment_step(session_id: str, module_title: str, step_title: str
     completed_mods = sum(1 for m in state["module_breakdown"].values() if m["done"] >= m["total"] and m["total"] > 0)
     state["completed_modules"] = completed_mods
     state["updated_at"] = _t.time()
+    _progress_write(session_id, state)
 
 # Exercise type mappings by course_type
 _EXERCISE_TYPES_BY_COURSE = {
@@ -13947,8 +14023,13 @@ async def creator_progress(session_id: str):
     Returns the shape shown in the _creator_progress docstring. If no progress
     exists for this session yet (race: poll fired before generate initialized
     state), returns {phase: 'waiting'} so the client can keep polling.
+
+    2026-05-04 — Reads via _progress_read which falls back to redis. The
+    Creator generate task runs in the celery WORKER process; its writes to
+    progress state never reached this FastAPI process via in-memory dict
+    alone. Now both processes share state through redis.
     """
-    state = _creator_progress.get(session_id)
+    state = _progress_read(session_id)
     if not state:
         return {"phase": "waiting"}
     # Compute derived fields
