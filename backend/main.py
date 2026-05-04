@@ -4049,25 +4049,31 @@ def _progress_write(session_id: str, state: dict) -> None:
 
 
 def _progress_read(session_id: str) -> dict | None:
-    """Read progress state. Tries in-memory first; falls back to redis on
-    miss (so the FastAPI process can see writes from the celery worker
-    process, and vice versa)."""
-    state = _creator_progress.get(session_id)
-    if state is not None:
-        return state
+    """Read progress state. Redis is the SOURCE OF TRUTH when available
+    (cross-process visibility); in-memory dict is fallback only.
+
+    2026-05-04 second pass — earlier version cached redis reads in the
+    local dict and never invalidated, which meant FastAPI's first stale
+    read got cached forever and never refreshed from the celery worker's
+    later writes. New behavior: ALWAYS hit redis if available; in-memory
+    is only consulted when redis is unreachable.
+    """
     r = _get_progress_redis()
-    if r is None:
-        return None
-    try:
-        raw = r.get(_progress_redis_key(session_id))
-        if raw:
-            state = json.loads(raw)
-            # Cache in-memory so subsequent same-process reads are fast.
-            _creator_progress[session_id] = state
-            return state
-    except Exception as _e:
-        logging.warning("redis progress read failed for %s: %s", session_id, _e)
-    return None
+    if r is not None:
+        try:
+            raw = r.get(_progress_redis_key(session_id))
+            if raw:
+                state = json.loads(raw)
+                # Refresh in-memory cache so a subsequent redis-down read
+                # still has reasonable data.
+                _creator_progress[session_id] = state
+                return state
+            # No state in redis — fall back to local dict (might have been
+            # written same-process before redis was reachable).
+        except Exception as _e:
+            logging.warning("redis progress read failed for %s: %s", session_id, _e)
+    # Redis miss or unreachable — try local dict
+    return _creator_progress.get(session_id)
 
 def _progress_init(session_id: str, outline) -> None:
     import time as _t
