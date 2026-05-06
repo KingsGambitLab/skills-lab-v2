@@ -3001,7 +3001,26 @@ async function validateExercise(stepId, exerciseType, response) {
     })
   });
   if (!res.ok) throw new Error(`Validation failed: ${res.status}`);
-  return res.json();
+  const result = await res.json();
+  // 2026-05-06 — cache latest validation so Clicky can see what the
+  // grader said when the learner asks for help. Stored per-step so
+  // navigating between steps doesn't leak old results.
+  try {
+    window._lastValidation = window._lastValidation || {};
+    window._lastValidation[stepId] = {
+      step_id: stepId,
+      exercise_type: exerciseType,
+      submitted_response: response,
+      result: {
+        correct: result.correct,
+        score: result.score,
+        feedback: typeof result.feedback === 'string' ? result.feedback.slice(0, 1500) : null,
+        item_results: result.item_results || null,
+      },
+      ts: Date.now(),
+    };
+  } catch (_) { /* non-fatal */ }
+  return result;
 }
 
 // ===================================================================
@@ -9249,6 +9268,63 @@ async function sendClickyMessage() {
     }
     // Send recent chat history (last 6 messages) for conversational continuity
     const history = clickyMessages.slice(-6, -1).map(m => ({ role: m.role, content: m.content }));
+    // 2026-05-06 — gather PAGE CONTEXT so Clicky can see what the
+    // learner is actually working on. Without this, Clicky says "paste
+    // your code" even though the code is right there in the editor.
+    // Captures: current code-editor value, latest run output, latest
+    // grader feedback, latest validation result. Truncated to keep the
+    // POST under ~10KB.
+    const _trim = (s, n) => (typeof s === 'string' ? s.slice(0, n) : null);
+    let learnerCode = null;
+    try {
+      // Code template's textarea
+      const tmplEditor = document.querySelector('.tmpl-editor');
+      if (tmplEditor && typeof tmplEditor.value === 'string' && tmplEditor.value.trim()) {
+        learnerCode = _trim(tmplEditor.value, 4000);
+      }
+      // Fallback: any visible textarea inside step content (paste slots, etc.)
+      if (!learnerCode) {
+        const ta = document.querySelector('.step-content textarea');
+        if (ta && ta.value && ta.value.trim()) learnerCode = _trim(ta.value, 4000);
+      }
+    } catch (_) {}
+
+    let runOutput = null;
+    try {
+      const out = document.querySelector('.tmpl-output-body')?.textContent?.trim();
+      if (out && out !== '(no output)') runOutput = _trim(out, 2000);
+    } catch (_) {}
+
+    let testOutput = null;
+    try {
+      const t = document.querySelector('.tmpl-test-output')?.textContent?.trim();
+      if (t) testOutput = _trim(t, 2000);
+    } catch (_) {}
+
+    let feedbackPanel = null;
+    try {
+      const fb = document.querySelector('.tmpl-feedback')?.textContent?.trim();
+      if (fb) feedbackPanel = _trim(fb, 2000);
+    } catch (_) {}
+
+    // Latest validation result for THIS step (cached by validateExercise)
+    let latestValidation = null;
+    try {
+      const stepId = currentStep?.id;
+      if (stepId && window._lastValidation && window._lastValidation[stepId]) {
+        const v = window._lastValidation[stepId];
+        latestValidation = {
+          correct: v.result?.correct,
+          score: v.result?.score,
+          feedback: _trim(v.result?.feedback, 1200),
+          submitted_response: typeof v.submitted_response === 'object'
+            ? _trim(JSON.stringify(v.submitted_response), 2000)
+            : _trim(String(v.submitted_response || ''), 2000),
+          age_seconds: v.ts ? Math.round((Date.now() - v.ts) / 1000) : null,
+        };
+      }
+    } catch (_) {}
+
     const body = {
       message: msg,
       course_id: state.currentCourse?.id || null,
@@ -9256,6 +9332,12 @@ async function sendClickyMessage() {
       step_index: state.currentStepIndex || 0,
       step_type: currentStep?.exercise_type || currentStep?.step_type || 'concept',
       history,
+      // 2026-05-06 — page-state additions for Clicky context
+      learner_code: learnerCode,
+      run_output: runOutput,
+      test_output: testOutput,
+      feedback_panel: feedbackPanel,
+      latest_validation: latestValidation,
     };
     const res = await fetch(`${API}/clicky/ask`, {
       method: 'POST',

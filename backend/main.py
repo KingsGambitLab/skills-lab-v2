@@ -2519,6 +2519,13 @@ CORE TEACHING RULES (NEVER BREAK THESE):
    - Max 2-3 paragraphs. Break into bullets if longer.
 
 You have access to the learner's current course, module, step, and step type — use this context to give specific, relevant answers. If they ask about something unrelated to learning, gently redirect.
+
+6. PAGE STATE AWARENESS (2026-05-06):
+   - The user-message context includes labeled blocks for what the learner CURRENTLY sees on the page: their code in the editor, the latest run output, the test-runner output, the grader feedback panel, and the latest grader result.
+   - When ANY of these blocks are present, you ALREADY HAVE the code/output/error. NEVER say "paste your code" or "share the error message" — refer to the labeled block directly. Quote the SPECIFIC line, value, or message you're reacting to.
+   - When ALL blocks are absent, the learner hasn't run anything yet. THEN it's fine to say "what code do you have so far?" or "have you tried running it?".
+   - The "Learner's CURRENT CODE" is the SOURCE OF TRUTH for what they have. Don't ask them to confirm; read it.
+   - Per rule #1, even with the code in front of you, NEVER write the full solution — diagnose what's wrong, give one Socratic hint, point at the specific line.
 """
 
 
@@ -2530,8 +2537,21 @@ async def _clicky_real_llm_response(
     step_type: str,
     step_content: str,
     history: list[dict],
+    *,
+    learner_code: str | None = None,
+    run_output: str | None = None,
+    test_output: str | None = None,
+    feedback_panel: str | None = None,
+    latest_validation: dict | None = None,
 ) -> str:
-    """Call the real Claude API for a Clicky response — respects budget cap."""
+    """Call the real Claude API for a Clicky response — respects budget cap.
+
+    2026-05-06 — page-state args added so Clicky can see what the learner
+    is actually working on (current code, latest output, validation result)
+    instead of asking them to "paste your code". Each field is bounded
+    client-side; the helper assembles them into clearly-labeled blocks
+    in the user-message context so Claude can ground its answer.
+    """
     if not _llm_enabled():
         return None
 
@@ -2544,6 +2564,42 @@ async def _clicky_real_llm_response(
         context_parts.append(f"Current step: {step_title} (type: {step_type})")
     if step_content and len(step_content) < 2000:
         context_parts.append(f"Step content excerpt:\n{step_content[:1500]}")
+
+    # 2026-05-06 — visible page state. ALWAYS feed this when present.
+    # Each block is labeled so the LLM knows what it's looking at.
+    if learner_code:
+        context_parts.append(
+            "Learner's CURRENT CODE in the editor (this is what they have right now — do NOT ask them to paste it):\n"
+            f"```\n{learner_code[:4000]}\n```"
+        )
+    if run_output:
+        context_parts.append(
+            f"Latest stdout/run output the learner sees:\n```\n{run_output[:2000]}\n```"
+        )
+    if test_output:
+        context_parts.append(
+            f"Latest test runner output the learner sees:\n```\n{test_output[:2000]}\n```"
+        )
+    if feedback_panel:
+        context_parts.append(
+            f"Grader feedback panel currently visible:\n{feedback_panel[:1500]}"
+        )
+    if isinstance(latest_validation, dict):
+        v = latest_validation
+        bits = []
+        if v.get("correct") is not None:
+            bits.append(f"correct={v.get('correct')}")
+        if v.get("score") is not None:
+            bits.append(f"score={v.get('score')}")
+        if v.get("age_seconds") is not None:
+            bits.append(f"submitted {v.get('age_seconds')}s ago")
+        header = f"Latest grader result ({', '.join(bits)}):" if bits else "Latest grader result:"
+        chunks = [header]
+        if v.get("feedback"):
+            chunks.append(f"  Grader feedback: {str(v['feedback'])[:1200]}")
+        if v.get("submitted_response"):
+            chunks.append(f"  What the learner submitted: {str(v['submitted_response'])[:1500]}")
+        context_parts.append("\n".join(chunks))
 
     context_msg = "\n\n".join(context_parts) if context_parts else "No specific course context."
 
@@ -2922,6 +2978,16 @@ async def clicky_ask(body: dict, db: AsyncSession = Depends(get_db)):
     step_index = body.get("step_index", 0)
     step_type = body.get("step_type", "concept")
     history = body.get("history", [])
+    # 2026-05-06 — page-state context. Frontend captures the editor's
+    # current code, latest run output, latest test output, feedback
+    # panel text, and latest validation result. With these, Clicky can
+    # answer "fix my code" without telling the learner to "paste your
+    # code" (the code is right there on the page).
+    learner_code = body.get("learner_code")
+    run_output = body.get("run_output")
+    test_output = body.get("test_output")
+    feedback_panel = body.get("feedback_panel")
+    latest_validation = body.get("latest_validation")
 
     if not message:
         return {"response": "Ask me anything about what you're learning!"}
@@ -2959,7 +3025,12 @@ async def clicky_ask(body: dict, db: AsyncSession = Depends(get_db)):
     # Try the real LLM first (budget-checked inside the helper)
     if _llm_enabled():
         real_response = await _clicky_real_llm_response(
-            message, course_title, module_title, step_title, step_type, step_content, history
+            message, course_title, module_title, step_title, step_type, step_content, history,
+            learner_code=learner_code,
+            run_output=run_output,
+            test_output=test_output,
+            feedback_panel=feedback_panel,
+            latest_validation=latest_validation,
         )
         if real_response:
             return {
